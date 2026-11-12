@@ -1,12 +1,16 @@
 import { Hono } from "hono";
-import { bearerToken, findTenantByApiKey, optionalVoterSub, requireAdmin } from "../auth";
+import { actorLabel, listAuditEvents, recordAudit } from "../audit";
+import { bearerToken, optionalVoterSub, requireAdmin } from "../auth";
 import { ballotCount, upsertBallot } from "../ballots";
 import { addTenantOrigin, listTenantOrigins, removeTenantOrigin } from "../cors";
-import { randomId, randomToken, sha256Hex } from "../crypto";
+import { randomId } from "../crypto";
+import { resultsToCsv } from "../export";
 import {
+  assertSchedule,
   computeResults,
   getPollRow,
   isClosedForVoting,
+  isNotYetOpen,
   jsonBody,
   listOptionRows,
   nowIso,
@@ -16,7 +20,8 @@ import {
   pollToJson,
   reqString,
 } from "../domain";
-import { ApiError, badRequest, conflict, notFound, unauthorized } from "../errors";
+import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from "../errors";
+import { findActiveApiKey, issueApiKey, listApiKeys, provisionTenant, publicKey, revokeApiKey, rotatePresentedKey } from "../keys";
 import { assertPlainText, isSafeImageKey, normalizeUuid, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
 import type { Env, OptionRow, PollRow, TenantRow, Variables } from "../types";
 
@@ -39,38 +44,56 @@ function originOf(c: { req: { url: string } }): string {
 /* ------------------------------------------------------------------ */
 
 /** Self-serve tenant creation (SaaS onboarding). The API key is shown once. */
+const MAX_POLLS = 100;
+
 api.post("/tenants", async (c) => {
   await rateLimitByIp(c, "tenant-create", 80, 3600);
   const body = await jsonBody(c);
   const name = reqString(body, "name", { max: 120 });
-  const tenantId = randomId();
-  const apiKey = randomToken("hvk");
-  const apiKeyHash = await sha256Hex(apiKey);
-  await c.env.DB.prepare(
-    "INSERT INTO tenants (id, name, api_key_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-  )
-    .bind(tenantId, name, apiKeyHash, nowIso())
-    .run();
+  const { tenantId, apiKey } = await provisionTenant(c.env, name, null);
   return c.json(
     { tenant: { id: tenantId, name }, api_key: apiKey },
     201,
   );
 });
 
-/** Rotate the tenant API key (authenticated with the current key). */
+/** Rotate the presented API key (old key stops working; a new write key is returned once). */
 api.post("/tenants/:tenantId/rotate-key", async (c) => {
   const tenantId = c.req.param("tenantId");
   const token = bearerToken(c);
   if (!token) throw unauthorized("UNAUTHORIZED", "API key required");
-  const tenant = await findTenantByApiKey(c.env, token);
-  if (!tenant || tenant.id !== tenantId) {
+  const found = await findActiveApiKey(c.env, token);
+  if (!found || found.tenant.id !== tenantId) {
     throw unauthorized("INVALID_API_KEY", "API key is not valid for this tenant");
   }
-  const apiKey = randomToken("hvk");
-  await c.env.DB.prepare("UPDATE tenants SET api_key_hash = ?1 WHERE id = ?2")
-    .bind(await sha256Hex(apiKey), tenantId)
-    .run();
+  if (found.key.scope !== "write") throw forbidden("This API key is read-only");
+  const apiKey = await rotatePresentedKey(c.env, tenantId, found);
   return c.json({ api_key: apiKey });
+});
+
+api.get("/tenants/:tenantId/api-keys", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  const keys = await listApiKeys(c.env, tenantId);
+  return c.json({ api_keys: keys.map(publicKey) });
+});
+
+api.post("/tenants/:tenantId/api-keys", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId);
+  const body = await jsonBody(c);
+  const name = reqString(body, "name", { max: 80 });
+  const scope = body["scope"];
+  if (scope !== "read" && scope !== "write") throw badRequest('"scope" must be read or write');
+  const issued = await issueApiKey(c.env, tenantId, name, scope, admin);
+  return c.json({ api_key: issued.apiKey, key: issued.key }, 201);
+});
+
+api.post("/tenants/:tenantId/api-keys/:keyId/revoke", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId);
+  await revokeApiKey(c.env, tenantId, c.req.param("keyId"), admin);
+  return c.json({ revoked: true });
 });
 
 /* ------------------------------------------------------------------ */
@@ -137,15 +160,25 @@ async function loadPollForAdmin(
 
 api.post("/tenants/:tenantId/polls", async (c) => {
   const tenantId = c.req.param("tenantId");
-  await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId);
   const body = await jsonBody(c);
   const question = reqString(body, "question", { max: 300 });
   const description = optString(body, "description", { max: 5000, newlines: true }) ?? "";
   const imageKey = optString(body, "image_key", { max: 300 });
   const allowMultiple = optBool(body, "allow_multiple");
   const requireLogin = optBool(body, "require_login");
+  const opensAt = optIsoDate(body, "opens_at");
   const closesAt = optIsoDate(body, "closes_at");
+  assertSchedule(opensAt, closesAt);
   const options = parseOptions(body);
+  const existingPolls = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM polls WHERE tenant_id = ?1",
+  )
+    .bind(tenantId)
+    .first<{ n: number }>();
+  if (Number(existingPolls?.n ?? 0) >= MAX_POLLS) {
+    throw conflict("QUOTA_EXCEEDED", `A workspace can have at most ${MAX_POLLS} polls`);
+  }
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
   for (const o of options) {
     await assertImageKeyBelongsToTenant(c.env, tenantId, o.image_key);
@@ -153,8 +186,8 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const pollId = randomId();
   const now = nowIso();
   await c.env.DB.prepare(
-    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, closes_at, created_at, updated_at, revision)
-     VALUES (?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?9, ?10)`,
+    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, created_at, updated_at, revision)
+     VALUES (?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?10, ?10, ?11)`,
   )
     .bind(
       pollId,
@@ -164,12 +197,19 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       imageKey,
       allowMultiple ? 1 : 0,
       requireLogin ? 1 : 0,
+      opensAt,
       closesAt,
       now,
       randomId(),
     )
     .run();
   await insertOptions(c.env, pollId, options);
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "poll.create",
+    target: pollId,
+  });
   const poll = await getPollRow(c.env, pollId);
   const opts = await listOptionRows(c.env, pollId);
   return c.json({ poll: pollToJson(originOf(c), poll as PollRow, opts) }, 201);
@@ -177,7 +217,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
 
 api.get("/tenants/:tenantId/polls", async (c) => {
   const tenantId = c.req.param("tenantId");
-  await requireAdmin(c, tenantId);
+  await requireAdmin(c, tenantId, "read");
   const res = await c.env.DB.prepare(
     "SELECT * FROM polls WHERE tenant_id = ?1 ORDER BY created_at DESC",
   )
@@ -193,7 +233,7 @@ api.get("/tenants/:tenantId/polls", async (c) => {
 
 api.get("/tenants/:tenantId/polls/:pollId", async (c) => {
   const tenantId = c.req.param("tenantId");
-  await requireAdmin(c, tenantId);
+  await requireAdmin(c, tenantId, "read");
   const poll = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
   const opts = await listOptionRows(c.env, poll.id);
   return c.json({ poll: pollToJson(originOf(c), poll, opts) });
@@ -227,8 +267,11 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     body["require_login"] !== undefined
       ? optBool(body, "require_login")
       : poll.require_login === 1;
+  const opensAt =
+    body["opens_at"] !== undefined ? optIsoDate(body, "opens_at") : poll.opens_at;
   const closesAt =
     body["closes_at"] !== undefined ? optIsoDate(body, "closes_at") : poll.closes_at;
+  assertSchedule(opensAt, closesAt);
 
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
 
@@ -261,15 +304,16 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
   const newRevision = randomId();
   const updatePoll = c.env.DB.prepare(
     `UPDATE polls SET question = ?1, description = ?2, image_key = ?3,
-     allow_multiple = ?4, require_login = ?5, closes_at = ?6, updated_at = ?7,
-     revision = ?8
-     WHERE id = ?9 AND revision = ?10`,
+     allow_multiple = ?4, require_login = ?5, opens_at = ?6, closes_at = ?7, updated_at = ?8,
+     revision = ?9
+     WHERE id = ?10 AND revision = ?11`,
   ).bind(
     question,
     description,
     imageKey,
     allowMultiple ? 1 : 0,
     requireLogin ? 1 : 0,
+    opensAt,
     closesAt,
     nowIso(),
     newRevision,
@@ -321,7 +365,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
 
 api.post("/tenants/:tenantId/polls/:pollId/status", async (c) => {
   const tenantId = c.req.param("tenantId");
-  await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId);
   const poll = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
   const body = await jsonBody(c);
   const status = body["status"];
@@ -342,6 +386,13 @@ api.post("/tenants/:tenantId/polls/:pollId/status", async (c) => {
   await c.env.DB.prepare("UPDATE polls SET status = ?1, updated_at = ?2 WHERE id = ?3")
     .bind(status, nowIso(), poll.id)
     .run();
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "poll.status",
+    target: poll.id,
+    detail: `${poll.status}->${status}`,
+  });
   const updated = await getPollRow(c.env, poll.id);
   const opts = await listOptionRows(c.env, poll.id);
   return c.json({ poll: pollToJson(originOf(c), updated as PollRow, opts) });
@@ -349,7 +400,7 @@ api.post("/tenants/:tenantId/polls/:pollId/status", async (c) => {
 
 api.get("/tenants/:tenantId/polls/:pollId/results", async (c) => {
   const tenantId = c.req.param("tenantId");
-  await requireAdmin(c, tenantId);
+  await requireAdmin(c, tenantId, "read");
   const poll = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
   return c.json({ results: await computeResults(c.env, originOf(c), poll) });
 });
@@ -399,6 +450,9 @@ api.get("/polls/:pollId/results", async (c) => {
 api.post("/polls/:pollId/vote", async (c) => {
   await rateLimitByIp(c, "vote", 600, 60);
   const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
+  if (isNotYetOpen(poll)) {
+    throw conflict("POLL_NOT_OPEN", "This poll is not open for voting yet");
+  }
   if (isClosedForVoting(poll)) {
     throw conflict("POLL_CLOSED", "This poll is closed for voting");
   }
@@ -505,30 +559,126 @@ export async function serveImage(env: Env, key: string): Promise<Response> {
 
 api.get("/tenants/:tenantId/origins", async (c) => {
   const tenantId = c.req.param("tenantId");
-  await requireAdmin(c, tenantId);
+  await requireAdmin(c, tenantId, "read");
   return c.json({ origins: await listTenantOrigins(c.env, tenantId) });
 });
 
 api.post("/tenants/:tenantId/origins", async (c) => {
   const tenantId = c.req.param("tenantId");
-  await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId);
   await rateLimitByIp(c, `origins:${tenantId}`, 60, 3600);
   const body = await jsonBody(c);
   const raw = body["origin"];
   if (typeof raw !== "string") throw badRequest('"origin" must be a string');
   const saved = await addTenantOrigin(c.env, tenantId, raw);
+  if (saved.created) {
+    await recordAudit(c.env, {
+      tenantId,
+      actor: actorLabel(admin),
+      action: "origin.add",
+      detail: saved.origin,
+    });
+  }
   return c.json(saved, saved.created ? 201 : 200);
 });
 
 api.delete("/tenants/:tenantId/origins", async (c) => {
   const tenantId = c.req.param("tenantId");
-  await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId);
   const body = await jsonBody(c);
   const raw = body["origin"];
   if (typeof raw !== "string") throw badRequest('"origin" must be a string');
   const removed = await removeTenantOrigin(c.env, tenantId, raw);
   if (!removed) throw notFound("Origin is not on the allowlist");
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "origin.remove",
+    detail: raw.slice(0, 200),
+  });
   return c.json({ removed: true });
+});
+
+api.get("/tenants/:tenantId/audit", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  return c.json({ events: await listAuditEvents(c.env, tenantId) });
+});
+
+api.get("/tenants/:tenantId/polls/:pollId/export", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "read");
+  const poll = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
+  const results = await computeResults(c.env, originOf(c), poll);
+  const format = c.req.query("format") === "csv" ? "csv" : "json";
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "results.export",
+    target: poll.id,
+    detail: format,
+  });
+  if (format === "csv") {
+    c.header("content-type", "text/csv; charset=utf-8");
+    c.header("content-disposition", 'attachment; filename="results.csv"');
+    return c.body(resultsToCsv(poll, results));
+  }
+  c.header("content-disposition", 'attachment; filename="results.json"');
+  return c.json({ poll: pollToJson(originOf(c), poll, await listOptionRows(c.env, poll.id)), results });
+});
+
+api.get("/tenants/:tenantId/export", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "read");
+  const tenant = await c.env.DB.prepare("SELECT id, name, created_at FROM tenants WHERE id = ?1")
+    .bind(tenantId)
+    .first<{ id: string; name: string; created_at: string }>();
+  if (!tenant) throw notFound("Workspace not found");
+  const polls = await c.env.DB.prepare("SELECT * FROM polls WHERE tenant_id = ?1")
+    .bind(tenantId)
+    .all<PollRow>();
+  const exported = [];
+  for (const poll of polls.results) {
+    const options = await listOptionRows(c.env, poll.id);
+    exported.push({
+      poll: pollToJson(originOf(c), poll, options),
+      results: await computeResults(c.env, originOf(c), poll),
+    });
+  }
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "tenant.export",
+  });
+  c.header("content-disposition", 'attachment; filename="workspace.json"');
+  return c.json({
+    tenant,
+    polls: exported,
+    origins: await listTenantOrigins(c.env, tenantId),
+    api_keys: (await listApiKeys(c.env, tenantId)).map(publicKey),
+    audit: await listAuditEvents(c.env, tenantId, 200),
+  });
+});
+
+api.delete("/tenants/:tenantId", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId);
+  const body = await jsonBody(c);
+  const confirm = body["confirm_name"];
+  if (typeof confirm !== "string") throw badRequest('"confirm_name" must match the workspace name');
+  const tenant = await c.env.DB.prepare("SELECT name FROM tenants WHERE id = ?1")
+    .bind(tenantId)
+    .first<{ name: string }>();
+  if (!tenant) throw notFound("Workspace not found");
+  if (confirm !== tenant.name) throw badRequest('"confirm_name" must match the workspace name');
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "tenant.delete",
+    detail: tenant.name.slice(0, 80),
+  });
+  await c.env.DB.prepare("DELETE FROM tenants WHERE id = ?1").bind(tenantId).run();
+  return c.json({ deleted: true });
 });
 
 export { ApiError };

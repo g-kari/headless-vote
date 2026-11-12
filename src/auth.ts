@@ -1,8 +1,9 @@
-import { sha256Hex, signValue, verifySignedValue } from "./crypto";
-import { unauthorized } from "./errors";
+import { signValue, verifySignedValue } from "./crypto";
+import { forbidden, unauthorized } from "./errors";
+import { findActiveApiKey, touchApiKey } from "./keys";
 import { verifyJwt } from "./oidc";
 import { assertSameOriginMutation } from "./security";
-import type { AdminPrincipal, AppContext, Env, SessionUser, TenantRow } from "./types";
+import type { AdminPrincipal, ApiScope, AppContext, Env, SessionUser, TenantRow } from "./types";
 
 type Ctx = AppContext;
 
@@ -14,10 +15,8 @@ export async function findTenantByApiKey(
   env: Env,
   apiKey: string,
 ): Promise<TenantRow | null> {
-  const hash = await sha256Hex(apiKey);
-  return env.DB.prepare("SELECT * FROM tenants WHERE api_key_hash = ?1")
-    .bind(hash)
-    .first<TenantRow>();
+  const found = await findActiveApiKey(env, apiKey);
+  return found?.tenant ?? null;
 }
 
 export function bearerToken(c: Ctx): string | null {
@@ -175,14 +174,25 @@ export async function listTenantsForUser(
 export async function requireAdmin(
   c: Ctx,
   tenantId: string,
+  need: ApiScope = "write",
 ): Promise<AdminPrincipal> {
   const token = bearerToken(c);
   if (token) {
-    const tenant = await findTenantByApiKey(c.env, token);
-    if (tenant && tenant.id === tenantId) {
-      return { kind: "api_key", tenantId };
+    const found = await findActiveApiKey(c.env, token);
+    if (!found || found.tenant.id !== tenantId) {
+      throw unauthorized("INVALID_API_KEY", "API key is not valid for this tenant");
     }
-    throw unauthorized("INVALID_API_KEY", "API key is not valid for this tenant");
+    if (need === "write" && found.key.scope !== "write") {
+      throw forbidden("This API key is read-only");
+    }
+    await touchApiKey(c.env, found.key.id);
+    return {
+      kind: "api_key",
+      tenantId,
+      keyId: found.key.id,
+      prefix: found.key.key_prefix,
+      scope: found.key.scope,
+    };
   }
   const method = c.req.method.toUpperCase();
   if (method !== "GET" && method !== "HEAD") {

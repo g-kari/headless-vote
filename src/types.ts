@@ -50,6 +50,7 @@ export interface PollRow {
   status: "draft" | "published" | "closed";
   allow_multiple: number;
   require_login: number;
+  opens_at: string | null;
   closes_at: string | null;
   created_at: string;
   updated_at: string;
@@ -67,8 +68,10 @@ export interface OptionRow {
 }
 
 /** Authenticated principal for admin operations (exactly one of the two). */
+export type ApiScope = "read" | "write";
+
 export type AdminPrincipal =
-  | { kind: "api_key"; tenantId: string }
+  | { kind: "api_key"; tenantId: string; keyId: string; prefix: string; scope: ApiScope }
   | { kind: "session"; tenantId: string; sub: string };
 
 /** A signed-in 0g0-id user (admin UI session). */

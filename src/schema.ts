@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS polls (
   status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'closed')),
   allow_multiple INTEGER NOT NULL DEFAULT 0,
   require_login INTEGER NOT NULL DEFAULT 0,
+  opens_at TEXT,
   closes_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -85,6 +86,30 @@ CREATE TABLE IF NOT EXISTS oidc_states (
   state_hash TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  key_hash TEXT NOT NULL UNIQUE,
+  key_prefix TEXT NOT NULL,
+  scope TEXT NOT NULL CHECK (scope IN ('read', 'write')),
+  created_at TEXT NOT NULL,
+  revoked_at TEXT,
+  last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id, created_at);
 `;
 
 /** Split a multi-statement SQL script into individual statements. */

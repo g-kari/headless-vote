@@ -101,6 +101,7 @@ export function pollToJson(origin: string, poll: PollRow, options: OptionRow[]) 
     status: poll.status,
     allow_multiple: poll.allow_multiple === 1,
     require_login: poll.require_login === 1,
+    opens_at: poll.opens_at,
     closes_at: poll.closes_at,
     created_at: poll.created_at,
     updated_at: poll.updated_at,
@@ -123,6 +124,19 @@ export async function listOptionRows(env: Env, pollId: string): Promise<OptionRo
   return res.results;
 }
 
+/** True when a published poll has an open time that is still in the future. */
+export function isNotYetOpen(poll: PollRow, now = new Date()): boolean {
+  if (!poll.opens_at) return false;
+  const time = Date.parse(poll.opens_at);
+  return !Number.isNaN(time) && time > now.getTime();
+}
+
+export function assertSchedule(opensAt: string | null, closesAt: string | null): void {
+  if (opensAt && closesAt && Date.parse(opensAt) >= Date.parse(closesAt)) {
+    throw badRequest('"opens_at" must be earlier than "closes_at"');
+  }
+}
+
 /** A poll rejects new votes when closed manually or past its deadline. */
 export function isClosedForVoting(poll: PollRow, now = new Date()): boolean {
   if (poll.status === "closed") return true;
@@ -133,6 +147,7 @@ export function isClosedForVoting(poll: PollRow, now = new Date()): boolean {
 export interface PollResults {
   poll_id: string;
   status: PollRow["status"];
+  opens_at: string | null;
   closes_at: string | null;
   total_voters: number;
   total_votes: number;
@@ -167,6 +182,7 @@ export async function computeResults(
   return {
     poll_id: poll.id,
     status: poll.status,
+    opens_at: poll.opens_at,
     closes_at: poll.closes_at,
     total_voters: Number(totals?.voters ?? 0),
     total_votes: Number(totals?.votes ?? 0),

@@ -5,8 +5,9 @@ import {
   listTenantOrigins,
   removeTenantOrigin,
 } from "../cors";
-import { randomId, randomToken, sha256Hex } from "../crypto";
-import { computeResults, getPollRow, listOptionRows, nowIso } from "../domain";
+import { listAuditEvents } from "../audit";
+import { computeResults, getPollRow, listOptionRows } from "../domain";
+import { issueApiKey, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
 import { ApiError } from "../errors";
 import {
   assertSameOriginMutation,
@@ -137,17 +138,7 @@ ui.post("/admin/workspaces", async (c) => {
       400,
     );
   }
-  const tenantId = randomId();
-  const apiKey = randomToken("hvk");
-  const now = nowIso();
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      "INSERT INTO tenants (id, name, api_key_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-    ).bind(tenantId, name, await sha256Hex(apiKey), now),
-    c.env.DB.prepare(
-      "INSERT INTO tenant_members (tenant_id, user_sub, role, created_at) VALUES (?1, ?2, 'owner', ?3)",
-    ).bind(tenantId, user.sub, now),
-  ]);
+  const { tenantId, apiKey } = await provisionTenant(c.env, name, user.sub);
   const body = `
     <h1>ワークスペースを作成しました</h1>
     <section class="card">
@@ -191,6 +182,12 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
   )
     .bind(tenantId)
     .all<PollRow>();
+  const keys = await listApiKeys(c.env, tenantId);
+  const keyItems = keys
+    .map(
+      (key) => `<li>${escapeHtml(key.name)} <code>${escapeHtml(key.key_prefix)}…</code> ${key.scope === "write" ? "読み書き" : "読み取り"} ${key.revoked_at ? '<span class="badge closed">失効</span>' : `<form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/api-keys/revoke" style="display:inline"><input type="hidden" name="key_id" value="${escapeHtml(key.id)}"><button class="btn small danger" type="submit">失効</button></form>`}</li>`,
+    )
+    .join("");
   const rows = polls.results
     .map(
       (p) => `<tr>
@@ -206,9 +203,11 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
   const body = `
     <p class="muted small"><a href="/admin">ワークスペース一覧</a></p>
     <h1>${escapeHtml(tenant.name)}</h1>
+    <p class="muted">投票 ${polls.results.length} 件（公開中 ${polls.results.filter((p) => p.status === "published").length}）／ 記録された票 ${Number((await c.env.DB.prepare("SELECT COUNT(*) AS n FROM vote_ballots WHERE poll_id IN (SELECT id FROM polls WHERE tenant_id = ?1)").bind(tenantId).first<{ n: number }>())?.n ?? 0)} 件。1 ワークスペースあたり投票は 100 件、有効な API キーは 10 個までです。</p>
     <div class="actions">
       <a class="btn primary" href="/admin/workspaces/${escapeHtml(tenantId)}/polls/new">新しい投票を作る</a>
       <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/settings">埋め込み設定</a>
+      <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/audit">操作履歴</a>
     </div>
     <h2>投票一覧</h2>
     <section class="card">
@@ -216,7 +215,20 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
     </section>
     <h2>API キー</h2>
     <section class="card">
-      <p class="muted">管理 API（<code>/api/v1/tenants/${tenantId}/…</code>）の認証には、このワークスペースの API キーを使います。キーを再発行すると、古いキーは使えなくなります。</p>
+      <p class="muted">管理 API のキーは SHA-256 で保存し、作成時に一度だけ表示します。<code>read</code> は参照と書き出し、<code>write</code> は作成・更新・失効もできます。</p>
+      ${keyItems ? `<ul>${keyItems}</ul>` : ""}
+      <form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/api-keys" aria-labelledby="key-heading">
+        <h3 id="key-heading">新しいキー</h3>
+        <label for="key-name">名前</label>
+        <input id="key-name" name="name" type="text" required maxlength="80" autocomplete="off">
+        <label for="key-scope">権限</label>
+        <select id="key-scope" name="scope">
+          <option value="read">読み取り</option>
+          <option value="write" selected>読み書き</option>
+        </select>
+        <div class="actions"><button class="btn" type="submit">発行する</button></div>
+      </form>
+      <p class="muted">下の再発行は、いま有効なキーをすべて失効させて書き込みキーを 1 つ作ります。</p>
       <button class="btn danger" type="button" id="open-rotate">API キーを再発行する</button>
       <dialog id="rotate-dialog" aria-labelledby="rotate-dialog-title">
         <h2 id="rotate-dialog-title">API キーを再発行しますか？</h2>
@@ -255,10 +267,13 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
   if (!user) return c.redirect("/admin", 302);
   assertSameOriginMutation(c);
   await readUrlEncodedForm(c);
-  const apiKey = randomToken("hvk");
-  await c.env.DB.prepare("UPDATE tenants SET api_key_hash = ?1 WHERE id = ?2")
-    .bind(await sha256Hex(apiKey), tenantId)
-    .run();
+  const actor = { kind: "session" as const, tenantId, sub: user.sub };
+  const existing = await listApiKeys(c.env, tenantId);
+  for (const key of existing) {
+    if (!key.revoked_at) await revokeApiKey(c.env, tenantId, key.id, actor);
+  }
+  const issued = await issueApiKey(c.env, tenantId, "再発行", "write", actor);
+  const apiKey = issued.apiKey;
   const body = `
     <h1>API キーを再発行しました</h1>
     <section class="card">
@@ -275,6 +290,60 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
       nonce: c.get("cspNonce") ?? "",
     }),
   );
+});
+
+ui.post("/admin/workspaces/:tenantId/api-keys", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  const name = String(form.get("name") ?? "").trim();
+  const scope = form.get("scope") === "read" ? "read" : "write";
+  try {
+    const issued = await issueApiKey(c.env, tenantId, name, scope, {
+      kind: "session",
+      tenantId,
+      sub: user.sub,
+    });
+    const body = `
+      <h1>API キーを発行しました</h1>
+      <section class="card">
+        <div class="notice"><strong>このキーは今だけ表示されます。</strong> ${escapeHtml(issued.key.prefix)}… / ${issued.key.scope}</div>
+        <p><code style="font-size:1.05rem">${escapeHtml(issued.apiKey)}</code></p>
+        <div class="actions"><a class="btn primary" href="/admin/workspaces/${escapeHtml(tenantId)}">ワークスペースに戻る</a></div>
+      </section>`;
+    return c.html(layout({
+      title: "API キーを発行しました",
+      userEmail: user.email ?? user.sub,
+      body,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }));
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    return c.html(layout({
+      title: "エラー",
+      userEmail: user.email ?? user.sub,
+      body: `<h1>キーを発行できません</h1><p class="muted">${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}">戻る</a></p>`,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 400);
+  }
+});
+
+ui.post("/admin/workspaces/:tenantId/api-keys/revoke", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  const keyId = String(form.get("key_id") ?? "");
+  if (!normalizeUuid(keyId)) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
+  await revokeApiKey(c.env, tenantId, keyId, { kind: "session", tenantId, sub: user.sub });
+  return c.redirect(`/admin/workspaces/${tenantId}`, 303);
 });
 
 /* ------------------------------------------------------------------ */
@@ -315,6 +384,17 @@ function settingsBody(
         <label for="origin">オリジン <span class="hint">例: https://www.example.com 。https のみ（localhost は http も可）。</span></label>
         <input id="origin" name="origin" type="url" required maxlength="200" placeholder="https://www.example.com" spellcheck="false" autocapitalize="none" autocomplete="off" inputmode="url">
         <div class="actions"><button class="btn primary" type="submit">追加する</button></div>
+      </form>
+    </section>
+    <h2>ワークスペースの書き出しと削除</h2>
+    <section class="card">
+      <p class="muted">書き出しには設問、集計、許可オリジン、キーのメタデータ、操作履歴が含まれます。投票者トークンやキーの秘密は含みません。</p>
+      <p><a class="btn" href="/api/v1/tenants/${tid}/export">JSON で書き出す</a></p>
+      <form method="post" action="/admin/workspaces/${tid}/delete" aria-labelledby="delete-heading">
+        <h3 id="delete-heading">削除</h3>
+        <label for="confirm-name">確認のためワークスペース名を入力</label>
+        <input id="confirm-name" name="confirm_name" type="text" required maxlength="120" autocomplete="off">
+        <div class="actions"><button class="btn danger" type="submit">ワークスペースを削除する</button></div>
       </form>
     </section>`;
 }
@@ -380,6 +460,65 @@ ui.post("/admin/workspaces/:tenantId/origins/remove", async (c) => {
   const form = await readUrlEncodedForm(c);
   await removeTenantOrigin(c.env, tenantId, String(form.get("origin") ?? ""));
   return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
+});
+
+ui.post("/admin/workspaces/:tenantId/delete", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  const tenant = await c.env.DB.prepare("SELECT name FROM tenants WHERE id = ?1")
+    .bind(tenantId)
+    .first<{ name: string }>();
+  if (!tenant || String(form.get("confirm_name") ?? "") !== tenant.name) {
+    const origins = await listTenantOrigins(c.env, tenantId);
+    return c.html(layout({
+      title: "埋め込み設定",
+      userEmail: user.email ?? user.sub,
+      body: settingsBody(tenantId, tenant?.name ?? "", origins, "ワークスペース名が一致しません。"),
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 400);
+  }
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM audit_events WHERE tenant_id = ?1").bind(tenantId),
+    c.env.DB.prepare("DELETE FROM tenants WHERE id = ?1").bind(tenantId),
+  ]);
+  return c.redirect("/admin", 303);
+});
+
+ui.get("/admin/workspaces/:tenantId/audit", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  const events = await listAuditEvents(c.env, tenantId);
+  const rows = events
+    .map(
+      (event) => `<tr>
+        <td data-label="日時">${escapeHtml(event.created_at)}</td>
+        <td data-label="操作">${escapeHtml(event.action)}</td>
+        <td data-label="実行者">${escapeHtml(event.actor)}</td>
+        <td data-label="対象">${escapeHtml(event.target ?? "")}</td>
+        <td data-label="内容">${escapeHtml(event.detail)}</td>
+      </tr>`,
+    )
+    .join("");
+  const body = `
+    <p class="muted small"><a href="/admin/workspaces/${escapeHtml(tenantId)}">ワークスペースに戻る</a></p>
+    <h1>操作履歴</h1>
+    <section class="card">
+      ${rows ? `<div class="table-wrapper" tabindex="0" role="region" aria-label="操作履歴"><table><thead><tr><th scope="col">日時</th><th scope="col">操作</th><th scope="col">実行者</th><th scope="col">対象</th><th scope="col">内容</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">まだ記録がありません。</p>'}
+    </section>`;
+  return c.html(layout({
+    title: "操作履歴",
+    userEmail: user.email ?? user.sub,
+    body,
+    origin: originOf(c),
+    nonce: c.get("cspNonce") ?? "",
+  }));
 });
 
 /* ------------------------------------------------------------------ */
@@ -469,12 +608,14 @@ async function submitPoll(ev) {
     }
     if (options.length < 2) throw new Error('選択肢は2つ以上必要です');
     const closesRaw = document.getElementById('closes-at').value;
+    const opensRaw = document.getElementById('opens-at').value;
     const payload = {
       question: document.getElementById('question').value.trim(),
       description: document.getElementById('description').value,
       image_key: document.getElementById('poll-image-key').value || null,
       allow_multiple: document.getElementById('allow-multiple').checked,
       require_login: document.getElementById('require-login').checked,
+      opens_at: opensRaw ? new Date(opensRaw).toISOString() : null,
       closes_at: closesRaw ? new Date(closesRaw).toISOString() : null,
       options,
     };
@@ -534,6 +675,8 @@ function pollFormBody(opts: {
         <input id="poll-image-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
         <input type="hidden" id="poll-image-key" value="${escapeHtml(p?.image_key ?? "")}">
       </div>
+      <label for="opens-at">開始日時 <span class="hint">任意。空欄なら公開後すぐに投票できます。</span></label>
+      <input id="opens-at" type="datetime-local" value="${p?.opens_at ? escapeHtml(p.opens_at.slice(0, 16)) : ""}">
       <label for="closes-at">締切日時 <span class="hint">任意。空欄なら手動で締め切るまで投票できます。</span></label>
       <input id="closes-at" type="datetime-local" value="${closesLocal}">
       <div class="check">
@@ -604,9 +747,54 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
     </div>
     <h2>公開 API</h2>
     <section class="card">
-      <p class="small">投票の取得: <code>GET ${origin}/api/v1/polls/${poll.id}</code><br>
-      投票の実行: <code>POST ${origin}/api/v1/polls/${poll.id}/vote</code><br>
-      結果の取得: <code>GET ${origin}/api/v1/polls/${poll.id}/results</code></p>
+      <p class="small">投票の取得: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}</code><br>
+      投票の実行: <code>POST ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/vote</code><br>
+      結果の取得: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/results</code></p>
+      ${poll.status === "draft" ? "" : `<h3>埋め込み用スニペット</h3>
+      <p class="muted small">別サイトから呼ぶときは、そのオリジンを埋め込み設定に追加してください。開始前は POLL_NOT_OPEN、締切後は POLL_CLOSED が返ります。</p>
+      <div class="copyable">
+        <span class="copy">
+          <button type="button" class="btn small copy-button" command="--copy" commandfor="embed-snippet">スニペットをコピー</button>
+          <span class="tip" role="status"></span>
+        </span>
+        <pre id="embed-snippet" tabindex="0">${escapeHtml(`const pollId = "${poll.id}";
+const base = "${origin}";
+const poll = await fetch(base + "/api/v1/polls/" + pollId).then((r) => r.json());
+await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ voter_token: "stable-id-for-this-voter", option_ids: [poll.poll.options[0].id] }),
+});`)}</pre>
+      </div>
+      ${scriptTag(nonce, `
+        function copyText(button, target) {
+          const text = target && target.innerText ? target.innerText.trim() : "";
+          if (!text) return;
+          const tip = button.nextElementSibling;
+          const finish = (ok) => {
+            button.removeAttribute("data-copied");
+            button.removeAttribute("data-failed");
+            button.setAttribute(ok ? "data-copied" : "data-failed", "");
+            if (tip) tip.textContent = ok ? "コピーしました" : "コピーできませんでした";
+          };
+          const write = navigator.clipboard && navigator.clipboard.writeText
+            ? navigator.clipboard.writeText(text)
+            : Promise.reject();
+          write.then(() => finish(true)).catch(() => finish(false));
+        }
+        if ("CommandEvent" in window) {
+          document.addEventListener("command", (event) => {
+            if (event.command === "--copy") copyText(event.source, event.target);
+          }, true);
+        } else {
+          document.addEventListener("click", (event) => {
+            const button = event.target.closest && event.target.closest('button[command="--copy"]');
+            if (!button) return;
+            const target = document.getElementById(button.getAttribute("commandfor"));
+            if (target) copyText(button, target);
+          });
+        }
+      `)}`}
     </section>
     <div id="flash" class="notice bad" role="alert" hidden></div>
     <dialog id="status-dialog" aria-labelledby="status-dialog-title">
@@ -692,6 +880,10 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
   const body = `
     <p class="muted small"><a href="/admin/workspaces/${tenantId}/polls/${pollId}">投票に戻る</a></p>
     <h1>結果</h1>
+    <div class="actions">
+      <a class="btn" href="/api/v1/tenants/${escapeHtml(tenantId)}/polls/${escapeHtml(pollId)}/export?format=csv">CSV で書き出す</a>
+      <a class="btn" href="/api/v1/tenants/${escapeHtml(tenantId)}/polls/${escapeHtml(pollId)}/export?format=json">JSON で書き出す</a>
+    </div>
     <section class="card">
       <div class="poll-head">
         <div style="flex:1;min-width:260px">

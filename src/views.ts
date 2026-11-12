@@ -103,6 +103,12 @@ dialog:modal{overscroll-behavior:contain}
 dialog::backdrop{background:rgba(0,0,0,.45);overflow:hidden;overscroll-behavior:contain}
 dialog h2{margin-top:0;font-size:1.1rem}
 .dialog-actions{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1rem}
+.copyable{display:flex;align-items:flex-start;gap:.6rem}
+.copy{display:flex;flex-direction:column;gap:.25rem;flex:none}
+.copy-button{min-inline-size:1.5rem;min-block-size:1.5rem}
+.tip{font-size:.85rem;color:var(--ok);opacity:1}
+.copy-button[data-failed]+.tip{color:var(--danger)}
+pre{padding-inline-end:1rem}
 /* Action results announced via a live region (accessible-error-announcement). */
 .notice.ok{border-color:var(--ok);background:color-mix(in srgb,var(--ok) 10%,var(--surface))}
 .notice.bad{border-color:var(--danger);background:color-mix(in srgb,var(--danger) 8%,var(--surface))}
