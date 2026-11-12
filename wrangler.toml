@@ -22,13 +22,13 @@ not_found_handling = "none"
 # confidential clients, OIDC_CLIENT_SECRET) are set with `wrangler secret put`.
 [vars]
 OIDC_ISSUER = "https://id.0g0.xyz"
-OIDC_CLIENT_ID = ""
+OIDC_CLIENT_ID = "cc4982bfefdddef9129577fd9a239946"
 OIDC_SCOPES = "openid profile email"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "headless-vote"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "4c266b0f-c748-4037-88c0-ab2dce040681"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
