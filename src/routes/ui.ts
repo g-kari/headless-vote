@@ -6,6 +6,7 @@ import {
   removeTenantOrigin,
 } from "../cors";
 import { listAuditEvents } from "../audit";
+import { listQuestionRows } from "../questions";
 import { computeResults, getPollRow, listOptionRows } from "../domain";
 import { issueApiKey, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
 import { ApiError } from "../errors";
@@ -529,10 +530,10 @@ function pollFormScript(tenantId: string, pollId: string | null, nonce: string):
   const code = `
 const TENANT = ${safeJsonForScript(tenantId)};
 const POLL_ID = ${safeJsonForScript(pollId)};
-const optionsEl = document.getElementById('options');
+const questionsEl = document.getElementById('questions');
 const errorEl = document.getElementById('form-error');
 
-function addOptionRow(label, imageKey) {
+function addOptionRow(list, label, imageKey, optionId) {
   const row = document.createElement('div');
   row.className = 'option-row';
   const input = document.createElement('input');
@@ -563,15 +564,87 @@ function addOptionRow(label, imageKey) {
   key.type = 'hidden';
   key.className = 'opt-key';
   key.value = imageKey || '';
+  const idInput = document.createElement('input');
+  idInput.type = 'hidden';
+  idInput.className = 'opt-id';
+  idInput.value = optionId || '';
   const remove = document.createElement('button');
   remove.type = 'button';
   remove.className = 'btn small danger opt-remove';
   remove.textContent = '削除';
   remove.addEventListener('click', () => row.remove());
-  row.append(fileLabel, key, remove);
-  optionsEl.append(row);
+  row.append(fileLabel, key, idInput, remove);
+  list.append(row);
 }
-document.getElementById('add-option').addEventListener('click', () => addOptionRow('', null));
+
+function addQuestionCard(data) {
+  const card = document.createElement('section');
+  card.className = 'card question-card';
+  const prompt = document.createElement('input');
+  prompt.type = 'text';
+  prompt.className = 'q-prompt';
+  prompt.maxLength = 300;
+  prompt.required = true;
+  prompt.placeholder = '設問文';
+  prompt.value = (data && data.prompt) || '';
+  const kind = document.createElement('select');
+  kind.className = 'q-kind';
+  for (const [value, label] of [['single', '単一選択'], ['multiple', '複数選択'], ['text', '自由記述']]) {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    if (data && data.kind === value) opt.selected = true;
+    kind.append(opt);
+  }
+  const requiredLabel = document.createElement('label');
+  requiredLabel.className = 'check';
+  const required = document.createElement('input');
+  required.type = 'checkbox';
+  required.className = 'q-required';
+  required.checked = !data || data.required !== false;
+  requiredLabel.append(required, document.createTextNode('必須'));
+  const qid = document.createElement('input');
+  qid.type = 'hidden';
+  qid.className = 'q-id';
+  qid.value = (data && data.id) || '';
+  const options = document.createElement('div');
+  options.className = 'q-options';
+  const addOpt = document.createElement('button');
+  addOpt.type = 'button';
+  addOpt.className = 'btn small';
+  addOpt.textContent = '選択肢を追加';
+  addOpt.addEventListener('click', () => addOptionRow(options, '', null, ''));
+  const syncKind = () => { options.hidden = kind.value === 'text'; addOpt.hidden = kind.value === 'text'; };
+  kind.addEventListener('change', syncKind);
+  const up = document.createElement('button');
+  up.type = 'button';
+  up.className = 'btn small';
+  up.textContent = '上へ';
+  up.addEventListener('click', () => { if (card.previousElementSibling) questionsEl.insertBefore(card, card.previousElementSibling); });
+  const down = document.createElement('button');
+  down.type = 'button';
+  down.className = 'btn small';
+  down.textContent = '下へ';
+  down.addEventListener('click', () => { if (card.nextElementSibling) questionsEl.insertBefore(card.nextElementSibling, card); });
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'btn small danger';
+  del.textContent = '設問を削除';
+  del.addEventListener('click', () => card.remove());
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  actions.append(up, down, del);
+  card.append(prompt, kind, requiredLabel, qid, options, addOpt, actions);
+  questionsEl.append(card);
+  const seedOptions = (data && data.options) || [];
+  if (seedOptions.length === 0 && (!data || data.kind !== 'text')) {
+    addOptionRow(options, '', null, '');
+    addOptionRow(options, '', null, '');
+  }
+  for (const o of seedOptions) addOptionRow(options, o.label, o.image_key, o.id);
+  syncKind();
+}
+document.getElementById('add-question').addEventListener('click', () => addQuestionCard(null));
 
 async function uploadImage(file) {
   const res = await fetch('/api/v1/tenants/' + TENANT + '/images', {
@@ -598,26 +671,44 @@ async function submitPoll(ev) {
   errorEl.style.display = 'none';
   try {
     await uploadFrom(document.getElementById('poll-image-row'), '#poll-image-file', '#poll-image-key');
-    const options = [];
-    for (const row of optionsEl.querySelectorAll('.option-row')) {
-      await uploadFrom(row, '.opt-file', '.opt-key');
-      const label = row.querySelector('.opt-label').value.trim();
-      if (!label) throw new Error('選択肢の文言が空です');
-      const key = row.querySelector('.opt-key').value || null;
-      options.push({ label, image_key: key });
+    const questions = [];
+    for (const card of questionsEl.querySelectorAll('.question-card')) {
+      const kind = card.querySelector('.q-kind').value;
+      const prompt = card.querySelector('.q-prompt').value.trim();
+      if (!prompt) throw new Error('設問文が空です');
+      const options = [];
+      if (kind !== 'text') {
+        for (const row of card.querySelectorAll('.option-row')) {
+          await uploadFrom(row, '.opt-file', '.opt-key');
+          const label = row.querySelector('.opt-label').value.trim();
+          if (!label) throw new Error('選択肢の文言が空です');
+          const imageKey = row.querySelector('.opt-key').value || null;
+          const id = row.querySelector('.opt-id').value || undefined;
+          options.push({ id, label, image_key: imageKey });
+        }
+        if (options.length < 2) throw new Error('選択式の設問には選択肢が2つ以上必要です');
+      }
+      const id = card.querySelector('.q-id').value || undefined;
+      questions.push({
+        id,
+        prompt,
+        kind,
+        required: card.querySelector('.q-required').checked,
+        options,
+      });
     }
-    if (options.length < 2) throw new Error('選択肢は2つ以上必要です');
+    if (questions.length < 1) throw new Error('設問は1つ以上必要です');
+    if (questions.length > 20) throw new Error('設問は20個までです');
     const closesRaw = document.getElementById('closes-at').value;
     const opensRaw = document.getElementById('opens-at').value;
     const payload = {
       question: document.getElementById('question').value.trim(),
       description: document.getElementById('description').value,
       image_key: document.getElementById('poll-image-key').value || null,
-      allow_multiple: document.getElementById('allow-multiple').checked,
       require_login: document.getElementById('require-login').checked,
       opens_at: opensRaw ? new Date(opensRaw).toISOString() : null,
       closes_at: closesRaw ? new Date(closesRaw).toISOString() : null,
-      options,
+      questions,
     };
     const url = POLL_ID
       ? '/api/v1/tenants/' + TENANT + '/polls/' + POLL_ID
@@ -641,9 +732,8 @@ document.getElementById('poll-form').addEventListener('submit', submitPoll);
 const seedEl = document.getElementById('poll-seed');
 let pending = [];
 try { pending = JSON.parse(seedEl && seedEl.textContent ? seedEl.textContent : '[]'); } catch (e) { pending = []; }
-if (!Array.isArray(pending)) pending = [];
-for (const o of pending) addOptionRow(o.label, o.image_key);
-if (pending.length === 0) { addOptionRow('', null); addOptionRow('', null); }
+if (!Array.isArray(pending) || pending.length === 0) addQuestionCard(null);
+else for (const q of pending) addQuestionCard(q);
 `;
   return scriptTag(nonce, code);
 }
@@ -651,14 +741,18 @@ if (pending.length === 0) { addOptionRow('', null); addOptionRow('', null); }
 function pollFormBody(opts: {
   tenantId: string;
   poll: PollRow | null;
-  options: { label: string; image_key: string | null }[];
+  questions: {
+    id: string;
+    prompt: string;
+    kind: string;
+    required: boolean;
+    options: { id: string; label: string; image_key: string | null }[];
+  }[];
   nonce: string;
 }): string {
   const p = opts.poll;
   const closesLocal = p?.closes_at ? escapeHtml(p.closes_at.slice(0, 16)) : "";
-  const seed = safeJsonForScript(
-    opts.options.map((o) => ({ label: o.label, image_key: o.image_key })),
-  );
+  const seed = safeJsonForScript(opts.questions);
   return `
     <p class="muted small"><a href="/admin/workspaces/${opts.tenantId}">ワークスペースに戻る</a></p>
     <h1>${p ? "投票を編集" : "新しい投票を作る"}</h1>
@@ -680,18 +774,14 @@ function pollFormBody(opts: {
       <label for="closes-at">締切日時 <span class="hint">任意。空欄なら手動で締め切るまで投票できます。</span></label>
       <input id="closes-at" type="datetime-local" value="${closesLocal}">
       <div class="check">
-        <input id="allow-multiple" type="checkbox" ${p?.allow_multiple === 1 ? "checked" : ""}>
-        <label for="allow-multiple" style="margin:0"><span>複数選択を許可する</span>
-        <small>オフの場合は1つだけ選ぶ投票になります。</small></label>
-      </div>
-      <div class="check">
         <input id="require-login" type="checkbox" ${p?.require_login === 1 ? "checked" : ""}>
         <label for="require-login" style="margin:0"><span>ログイン必須にする</span>
         <small>オンにすると 0g0-id でログインした人だけが投票できます。オフ（既定）なら誰でも投票できます。</small></label>
       </div>
-      <h2>選択肢</h2>
-      <div id="options"></div>
-      <div class="actions"><button type="button" class="btn" id="add-option">選択肢を追加</button></div>
+      <h2>設問</h2>
+      <p class="muted small">各設問は単一選択、複数選択、または自由記述です。並び順は上から下です。最大 20 問。</p>
+      <div id="questions"></div>
+      <div class="actions"><button type="button" class="btn" id="add-question">設問を追加</button></div>
       <div class="actions"><button class="btn primary" type="submit">${p ? "変更を保存" : "下書きとして作成"}</button></div>
     </form>
     </section>
@@ -708,7 +798,7 @@ ui.get("/admin/workspaces/:tenantId/polls/new", async (c) => {
     layout({
       title: "新しい投票を作る",
       userEmail: user.email ?? user.sub,
-      body: pollFormBody({ tenantId, poll: null, options: [], nonce: c.get("cspNonce") ?? "" }),
+      body: pollFormBody({ tenantId, poll: null, questions: [], nonce: c.get("cspNonce") ?? "" }),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }),
@@ -725,6 +815,18 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
   const poll = await getPollRow(c.env, pollId);
   if (!poll || poll.tenant_id !== tenantId) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
   const options = await listOptionRows(c.env, pollId);
+  const questionRows = await listQuestionRows(c.env, pollId);
+  const questionSeed = questionRows.map((q) => ({
+    id: q.id,
+    prompt: q.prompt,
+    kind: q.kind,
+    required: q.required === 1,
+    options: options.filter((o) => o.question_id === q.id).map((o) => ({
+      id: o.id,
+      label: o.label,
+      image_key: o.image_key,
+    })),
+  }));
   const origin = originOf(c);
   const nonce = c.get("cspNonce") ?? "";
   const statusActions =
@@ -760,10 +862,13 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
         <pre id="embed-snippet" tabindex="0">${escapeHtml(`const pollId = "${poll.id}";
 const base = "${origin}";
 const poll = await fetch(base + "/api/v1/polls/" + pollId).then((r) => r.json());
+const answers = poll.poll.questions.map((q) => q.kind === "text"
+  ? { question_id: q.id, text: "" }
+  : { question_id: q.id, option_ids: [q.options[0].id] });
 await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
   method: "POST",
   headers: { "content-type": "application/json" },
-  body: JSON.stringify({ voter_token: "stable-id-for-this-voter", option_ids: [poll.poll.options[0].id] }),
+  body: JSON.stringify({ voter_token: "stable-id-for-this-voter", answers }),
 });`)}</pre>
       </div>
       ${scriptTag(nonce, `
@@ -839,7 +944,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
         flash.hidden = false;
       });
     `)}
-    ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, options, nonce }) : `<h2>内容</h2><section class="card"><p>${escapeHtml(poll.description || "")}</p><ul>${options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul></section>`}`;
+    ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, questions: questionSeed, nonce }) : `<h2>内容</h2><section class="card">${questionSeed.map((q) => `<h3>${escapeHtml(q.prompt)}</h3><p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : "単一選択"}</p><ul>${q.options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul>`).join("")}</section>`}`;
   return c.html(
     layout({
       title: poll.question,
@@ -864,19 +969,33 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
   if (!user) return c.redirect("/admin", 302);
   const poll = await getPollRow(c.env, pollId);
   if (!poll || poll.tenant_id !== tenantId) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
-  const results = await computeResults(c.env, originOf(c), poll);
-  const maxVotes = Math.max(1, ...results.options.map((o) => o.votes));
-  const bars = results.options
-    .map((o) => {
-      const pct = results.total_votes > 0 ? Math.round((o.votes / results.total_votes) * 1000) / 10 : 0;
+  const results = await computeResults(c.env, originOf(c), poll, { includeText: true });
+  const sections = (results.questions.length > 0 ? results.questions : [{
+    id: poll.id,
+    prompt: poll.question,
+    kind: "single" as const,
+    required: true,
+    position: 0,
+    response_count: results.total_voters,
+    options: results.options,
+    texts: [] as string[],
+  }]).map((q) => {
+    const denom = q.options.reduce((sum, o) => sum + o.votes, 0);
+    const maxVotes = Math.max(1, ...q.options.map((o) => o.votes));
+    const bars = q.options.map((o) => {
+      const pct = denom > 0 ? Math.round((o.votes / denom) * 1000) / 10 : 0;
       const width = Math.round((o.votes / maxVotes) * 1000) / 10;
       return `<div class="bar-row">
-        <div>${o.image_url ? `<img src="${escapeHtml(o.image_url)}" alt="" style="width:34px;height:34px;object-fit:cover;border-radius:7px;vertical-align:middle;margin-right:.4rem">` : ""}${escapeHtml(o.label)}</div>
+        <div>${escapeHtml(o.label)}</div>
         <div class="bar-track" role="img" aria-label="${escapeHtml(o.label)}: ${o.votes}票 (${pct}%)"><div class="bar-fill" style="width:${width}%"></div></div>
         <div><strong>${o.votes}</strong> 票 <span class="muted">(${pct}%)</span></div>
       </div>`;
-    })
-    .join("");
+    }).join("");
+    const texts = (q.texts ?? []).map((t) => `<li>${escapeHtml(t)}</li>`).join("");
+    return `<h2>${escapeHtml(q.prompt)}</h2>
+      <p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : "単一選択"} ／ 回答 ${q.response_count}</p>
+      ${q.kind === "text" ? `<ul>${texts || '<li class="muted">まだ回答がありません。</li>'}</ul>` : bars}`;
+  }).join("");
   const body = `
     <p class="muted small"><a href="/admin/workspaces/${tenantId}/polls/${pollId}">投票に戻る</a></p>
     <h1>結果</h1>
@@ -892,13 +1011,8 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
         </div>
         ${poll.image_key ? `<img src="/images/${escapeHtml(poll.image_key)}" alt="設問の画像">` : ""}
       </div>
-      ${bars || '<p class="muted">選択肢がありません。</p>'}
-      <p class="muted small">割合は総票数に対する各選択肢の票数の割合です。複数選択の投票では、合計が100%を超えることがあります。</p>
-      <h2>集計表</h2>
-      <div class="table-wrapper" tabindex="0" role="region" aria-label="集計表">
-        <table><thead><tr><th scope="col">選択肢</th><th scope="col">票数</th><th scope="col">割合</th></tr></thead>
-        <tbody>${results.options.map((o) => { const pct = results.total_votes > 0 ? Math.round((o.votes / results.total_votes) * 1000) / 10 : 0; return `<tr><td data-label="選択肢">${escapeHtml(o.label)}</td><td data-label="票数">${o.votes}</td><td data-label="割合">${pct}%</td></tr>`; }).join("")}</tbody></table>
-      </div>
+      ${sections || '<p class="muted">設問がありません。</p>'}
+      <p class="muted small">割合は、その設問の選択票に対する割合です。複数選択では合計が100%を超えることがあります。自由記述は管理画面と書き出しにだけ全文が出ます。</p>
     </section>`;
   return c.html(
     layout({

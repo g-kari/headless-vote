@@ -1,7 +1,8 @@
 import { ensureVoterKeysHashed } from "./ballots";
 import { ApiError, badRequest } from "./errors";
+import { listQuestionRows, parseBallotDocument } from "./questions";
 import { assertPlainText, readBodyLimited } from "./security";
-import type { AppContext, Env, OptionRow, PollRow } from "./types";
+import type { AppContext, Env, OptionRow, PollRow, QuestionRow } from "./types";
 
 const MAX_JSON_BYTES = 64 * 1024;
 
@@ -92,20 +93,37 @@ export function optionToJson(origin: string, row: OptionRow) {
   };
 }
 
-export function pollToJson(origin: string, poll: PollRow, options: OptionRow[]) {
+export function pollToJson(
+  origin: string,
+  poll: PollRow,
+  options: OptionRow[],
+  questions: QuestionRow[] = [],
+) {
+  const questionJson = questions.map((q) => ({
+    id: q.id,
+    prompt: q.prompt,
+    description: q.description,
+    image_url: imageUrl(origin, q.image_key),
+    kind: q.kind,
+    required: q.required === 1,
+    position: q.position,
+    options: options.filter((o) => o.question_id === q.id).map((o) => optionToJson(origin, o)),
+  }));
+  const firstChoice = questions.find((q) => q.kind !== "text");
   return {
     id: poll.id,
     question: poll.question,
     description: poll.description,
     image_url: imageUrl(origin, poll.image_key),
     status: poll.status,
-    allow_multiple: poll.allow_multiple === 1,
+    allow_multiple: firstChoice ? firstChoice.kind === "multiple" : poll.allow_multiple === 1,
     require_login: poll.require_login === 1,
     opens_at: poll.opens_at,
     closes_at: poll.closes_at,
     created_at: poll.created_at,
     updated_at: poll.updated_at,
-    options: options.map((o) => optionToJson(origin, o)),
+    options: questionJson.flatMap((q) => q.options),
+    questions: questionJson,
   };
 }
 
@@ -144,6 +162,17 @@ export function isClosedForVoting(poll: PollRow, now = new Date()): boolean {
   return false;
 }
 
+export interface QuestionResult {
+  id: string;
+  prompt: string;
+  kind: QuestionRow["kind"];
+  required: boolean;
+  position: number;
+  response_count: number;
+  options: { id: string; label: string; image_url: string | null; votes: number }[];
+  texts?: string[];
+}
+
 export interface PollResults {
   poll_id: string;
   status: PollRow["status"];
@@ -152,45 +181,67 @@ export interface PollResults {
   total_voters: number;
   total_votes: number;
   options: { id: string; label: string; image_url: string | null; votes: number }[];
+  questions: QuestionResult[];
 }
 
 export async function computeResults(
   env: Env,
   origin: string,
   poll: PollRow,
+  opts: { includeText?: boolean } = {},
 ): Promise<PollResults> {
   await ensureVoterKeysHashed(env);
+  const questions = await listQuestionRows(env, poll.id);
   const options = await listOptionRows(env, poll.id);
-  const counts = await env.DB.prepare(
-    `SELECT j.value AS option_id, COUNT(*) AS votes
-     FROM vote_ballots AS b, json_each(b.option_ids) AS j
-     WHERE b.poll_id = ?1
-     GROUP BY j.value`,
+  const ballots = await env.DB.prepare(
+    "SELECT option_ids FROM vote_ballots WHERE poll_id = ?1",
   )
     .bind(poll.id)
-    .all<{ option_id: string; votes: number }>();
-  const byOption = new Map(
-    counts.results.map((r) => [String(r.option_id), Number(r.votes)]),
-  );
-  const totals = await env.DB.prepare(
-    `SELECT
-       (SELECT COUNT(*) FROM vote_ballots WHERE poll_id = ?1) AS voters,
-       (SELECT COUNT(*) FROM vote_ballots AS b, json_each(b.option_ids) AS j WHERE b.poll_id = ?1) AS votes`,
-  )
-    .bind(poll.id)
-    .first<{ voters: number; votes: number }>();
+    .all<{ option_ids: string }>();
+  const defaultQuestionId = questions[0]?.id ?? poll.id;
+  const optionVotes = new Map<string, number>();
+  const textAnswers = new Map<string, string[]>();
+  const answered = new Map<string, number>();
+  for (const ballot of ballots.results) {
+    for (const answer of parseBallotDocument(ballot.option_ids, defaultQuestionId)) {
+      answered.set(answer.question_id, (answered.get(answer.question_id) ?? 0) + 1);
+      for (const id of answer.option_ids) optionVotes.set(id, (optionVotes.get(id) ?? 0) + 1);
+      if (answer.text) {
+        const list = textAnswers.get(answer.question_id) ?? [];
+        list.push(answer.text);
+        textAnswers.set(answer.question_id, list);
+      }
+    }
+  }
+  const questionResults: QuestionResult[] = questions.map((q) => {
+    const qOptions = options.filter((o) => o.question_id === q.id).map((o) => ({
+      id: o.id,
+      label: o.label,
+      image_url: imageUrl(origin, o.image_key),
+      votes: optionVotes.get(o.id) ?? 0,
+    }));
+    const result: QuestionResult = {
+      id: q.id,
+      prompt: q.prompt,
+      kind: q.kind,
+      required: q.required === 1,
+      position: q.position,
+      response_count: answered.get(q.id) ?? 0,
+      options: qOptions,
+    };
+    if (opts.includeText && q.kind === "text") result.texts = textAnswers.get(q.id) ?? [];
+    return result;
+  });
+  const flat = questionResults.flatMap((q) => q.options);
+  const totalVotes = flat.reduce((sum, o) => sum + o.votes, 0);
   return {
     poll_id: poll.id,
     status: poll.status,
     opens_at: poll.opens_at,
     closes_at: poll.closes_at,
-    total_voters: Number(totals?.voters ?? 0),
-    total_votes: Number(totals?.votes ?? 0),
-    options: options.map((o) => ({
-      id: o.id,
-      label: o.label,
-      image_url: imageUrl(origin, o.image_key),
-      votes: byOption.get(o.id) ?? 0,
-    })),
+    total_voters: ballots.results.length,
+    total_votes: totalVotes,
+    options: flat,
+    questions: questionResults,
   };
 }

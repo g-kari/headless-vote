@@ -22,7 +22,17 @@ import {
 } from "../domain";
 import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from "../errors";
 import { findActiveApiKey, issueApiKey, listApiKeys, provisionTenant, publicKey, revokeApiKey, rotatePresentedKey } from "../keys";
-import { assertPlainText, isSafeImageKey, normalizeUuid, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
+import {
+  ballotDocument,
+  legacyQuestion,
+  listQuestionRows,
+  parseQuestions,
+  replaceQuestions,
+  resolveAnswers,
+  updateQuestionText,
+  type QuestionInput,
+} from "../questions";
+import { assertPlainText, isSafeImageKey, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
 import type { Env, OptionRow, PollRow, TenantRow, Variables } from "../types";
 
 export const api = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -134,18 +144,26 @@ async function assertImageKeyBelongsToTenant(
   if (!obj) throw badRequest("image_key does not reference an uploaded image");
 }
 
-async function insertOptions(
-  env: Env,
-  pollId: string,
-  options: OptionInput[],
-): Promise<void> {
-  const now = nowIso();
-  const stmts = options.map((o, i) =>
-    env.DB.prepare(
-      "INSERT INTO options (id, poll_id, label, image_key, position, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    ).bind(randomId(), pollId, o.label, o.image_key, i, now),
-  );
-  await env.DB.batch(stmts);
+async function renderPoll(c: { env: Env; req: { url: string } }, poll: PollRow) {
+  const questions = await listQuestionRows(c.env, poll.id);
+  const options = await listOptionRows(c.env, poll.id);
+  return pollToJson(originOf(c), poll, options, questions);
+}
+
+async function questionInputsFromBody(
+  c: { env: Env },
+  tenantId: string,
+  body: Record<string, unknown>,
+  title: string,
+  allowMultiple: boolean,
+): Promise<QuestionInput[]> {
+  const parsed = parseQuestions(body);
+  const questions = parsed ?? [legacyQuestion(title, allowMultiple, parseOptions(body))];
+  for (const q of questions) {
+    await assertImageKeyBelongsToTenant(c.env, tenantId, q.image_key);
+    for (const o of q.options) await assertImageKeyBelongsToTenant(c.env, tenantId, o.image_key);
+  }
+  return questions;
 }
 
 async function loadPollForAdmin(
@@ -170,7 +188,9 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const opensAt = optIsoDate(body, "opens_at");
   const closesAt = optIsoDate(body, "closes_at");
   assertSchedule(opensAt, closesAt);
-  const options = parseOptions(body);
+  const questions = await questionInputsFromBody(c, tenantId, body, question, allowMultiple);
+  const firstChoice = questions.find((q) => q.kind !== "text");
+  const multiple = firstChoice ? firstChoice.kind === "multiple" : allowMultiple;
   const existingPolls = await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM polls WHERE tenant_id = ?1",
   )
@@ -180,9 +200,6 @@ api.post("/tenants/:tenantId/polls", async (c) => {
     throw conflict("QUOTA_EXCEEDED", `A workspace can have at most ${MAX_POLLS} polls`);
   }
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
-  for (const o of options) {
-    await assertImageKeyBelongsToTenant(c.env, tenantId, o.image_key);
-  }
   const pollId = randomId();
   const now = nowIso();
   await c.env.DB.prepare(
@@ -195,7 +212,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       question,
       description,
       imageKey,
-      allowMultiple ? 1 : 0,
+      multiple ? 1 : 0,
       requireLogin ? 1 : 0,
       opensAt,
       closesAt,
@@ -203,7 +220,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       randomId(),
     )
     .run();
-  await insertOptions(c.env, pollId, options);
+  await replaceQuestions(c.env, pollId, questions);
   await recordAudit(c.env, {
     tenantId,
     actor: actorLabel(admin),
@@ -211,8 +228,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
     target: pollId,
   });
   const poll = await getPollRow(c.env, pollId);
-  const opts = await listOptionRows(c.env, pollId);
-  return c.json({ poll: pollToJson(originOf(c), poll as PollRow, opts) }, 201);
+  return c.json({ poll: await renderPoll(c, poll as PollRow) }, 201);
 });
 
 api.get("/tenants/:tenantId/polls", async (c) => {
@@ -224,10 +240,7 @@ api.get("/tenants/:tenantId/polls", async (c) => {
     .bind(tenantId)
     .all<PollRow>();
   const polls = [];
-  for (const poll of res.results) {
-    const opts = await listOptionRows(c.env, poll.id);
-    polls.push(pollToJson(originOf(c), poll, opts));
-  }
+  for (const poll of res.results) polls.push(await renderPoll(c, poll));
   return c.json({ polls });
 });
 
@@ -235,8 +248,7 @@ api.get("/tenants/:tenantId/polls/:pollId", async (c) => {
   const tenantId = c.req.param("tenantId");
   await requireAdmin(c, tenantId, "read");
   const poll = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
-  const opts = await listOptionRows(c.env, poll.id);
-  return c.json({ poll: pollToJson(originOf(c), poll, opts) });
+  return c.json({ poll: await renderPoll(c, poll) });
 });
 
 api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
@@ -259,7 +271,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     body["image_key"] !== undefined
       ? optString(body, "image_key", { max: 300 })
       : poll.image_key;
-  const allowMultiple =
+  let allowMultiple =
     body["allow_multiple"] !== undefined
       ? optBool(body, "allow_multiple")
       : poll.allow_multiple === 1;
@@ -285,18 +297,37 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     }
   }
 
-  let replacementOptions: OptionInput[] | null = null;
-  if (body["options"] !== undefined) {
-    replacementOptions = parseOptions(body);
-    for (const o of replacementOptions) {
-      await assertImageKeyBelongsToTenant(c.env, tenantId, o.image_key);
+  let replacement: QuestionInput[] | null = null;
+  if (body["questions"] !== undefined || body["options"] !== undefined) {
+    const existingQuestions = await listQuestionRows(c.env, poll.id);
+    const existingOptions = await listOptionRows(c.env, poll.id);
+    if (body["questions"] !== undefined) {
+      replacement = await questionInputsFromBody(c, tenantId, body, question, allowMultiple);
+    } else if (existingQuestions.length !== 1) {
+      throw badRequest("Replace questions explicitly when a poll has more than one");
+    } else {
+      const only = existingQuestions[0];
+      const legacy = legacyQuestion(question, allowMultiple, parseOptions(body));
+      replacement = [{ ...legacy, id: only?.id, prompt: only?.prompt ?? legacy.prompt }];
+      for (const o of replacement[0]?.options ?? []) {
+        await assertImageKeyBelongsToTenant(c.env, tenantId, o.image_key);
+      }
     }
     if (cast > 0) {
-      throw conflict(
-        "OPTIONS_LOCKED",
-        "Options cannot be replaced after votes have been cast",
-      );
+      if (body["questions"] === undefined) {
+        throw conflict(
+          "OPTIONS_LOCKED",
+          "Options cannot be replaced after votes have been cast",
+        );
+      }
+      await updateQuestionText(c.env, poll.id, replacement, existingQuestions, existingOptions);
+      replacement = null;
     }
+  }
+
+  if (replacement) {
+    const first = replacement.find((q) => q.kind !== "text");
+    if (first) allowMultiple = first.kind === "multiple";
   }
 
   // revision always changes, so a matching WHERE is a real write even when
@@ -321,7 +352,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     poll.revision,
   );
 
-  if (!replacementOptions) {
+  if (!replacement) {
     const updatedPoll = await updatePoll.run();
     if (Number(updatedPoll.meta.changes ?? 0) !== 1) {
       throw conflict(
@@ -355,12 +386,11 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
         "The poll was updated at the same time. Reload and try again.",
       );
     }
-    await insertOptions(c.env, poll.id, replacementOptions);
+    await replaceQuestions(c.env, poll.id, replacement);
   }
 
   const updated = await getPollRow(c.env, poll.id);
-  const opts = await listOptionRows(c.env, poll.id);
-  return c.json({ poll: pollToJson(originOf(c), updated as PollRow, opts) });
+  return c.json({ poll: await renderPoll(c, updated as PollRow) });
 });
 
 api.post("/tenants/:tenantId/polls/:pollId/status", async (c) => {
@@ -394,15 +424,14 @@ api.post("/tenants/:tenantId/polls/:pollId/status", async (c) => {
     detail: `${poll.status}->${status}`,
   });
   const updated = await getPollRow(c.env, poll.id);
-  const opts = await listOptionRows(c.env, poll.id);
-  return c.json({ poll: pollToJson(originOf(c), updated as PollRow, opts) });
+  return c.json({ poll: await renderPoll(c, updated as PollRow) });
 });
 
 api.get("/tenants/:tenantId/polls/:pollId/results", async (c) => {
   const tenantId = c.req.param("tenantId");
   await requireAdmin(c, tenantId, "read");
   const poll = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
-  return c.json({ results: await computeResults(c.env, originOf(c), poll) });
+  return c.json({ results: await computeResults(c.env, originOf(c), poll, { includeText: true }) });
 });
 
 /* ------------------------------------------------------------------ */
@@ -438,8 +467,7 @@ async function loadPublicPoll(env: Env, pollId: string): Promise<PollRow> {
 
 api.get("/polls/:pollId", async (c) => {
   const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
-  const opts = await listOptionRows(c.env, poll.id);
-  return c.json({ poll: pollToJson(originOf(c), poll, opts) });
+  return c.json({ poll: await renderPoll(c, poll) });
 });
 
 api.get("/polls/:pollId/results", async (c) => {
@@ -487,28 +515,19 @@ api.post("/polls/:pollId/vote", async (c) => {
     voterKey = `anon:${trimmedToken}`;
   }
 
-  const rawOptionIds = body["option_ids"];
-  if (!Array.isArray(rawOptionIds) || rawOptionIds.length === 0 || rawOptionIds.length > 50) {
-    throw badRequest('"option_ids" must be a non-empty array');
-  }
-  const optionIds = [...new Set(rawOptionIds)];
-  if (optionIds.some((id) => typeof id !== "string" || !normalizeUuid(id))) {
-    throw badRequest('"option_ids" must contain option id strings');
-  }
-  if (poll.allow_multiple !== 1 && optionIds.length !== 1) {
-    throw badRequest("This poll allows exactly one choice");
-  }
+  const questions = await listQuestionRows(c.env, poll.id);
   const options = await listOptionRows(c.env, poll.id);
-  const validIds = new Set(options.map((o) => o.id));
-  for (const id of optionIds as string[]) {
-    if (!validIds.has(id)) throw badRequest(`Unknown option id: ${id}`);
-  }
-
-  await upsertBallot(c.env, poll.id, voterKey, optionIds as string[]);
+  const answers = resolveAnswers(body, questions, options);
+  await upsertBallot(c.env, poll.id, voterKey, ballotDocument(answers));
 
   const results = await computeResults(c.env, originOf(c), poll);
   return c.json({
-    vote: { poll_id: poll.id, option_ids: optionIds, voter: sub ? "user" : "anonymous" },
+    vote: {
+      poll_id: poll.id,
+      option_ids: answers.flatMap((a) => a.option_ids),
+      answers,
+      voter: sub ? "user" : "anonymous",
+    },
     results,
   });
 });
@@ -609,7 +628,7 @@ api.get("/tenants/:tenantId/polls/:pollId/export", async (c) => {
   const tenantId = c.req.param("tenantId");
   const admin = await requireAdmin(c, tenantId, "read");
   const poll = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
-  const results = await computeResults(c.env, originOf(c), poll);
+  const results = await computeResults(c.env, originOf(c), poll, { includeText: true });
   const format = c.req.query("format") === "csv" ? "csv" : "json";
   await recordAudit(c.env, {
     tenantId,
@@ -624,7 +643,7 @@ api.get("/tenants/:tenantId/polls/:pollId/export", async (c) => {
     return c.body(resultsToCsv(poll, results));
   }
   c.header("content-disposition", 'attachment; filename="results.json"');
-  return c.json({ poll: pollToJson(originOf(c), poll, await listOptionRows(c.env, poll.id)), results });
+  return c.json({ poll: await renderPoll(c, poll), results });
 });
 
 api.get("/tenants/:tenantId/export", async (c) => {
@@ -641,8 +660,8 @@ api.get("/tenants/:tenantId/export", async (c) => {
   for (const poll of polls.results) {
     const options = await listOptionRows(c.env, poll.id);
     exported.push({
-      poll: pollToJson(originOf(c), poll, options),
-      results: await computeResults(c.env, originOf(c), poll),
+      poll: await renderPoll(c, poll),
+      results: await computeResults(c.env, originOf(c), poll, { includeText: true }),
     });
   }
   await recordAudit(c.env, {

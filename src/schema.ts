@@ -35,15 +35,30 @@ CREATE TABLE IF NOT EXISTS polls (
 );
 CREATE INDEX IF NOT EXISTS idx_polls_tenant ON polls(tenant_id);
 
+CREATE TABLE IF NOT EXISTS questions (
+  id TEXT PRIMARY KEY,
+  poll_id TEXT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+  prompt TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  image_key TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ('single', 'multiple', 'text')),
+  required INTEGER NOT NULL DEFAULT 1,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_questions_poll ON questions(poll_id);
+
 CREATE TABLE IF NOT EXISTS options (
   id TEXT PRIMARY KEY,
   poll_id TEXT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+  question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
   label TEXT NOT NULL,
   image_key TEXT,
   position INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_options_poll ON options(poll_id);
+CREATE INDEX IF NOT EXISTS idx_options_question ON options(question_id);
 
 CREATE TABLE IF NOT EXISTS votes (
   id TEXT PRIMARY KEY,

@@ -76,7 +76,7 @@ export async function upsertBallot(
   env: Env,
   pollId: string,
   rawVoterKey: string,
-  optionIds: string[],
+  document: string,
 ): Promise<void> {
   await ensureVoterKeysHashed(env);
   const stored = await hashVoterKey(env, rawVoterKey);
@@ -87,6 +87,6 @@ export async function upsertBallot(
        option_ids = excluded.option_ids,
        updated_at = excluded.updated_at`,
   )
-    .bind(pollId, stored, JSON.stringify(optionIds), new Date().toISOString())
+    .bind(pollId, stored, document, new Date().toISOString())
     .run();
 }

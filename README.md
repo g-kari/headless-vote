@@ -88,18 +88,30 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 
 ```json
 {
-  "question": "好きな季節は？",
-  "description": "1 つ選んでください",
-  "image_key": "t/<tenantId>/<uuid>.png",
-  "allow_multiple": false,
+  "question": "イベントアンケート",
+  "description": "すべて答えてください",
   "require_login": false,
+  "opens_at": "2026-12-01T00:00:00.000Z",
   "closes_at": "2026-12-31T15:00:00.000Z",
-  "options": [
-    { "label": "春" },
-    { "label": "夏", "image_key": "t/<tenantId>/<uuid>.png" }
+  "questions": [
+    {
+      "prompt": "好きな季節は？",
+      "kind": "single",
+      "required": true,
+      "options": [{ "label": "春" }, { "label": "夏" }]
+    },
+    {
+      "prompt": "当てはまるものをすべて",
+      "kind": "multiple",
+      "required": true,
+      "options": [{ "label": "午前" }, { "label": "午後" }]
+    },
+    { "prompt": "ひとこと", "kind": "text", "required": false }
   ]
 }
 ```
+
+`questions` を省略した場合は、従来どおり `question` と `options` と `allow_multiple` から設問が 1 つ作られます。設問は 1〜20 個です。選択式は選択肢 2〜50 個、自由記述は 2000 文字までです。票が入ったあとは設問の追加・削除・種類変更・選択肢の増減はできません（文言と並びの更新はできます）。
 
 ### 公開 API（投票者向け）
 
@@ -112,11 +124,18 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 投票リクエスト例（未ログイン）:
 
 ```json
-{ "voter_token": "any-opaque-string-1234", "option_ids": ["<optionId>"] }
+{
+  "voter_token": "any-opaque-string-1234",
+  "answers": [
+    { "question_id": "<questionId>", "option_ids": ["<optionId>"] },
+    { "question_id": "<textQuestionId>", "text": "よかったです" }
+  ]
+}
 ```
 
-ログイン時は `voter_token` の代わりに `Authorization: Bearer <ID トークン>` を付けます。
-レスポンスには、記録された票と最新の集計が入ります。
+設問が 1 つだけの投票は、従来の `{ "option_ids": ["<optionId>"] }` も受け付けます。必須の設問はすべてこの 1 回の送信に含めます。ログイン時は `voter_token` の代わりに `Authorization: Bearer <ID トークン>` を付けます。
+
+集計は設問ごとです。自由記述の本文は、管理 API・管理画面・書き出しにだけ含まれ、公開の結果 API では件数だけです。
 
 画像は `GET /images/t/<tenantId>/<file>` で配信します。
 投票の JSON では `image_url` として絶対 URL が返ります。
@@ -139,6 +158,7 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 ## ワークスペースの運用機能
 
 - **API キー**: ワークスペースごとに複数持てます。権限は `read`（参照と書き出し）か `write`（作成・更新・失効も可）。平文は発行時に一度だけ返り、保存するのは SHA-256 と先頭のプレフィックスです。`POST /api/v1/tenants/:id/api-keys`、失効は `POST .../api-keys/:keyId/revoke`。従来の `POST .../rotate-key` は、そのリクエストのキーを失効して書き込みキーを 1 つ発行します。有効なキーは 10 個までです。
+- **複数設問**: 1 つの投票に単一選択・複数選択・自由記述を混在できます。投票は全設問を 1 回で送ります。
 - **開始日時**: `opens_at` を付けると、その時刻より前の投票は `POLL_NOT_OPEN`（409）です。`closes_at` より前である必要があります。
 - **結果の書き出し**: `GET /api/v1/tenants/:id/polls/:pollId/export?format=csv` または `format=json`。集計だけで、投票者トークンは含みません。CSV はスプレッドシートの式として解釈されないようセルを中和します。
 - **ワークスペースの書き出しと削除**: `GET /api/v1/tenants/:id/export`。削除は `DELETE /api/v1/tenants/:id` に `{ "confirm_name": "ワークスペース名" }`。管理画面の埋め込み設定からも行えます。

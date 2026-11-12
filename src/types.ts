@@ -58,9 +58,24 @@ export interface PollRow {
   revision: string;
 }
 
+export type QuestionKind = "single" | "multiple" | "text";
+
+export interface QuestionRow {
+  id: string;
+  poll_id: string;
+  prompt: string;
+  description: string;
+  image_key: string | null;
+  kind: QuestionKind;
+  required: number;
+  position: number;
+  created_at: string;
+}
+
 export interface OptionRow {
   id: string;
   poll_id: string;
+  question_id: string;
   label: string;
   image_key: string | null;
   position: number;
