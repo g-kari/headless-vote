@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "skills": {
+    "modern-web-guidance": {
+      "source": "GoogleChrome/modern-web-guidance",
+      "sourceType": "github",
+      "skillPath": "skills/modern-web-guidance/SKILL.md",
+      "computedHash": "9e69ce00dc314b64f6664031b70295ea46c7de93ac682c624808df6e48e08b66"
+    },
+    "visual-explainer": {
+      "source": "nicobailon/visual-explainer",
+      "sourceType": "github",
+      "skillPath": "plugins/visual-explainer/SKILL.md",
+      "computedHash": "305dcaef5f5ee1cd49083609b3ab182b9c55293590d4fbeeb625b2b5c30eab91",
+      "installMode": "copy"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+name = "headless-vote"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+workers_dev = true
+
+# Public domain. The custom domain automatically provisions its DNS record
+# in the 0g0.xyz zone (same Cloudflare account) on deploy.
+routes = [
+  { pattern = "vote.0g0.xyz", custom_domain = true },
+]
+
+# Brand assets (favicon, logo, OGP) served as static files; requests that do
+# not match a file fall through to the Worker.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "none"
+
+# OIDC (0g0-id) configuration for the admin UI login and logged-in voting.
+# OIDC_CLIENT_ID is set after registering the client (see
+# scripts/register-oidc-client.mjs). Secrets (SESSION_SECRET and, for
+# confidential clients, OIDC_CLIENT_SECRET) are set with `wrangler secret put`.
+[vars]
+OIDC_ISSUER = "https://id.0g0.xyz"
+OIDC_CLIENT_ID = ""
+OIDC_SCOPES = "openid profile email"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "headless-vote"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "headless-vote-images"

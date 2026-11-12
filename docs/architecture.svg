@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 560" role="img" aria-label="headless-vote architecture" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+  <rect width="980" height="560" fill="#f6f7fb"/>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5b5bd6"/>
+    </marker>
+  </defs>
+
+  <!-- actors -->
+  <rect x="30" y="60" width="200" height="86" rx="12" fill="#ffffff" stroke="#d9dce8"/>
+  <text x="130" y="95" text-anchor="middle" font-size="17" font-weight="700" fill="#171a26">テナント管理者</text>
+  <text x="130" y="120" text-anchor="middle" font-size="13" fill="#5b6172">ブラウザで管理画面を使う</text>
+
+  <rect x="30" y="250" width="200" height="86" rx="12" fill="#ffffff" stroke="#d9dce8"/>
+  <text x="130" y="285" text-anchor="middle" font-size="17" font-weight="700" fill="#171a26">投票者・外部サイト</text>
+  <text x="130" y="310" text-anchor="middle" font-size="13" fill="#5b6172">API を呼ぶ（ログイン任意）</text>
+
+  <rect x="30" y="430" width="200" height="70" rx="12" fill="#ffffff" stroke="#d9dce8"/>
+  <text x="130" y="462" text-anchor="middle" font-size="17" font-weight="700" fill="#171a26">0g0-id</text>
+  <text x="130" y="485" text-anchor="middle" font-size="13" fill="#5b6172">id.0g0.xyz（OIDC）</text>
+
+  <!-- worker -->
+  <rect x="400" y="120" width="250" height="270" rx="14" fill="#ececff" stroke="#5b5bd6" stroke-width="2"/>
+  <text x="525" y="152" text-anchor="middle" font-size="18" font-weight="700" fill="#171a26">Cloudflare Worker</text>
+  <text x="525" y="176" text-anchor="middle" font-size="13" fill="#5b6172">headless-vote（Hono）</text>
+  <rect x="425" y="195" width="200" height="52" rx="9" fill="#ffffff" stroke="#d9dce8"/>
+  <text x="525" y="227" text-anchor="middle" font-size="14" fill="#171a26">管理画面（UI）</text>
+  <rect x="425" y="260" width="200" height="52" rx="9" fill="#ffffff" stroke="#d9dce8"/>
+  <text x="525" y="292" text-anchor="middle" font-size="14" fill="#171a26">投票 API / 管理 API</text>
+  <rect x="425" y="325" width="200" height="52" rx="9" fill="#ffffff" stroke="#d9dce8"/>
+  <text x="525" y="357" text-anchor="middle" font-size="14" fill="#171a26">OIDC 認証（PKCE）</text>
+
+  <!-- stores -->
+  <rect x="760" y="150" width="190" height="80" rx="12" fill="#ffffff" stroke="#d9dce8"/>
+  <text x="855" y="183" text-anchor="middle" font-size="17" font-weight="700" fill="#171a26">D1</text>
+  <text x="855" y="206" text-anchor="middle" font-size="13" fill="#5b6172">テナント・投票・票</text>
+
+  <rect x="760" y="290" width="190" height="80" rx="12" fill="#ffffff" stroke="#d9dce8"/>
+  <text x="855" y="323" text-anchor="middle" font-size="17" font-weight="700" fill="#171a26">R2</text>
+  <text x="855" y="346" text-anchor="middle" font-size="13" fill="#5b6172">設問・選択肢の画像</text>
+
+  <!-- arrows with verbs -->
+  <line x1="230" y1="95" x2="420" y2="205" stroke="#5b5bd6" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="300" y="128" font-size="13" fill="#4646b8">ログインして作成・編集</text>
+
+  <line x1="230" y1="290" x2="420" y2="290" stroke="#5b5bd6" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="262" y="278" font-size="13" fill="#4646b8">取得・投票・結果</text>
+
+  <path d="M 400 340 C 320 400, 300 420, 236 452" fill="none" stroke="#5b5bd6" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="238" y="408" font-size="13" fill="#4646b8">認可コード + ID トークン検証</text>
+
+  <line x1="650" y1="190" x2="754" y2="190" stroke="#5b5bd6" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="664" y="178" font-size="13" fill="#4646b8">保存・集計</text>
+
+  <line x1="650" y1="330" x2="754" y2="330" stroke="#5b5bd6" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="664" y="318" font-size="13" fill="#4646b8">アップロード</text>
+</svg>

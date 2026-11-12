@@ -1,0 +1,24 @@
+# Dependabot is the security lane for this repository.
+#
+# Division of labor (so Dependabot and Renovate never compete):
+# - Renovate (see renovate.json) is the primary updater: regular npm and
+#   GitHub Actions version updates, auto-merged once CI is green.
+# - Dependabot version updates are disabled here on purpose: the entries
+#   below exist so Dependabot *security* updates (enabled in the
+#   repository's Security settings) know which ecosystems and directory to
+#   watch. Security-update PRs opened by dependabot[bot] are auto-merged
+#   by .github/workflows/dependabot-automerge.yml once CI succeeds.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Version updates are handled by Renovate; Dependabot stays focused
+    # on security updates, which are configured in the repo settings.
+    open-pull-requests-limit: 0
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
