@@ -1,4 +1,5 @@
-import { badRequest } from "./errors";
+import { ApiError, badRequest } from "./errors";
+import { readBodyLimited } from "./body-limit";
 import { migrateLegacyAnonVoterKeys } from "./voter-keys";
 import type { AppContext, Env, OptionRow, PollRow } from "./types";
 
@@ -8,8 +9,9 @@ export async function jsonBody<T extends Record<string, unknown>>(
 ): Promise<T> {
   let parsed: unknown;
   try {
-    parsed = await c.req.json();
-  } catch {
+    parsed = JSON.parse(new TextDecoder().decode(await readBodyLimited(c.req.raw, 64 * 1024)));
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
     throw badRequest("Request body must be valid JSON");
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {

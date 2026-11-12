@@ -46,7 +46,7 @@ async function loginAs(sub: string, email: string): Promise<string> {
   expect(params.get("client_id")).toBe("test-client-id");
   expect(params.get("redirect_uri")).toBe(`${BASE}/auth/callback`);
 
-  const flowCookie = getCookie(loginRes, "hv_oidc_flow");
+  const flowCookie = getCookie(loginRes, "__Host-hv_oidc_flow");
   expect(flowCookie).toBeTruthy();
   const flow = decodeFlowPayload(flowCookie as string);
   expect(params.get("state")).toBe(flow.state);
@@ -57,7 +57,7 @@ async function loginAs(sub: string, email: string): Promise<string> {
     `${BASE}/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(flow.state)}`,
     {
       redirect: "manual",
-      headers: { cookie: `hv_oidc_flow=${flowCookie}` },
+      headers: { cookie: `__Host-hv_oidc_flow=${flowCookie}` },
     },
   );
   expect(callbackRes.status).toBe(302);
@@ -118,12 +118,12 @@ describe("0g0-id login flow for the admin UI", () => {
     const loginRes = await SELF.fetch(`${BASE}/admin/login`, {
       redirect: "manual",
     });
-    const flowCookie = getCookie(loginRes, "hv_oidc_flow");
+    const flowCookie = getCookie(loginRes, "__Host-hv_oidc_flow");
     const res = await SELF.fetch(
       `${BASE}/auth/callback?code=test-code&state=bogus-state`,
       {
         redirect: "manual",
-        headers: { cookie: `hv_oidc_flow=${flowCookie}` },
+        headers: { cookie: `__Host-hv_oidc_flow=${flowCookie}` },
       },
     );
     expect(res.status).toBe(400);

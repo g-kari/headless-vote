@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { readFormLimited } from "../body-limit";
 import {
   clearFlowCookie,
   clearSessionCookie,
@@ -104,7 +105,7 @@ authRoutes.post("/admin/logout", async (c) => {
   if (user) {
     let token: string | null = null;
     try {
-      const form = await c.req.formData();
+      const form = await readFormLimited(c.req.raw);
       token = String(form.get("csrf_token") ?? "") || null;
     } catch {
       token = null;

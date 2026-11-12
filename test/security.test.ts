@@ -42,13 +42,13 @@ function decodeFlowPayload(cookieValue: string): { state: string; nonce: string 
 async function loginAs(sub: string, email: string): Promise<string> {
   const loginRes = await SELF.fetch(`${BASE}/admin/login`, { redirect: "manual" });
   expect(loginRes.status).toBe(302);
-  const flowCookie = getCookie(loginRes, "hv_oidc_flow");
+  const flowCookie = getCookie(loginRes, "__Host-hv_oidc_flow");
   expect(flowCookie).toBeTruthy();
   const flow = decodeFlowPayload(flowCookie as string);
   const code = `mock:${sub}:${flow.nonce}:${email}`;
   const callbackRes = await SELF.fetch(
     `${BASE}/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(flow.state)}`,
-    { redirect: "manual", headers: { cookie: `hv_oidc_flow=${flowCookie}` } },
+    { redirect: "manual", headers: { cookie: `__Host-hv_oidc_flow=${flowCookie}` } },
   );
   expect(callbackRes.status).toBe(302);
   const session = getCookie(callbackRes, "__Host-hv_session");

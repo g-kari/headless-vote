@@ -41,18 +41,22 @@ export function bearerToken(c: Ctx): string | null {
 // __Host- prefix: Secure + Path=/ + no Domain (see cookieHeader), so a
 // sibling subdomain cannot plant a session cookie for this origin.
 export const SESSION_COOKIE = "__Host-hv_session";
-export const FLOW_COOKIE = "hv_oidc_flow";
+export const FLOW_COOKIE = "__Host-hv_oidc_flow";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const FLOW_TTL_SECONDS = 60 * 10; // 10 minutes
 
 export function parseCookies(c: Ctx): Record<string, string> {
   const header = c.req.header("cookie");
-  const out: Record<string, string> = {};
+  const out: Record<string, string> = Object.create(null);
+  const seen = new Set<string>();
   if (!header) return out;
   for (const part of header.split(";")) {
     const eq = part.indexOf("=");
     if (eq > 0) {
-      out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+      const name = part.slice(0, eq).trim();
+      if (seen.has(name)) { delete out[name]; continue; }
+      seen.add(name);
+      try { out[name] = decodeURIComponent(part.slice(eq + 1).trim()); } catch { /* Invalid cookie is ignored. */ }
     }
   }
   return out;
@@ -269,8 +273,9 @@ export async function optionalVoterSub(c: Ctx): Promise<string | null> {
   const token = bearerToken(c);
   if (!token) return null;
   try {
+    if (!c.env.OIDC_CLIENT_ID) throw new Error("Login is not configured");
     const verified = await verifyJwt(c.env, token, {
-      audience: c.env.OIDC_CLIENT_ID || undefined,
+      audience: c.env.OIDC_CLIENT_ID,
     });
     return verified.sub;
   } catch {

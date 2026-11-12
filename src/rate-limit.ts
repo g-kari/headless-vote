@@ -41,15 +41,14 @@ export async function consumeRateLimit(
     .bind(bucket, windowStart)
     .first<{ count: number }>();
   const count = row?.count ?? 1;
-  if (count === 1) {
-    // First hit in a fresh window: drop this bucket's expired windows
-    // so the table does not grow without bound.
-    await env.DB.prepare(
-      "DELETE FROM rate_limit_buckets WHERE bucket = ?1 AND window_start < ?2",
-    )
-      .bind(bucket, windowStart)
-      .run();
-  }
+  // All configured windows are at most one day. Globally reclaim old
+  // one-off identifiers too, in a bounded indexed batch on each request.
+  await env.DB.prepare(
+    `DELETE FROM rate_limit_buckets WHERE rowid IN (
+       SELECT rowid FROM rate_limit_buckets WHERE window_start < ?1
+       ORDER BY window_start LIMIT 100
+     )`,
+  ).bind(now - Math.max(86400, windowSeconds)).run();
   return {
     allowed: count <= limit,
     retryAfterSeconds: windowStart + windowSeconds - now,

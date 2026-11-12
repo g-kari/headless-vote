@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { readFormLimited } from "../body-limit";
 import {
   clearSessionCookie,
   csrfTokenForSession,
@@ -157,7 +158,7 @@ ui.post("/admin/workspaces", async (c) => {
     LIMITS.workspaceCreatePerUserPerHour,
     HOUR,
   );
-  const form = await c.req.formData();
+  const form = await readFormLimited(c.req.raw);
   if (!(await formCsrfOk(c, form))) return csrfFailure(c, user);
   const name = String(form.get("name") ?? "").trim();
   if (!name || name.length > 120) {
@@ -203,7 +204,7 @@ ui.post("/admin/workspaces", async (c) => {
 ui.post("/admin/sessions/revoke-all", async (c) => {
   const user = await getSessionUser(c);
   if (!user) return c.redirect("/admin/login", 302);
-  const form = await c.req.formData();
+  const form = await readFormLimited(c.req.raw);
   if (!(await formCsrfOk(c, form))) return csrfFailure(c, user);
   await revokeAllSessions(c.env, user.sub);
   c.header("Set-Cookie", clearSessionCookie());
@@ -294,6 +295,13 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
   const tenantId = c.req.param("tenantId");
   const user = await requireMember(c, tenantId);
   if (!user) return c.redirect("/admin", 302);
+  let form: FormData;
+  try {
+    form = await readFormLimited(c.req.raw);
+  } catch {
+    return csrfFailure(c, user);
+  }
+  if (!(await formCsrfOk(c, form))) return csrfFailure(c, user);
   await enforceRateLimit(
     c.env,
     "rotate-key",
@@ -301,13 +309,7 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
     LIMITS.rotateKeyPerTenantPerHour,
     HOUR,
   );
-  let form: FormData;
-  try {
-    form = await c.req.formData();
-  } catch {
-    return csrfFailure(c, user);
-  }
-  if (!(await formCsrfOk(c, form))) return csrfFailure(c, user);
+
   const apiKey = randomToken("hvk");
   await c.env.DB.prepare("UPDATE tenants SET api_key_hash = ?1 WHERE id = ?2")
     .bind(await sha256Hex(apiKey), tenantId)
