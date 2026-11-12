@@ -77,8 +77,8 @@ internal services authenticated independently.
 
 ### Security migration and image deletion
 
-Apply migrations through `0008_object_cleanup.sql` before running this revision.
-`0007_auth_security.sql` invalidates existing local-password sessions; users sign in again.
+Apply migrations through `0009_object_cleanup.sql` before running this revision.
+`0008_auth_security.sql` invalidates existing local-password sessions; users sign in again.
 Workspace deletion queues image cleanup in the same D1 transaction and immediately
 blocks new image reads. Cleanup processes at most 20 pages of 100 objects per run;
 failed/unfinished jobs remain in `object_cleanup`. The supplied daily Worker cron

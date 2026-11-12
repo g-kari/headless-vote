@@ -19,6 +19,9 @@ export interface OidcDiscovery {
   registration_endpoint?: string;
 }
 
+/** Clock-skew allowance (seconds) applied to the iat check. */
+const CLOCK_SKEW_SECONDS = 60;
+
 let discoveryCache: { issuer: string; doc: OidcDiscovery } | null = null;
 
 /** Issuer and every OIDC URL must be https and on the same origin. */
@@ -181,10 +184,27 @@ export async function verifyJwt(
   if (nbf !== undefined && (typeof nbf !== "number" || !Number.isFinite(nbf) || nbf > nowSeconds)) {
     throw new Error("token not yet valid");
   }
+  // iat is required and must be sane (ported from the PR #4 review fixes):
+  // not in the future beyond a small clock-skew allowance, not after exp.
+  const iat = claims["iat"];
+  if (typeof iat !== "number" || !Number.isFinite(iat)) {
+    throw new Error("token has no valid iat");
+  }
+  if (iat > nowSeconds + CLOCK_SKEW_SECONDS) throw new Error("token issued in the future");
+  if (iat > exp) throw new Error("token iat is after exp");
 
   const aud = claims["aud"];
   const audiences = Array.isArray(aud) ? aud : aud ? [aud] : [];
   if (!audiences.includes(opts.audience)) throw new Error("audience mismatch");
+  // With multiple audiences, azp must name the expected audience
+  // (OIDC Core 3.1.3.7); a present azp must always match it.
+  const azp = claims["azp"];
+  if (audiences.length > 1 && azp !== opts.audience) {
+    throw new Error("azp mismatch for multi-audience token");
+  }
+  if (azp !== undefined && azp !== opts.audience) {
+    throw new Error("azp mismatch");
+  }
   if (opts.nonce !== undefined) {
     const claimNonce = claims["nonce"];
     if (typeof claimNonce !== "string" || !timingSafeEqual(claimNonce, opts.nonce)) {

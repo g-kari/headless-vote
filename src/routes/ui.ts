@@ -2,7 +2,7 @@ import { Hono, type Context } from "hono";
 import { deleteAccountData, deleteWorkspace, listMemberships } from "../account";
 import { selectAuthProvider } from "../platform";
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
-import { getSessionUser, isTenantMember, listTenantsForUser, memberRole } from "../auth";
+import { bumpSessionEpoch, clearSessionCookie, getSessionUser, isTenantMember, listTenantsForUser, memberRole } from "../auth";
 import {
   addTenantOrigin,
   listTenantOrigins,
@@ -73,22 +73,27 @@ async function requireOwnerUser(
 ui.get("/", async (c) => {
   const user = await getSessionUser(c);
   const body = `
-    <h1>投票を、API でも画面でも。</h1>
-    <p class="lead">headless-vote は、投票の作成・実施・集計を行える SaaS です。
-    画面を持たないシステムからは API で、人はこの管理画面から、同じ投票を運用できます。</p>
+    <h1>headless-vote 投票管理</h1>
+    <p class="lead">投票の作成・公開・集計を行うサービスです。管理画面と API の両方から、同じ投票を操作できます。</p>
     <div class="actions">
       <a class="btn primary" href="/admin">管理画面を開く</a>
       <a class="btn" href="/api/v1/health">API の状態を見る</a>
     </div>
-    <h2>できること</h2>
-    <div class="grid">
-      <section class="card"><strong>設問と選択肢の設定</strong>
-        <p class="muted">設問文・説明・選択肢に加えて、画像も添付できます。締切日時、複数選択の可否、ログイン必須かどうかも投票ごとに選べます。</p></section>
-      <section class="card"><strong>1人1票</strong>
-        <p class="muted">ログインした人はアカウントに、未ログインの人は投票者トークンに紐付けて数えます。締切前なら投票のやり直しもできます。</p></section>
-      <section class="card"><strong>結果の見える化</strong>
-        <p class="muted">集計結果は管理画面で棒グラフとして確認でき、API からも取得できます。</p></section>
-    </div>`;
+    <h2>処理の流れ</h2>
+    <div class="flow" role="img" aria-label="投票を作成し、公開し、投票を受け付け、集計結果を表示する流れ">
+      <span class="node">1. 投票を作成</span><span class="arrow" aria-hidden="true">→</span>
+      <span class="node">2. 公開</span><span class="arrow" aria-hidden="true">→</span>
+      <span class="node">3. 投票を受け付け</span><span class="arrow" aria-hidden="true">→</span>
+      <span class="node">4. 集計結果を表示</span>
+    </div>
+    <h2>仕様</h2>
+    <dl class="spec">
+      <dt>投票の設定</dt><dd>1つの投票に設問を最大20件まで追加できます。形式は単一選択・複数選択・自由記述。設問と選択肢に画像を添付できます。</dd>
+      <dt>投票ごとに選べる項目</dt><dd>ログイン必須か任意か、公開日時と締切日時。</dd>
+      <dt>投票の数え方</dt><dd>1人1票。締切前なら投票の変更ができます。ログインした人はアカウント単位、匿名の人は投票者トークン単位で数えます。</dd>
+      <dt>匿名投票の限界</dt><dd>トークンを変えた同一人物は別人として数えられます。厳密に1人1票が必要な投票では「ログイン必須」を選んでください。</dd>
+      <dt>集計結果</dt><dd>管理画面のグラフと API（GET /api/v1/polls/:id/results）で取得できます。CSV / JSON への書き出しにも対応します。</dd>
+    </dl>`;
   return c.html(
     layout({
       title: "投票 SaaS",
@@ -113,27 +118,25 @@ ui.get("/admin", async (c) => {
   }
 
   const tenants = await listTenantsForUser(c.env, user.sub);
-  const cards = tenants
+  const rows = tenants
     .map(
-      (t) => `<section class="card">
-        <strong>${escapeHtml(t.name)}</strong>
-        <p class="muted small">ワークスペース ID: <code>${escapeHtml(t.id)}</code></p>
-        <div class="actions"><a class="btn small primary" href="/admin/workspaces/${t.id}">開く</a></div>
-      </section>`,
+      (t) => `<li>
+        <span class="grow"><strong>${escapeHtml(t.name)}</strong><br>
+        <span class="muted small">ワークスペース ID: <code>${escapeHtml(t.id)}</code></span></span>
+        <a class="btn small primary" href="/admin/workspaces/${t.id}">開く</a>
+      </li>`,
     )
     .join("");
   const body = `
     <h1>ワークスペース</h1>
     <p class="lead">ワークスペースごとに投票と API キーが分かれます。ほかのワークスペースのデータは見えません。</p>
-    <div class="grid">${cards || '<section class="card"><p class="muted">まだワークスペースがありません。下のフォームから作成してください。</p></section>'}</div>
+    ${rows ? `<ul class="rows">${rows}</ul>` : '<p class="muted">まだワークスペースがありません。下のフォームから作成してください。</p>'}
     <h2>新しいワークスペース</h2>
-    <section class="card">
       <form method="post" action="/admin/workspaces">
         <label for="ws-name">ワークスペース名</label>
         <input id="ws-name" type="text" name="name" required maxlength="120" placeholder="例: イベント投票">
         <div class="actions"><button class="btn primary" type="submit">作成する</button></div>
-      </form>
-    </section>`;
+      </form>`;
   return c.html(
     layout({
       title: "ワークスペース",
@@ -167,7 +170,7 @@ ui.post("/admin/workspaces", async (c) => {
   const { tenantId, apiKey } = await provisionTenant(c.env, name, user.sub);
   const body = `
     <h1>ワークスペースを作成しました</h1>
-    <section class="card">
+    <section class="section">
       <p><strong>${escapeHtml(name)}</strong></p>
       <div class="notice"><strong>API キーはこの画面でだけ表示されます。</strong>
       管理 API の認証に使うので、控えて安全な場所に保管してください。</div>
@@ -240,11 +243,11 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
       <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/audit">操作履歴</a>
     </div>
     <h2>投票一覧</h2>
-    <section class="card">
+    <section class="section">
       ${rows ? `<div class="table-wrapper" tabindex="0" role="region" aria-label="投票一覧"><table><thead><tr><th scope="col">設問</th><th scope="col">状態</th><th scope="col">設定</th><th scope="col">締切</th><th scope="col"><span class="muted">操作</span></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">まだ投票がありません。</p>'}
     </section>
     <h2>API キー</h2>
-    <section class="card">
+    <section class="section">
       <p class="muted">管理 API のキーは SHA-256 で保存し、作成時に一度だけ表示します。<code>read</code> は参照と書き出し、<code>write</code> は作成・更新・失効もできます。</p>
       ${keyItems ? `<ul>${keyItems}</ul>` : ""}
       ${role === "owner" ? `<form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/api-keys" aria-labelledby="key-heading">
@@ -309,7 +312,7 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
   const apiKey = issued.apiKey;
   const body = `
     <h1>API キーを再発行しました</h1>
-    <section class="card">
+    <section class="section">
       <div class="notice"><strong>新しい API キーはこの画面でだけ表示されます。</strong> 控えて安全な場所に保管してください。古いキーはもう使えません。</div>
       <p><code style="font-size:1.05rem">${escapeHtml(apiKey)}</code></p>
       <div class="actions"><a class="btn primary" href="/admin/workspaces/${tenantId}">ワークスペースに戻る</a></div>
@@ -343,7 +346,7 @@ ui.post("/admin/workspaces/:tenantId/api-keys", async (c) => {
     });
     const body = `
       <h1>API キーを発行しました</h1>
-      <section class="card">
+      <section class="section">
         <div class="notice"><strong>このキーは今だけ表示されます。</strong> ${escapeHtml(issued.key.prefix)}… / ${issued.key.scope}</div>
         <p><code style="font-size:1.05rem">${escapeHtml(issued.apiKey)}</code></p>
         <div class="actions"><a class="btn primary" href="/admin/workspaces/${escapeHtml(tenantId)}">ワークスペースに戻る</a></div>
@@ -425,11 +428,11 @@ function settingsBody(
     この管理画面と同じオリジンから使う場合は追加不要です。ワイルドカードやパスは使えません。</p>
     ${error ? `<div class="notice bad" role="alert">${escapeHtml(error)}</div>` : ""}
     <h2>許可しているオリジン</h2>
-    <section class="card">
+    <section class="section">
       ${items ? `<ul>${items}</ul>` : `<p class="muted">まだ許可しているオリジンはありません。この状態では、別サイトのブラウザから公開 API の応答を読めません。</p>`}
     </section>
     ${owner ? `<h2 id="origin-heading">許可するオリジンを追加</h2>
-    <section class="card">
+    <section class="section">
       <form method="post" action="/admin/workspaces/${tid}/origins" aria-labelledby="origin-heading">
         <label for="origin">オリジン <span class="hint">例: https://www.example.com 。https のみ（localhost は http も可）。</span></label>
         <input id="origin" name="origin" type="url" required maxlength="200" placeholder="https://www.example.com" spellcheck="false" autocapitalize="none" autocomplete="off" inputmode="url">
@@ -437,7 +440,7 @@ function settingsBody(
       </form>
     </section>` : `<p class="muted">許可オリジンの変更はオーナーだけが実行できます。</p>`}
     <h2>ワークスペースの書き出しと削除</h2>
-    <section class="card">
+    <section class="section">
       <p class="muted">書き出しには設問、集計、許可オリジン、キーのメタデータ、操作履歴が含まれます。投票者トークンやキーの秘密は含みません。</p>
       <p><a class="btn" href="/api/v1/tenants/${tid}/export">JSON で書き出す</a></p>
       ${owner ? `<form method="post" action="/admin/workspaces/${tid}/delete" aria-labelledby="delete-heading">
@@ -471,8 +474,8 @@ async function settingsExtras(env: Env, tenantId: string, owner: boolean) {
     .map((hook) => `<li><code>${escapeHtml(hook.url)}</code> ${hook.events.map((event) => escapeHtml(event)).join(", ")} ${hook.disabled_at ? '<span class="badge closed">停止</span>' : owner ? `<form method="post" action="/admin/workspaces/${tid}/webhooks/disable" style="display:inline"><input type="hidden" name="webhook_id" value="${escapeHtml(hook.id)}"><button class="btn small" type="submit">停止</button></form>` : ""}</li>`)
     .join("");
   return {
-    quotas: `<h2>利用上限</h2><section class="card"><p>プラン <strong>${escapeHtml(quotas.plan)}</strong>。投票 ${quotas.polls} 件、有効な API キー ${quotas.keys} 個、Webhook ${quotas.webhooks} 件、1 日の投票送信 ${quotas.votesPerDay} 件まで。上限はワークスペースに保存され、自分では引き上げられません。</p></section>`,
-    members: `<h2>メンバー</h2><section class="card">${memberItems ? `<ul>${memberItems}</ul>` : `<p class="muted">メンバーはいません。</p>`}
+    quotas: `<h2>利用上限</h2><section class="section"><p>プラン <strong>${escapeHtml(quotas.plan)}</strong>。投票 ${quotas.polls} 件、有効な API キー ${quotas.keys} 個、Webhook ${quotas.webhooks} 件、1 日の投票送信 ${quotas.votesPerDay} 件まで。上限はワークスペースに保存され、自分では引き上げられません。</p></section>`,
+    members: `<h2>メンバー</h2><section class="section">${memberItems ? `<ul>${memberItems}</ul>` : `<p class="muted">メンバーはいません。</p>`}
       ${owner ? `<form method="post" action="/admin/workspaces/${tid}/members" aria-labelledby="member-heading">
         <h3 id="member-heading">利用者 ID（sub）で追加</h3>
         <label for="member-sub">sub</label>
@@ -482,7 +485,7 @@ async function settingsExtras(env: Env, tenantId: string, owner: boolean) {
         <div class="actions"><button class="btn" type="submit">追加する</button></div>
       </form>` : `<p class="muted">メンバーの追加はオーナーだけが実行できます。招待メールはこのアプリから送りません。</p>`}
     </section>`,
-    webhooks: `<h2>Webhook</h2><section class="card">
+    webhooks: `<h2>Webhook</h2><section class="section">
       <p class="muted">投票の送信、公開、締切、更新を HTTPS の URL に送ります。署名は <code>X-Headless-Vote-Signature: v1=</code> と HMAC-SHA256 です。秘密は作成時に一度だけ表示し、保存時は暗号化します。投票者トークンや自由記述の本文は送りません。</p>
       ${hookItems ? `<ul>${hookItems}</ul>` : `<p class="muted">Webhook はありません。</p>`}
       ${owner ? `<form method="post" action="/admin/workspaces/${tid}/webhooks">
@@ -602,7 +605,7 @@ ui.get("/admin/workspaces/:tenantId/audit", async (c) => {
   const body = `
     <p class="muted small"><a href="/admin/workspaces/${escapeHtml(tenantId)}">ワークスペースに戻る</a></p>
     <h1>操作履歴</h1>
-    <section class="card">
+    <section class="section">
       ${rows ? `<div class="table-wrapper" tabindex="0" role="region" aria-label="操作履歴"><table><thead><tr><th scope="col">日時</th><th scope="col">操作</th><th scope="col">実行者</th><th scope="col">対象</th><th scope="col">内容</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">まだ記録がありません。</p>'}
     </section>`;
   return c.html(layout({
@@ -624,7 +627,7 @@ ui.get("/admin/workspaces/:tenantId/analytics", async (c) => {
     <p class="muted small"><a href="/admin/workspaces/${escapeHtml(tenantId)}">ワークスペースに戻る</a></p>
     <h1>投票の推移</h1>
     <p class="lead">直近 14 日の送信件数です。同じ人が投票をやり直すと、別の送信として数えます。人数ではありません。</p>
-    <section class="card">${seriesTable(days)}</section>`;
+    <section class="section">${seriesTable(days)}</section>`;
   return c.html(layout({
     title: "投票の推移",
     userEmail: user.email ?? user.sub,
@@ -647,7 +650,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/analytics", async (c) => {
     <p class="muted small"><a href="/admin/workspaces/${escapeHtml(tenantId)}/polls/${escapeHtml(poll.id)}/results">結果に戻る</a></p>
     <h1>${escapeHtml(poll.question)}</h1>
     <p class="lead">直近 14 日の送信件数です。人数ではなく、投票が保存された回数です。</p>
-    <section class="card">${seriesTable(days)}</section>`;
+    <section class="section">${seriesTable(days)}</section>`;
   return c.html(layout({
     title: "投票の推移",
     userEmail: user.email ?? user.sub,
@@ -745,7 +748,7 @@ ui.post("/admin/workspaces/:tenantId/webhooks", async (c) => {
     ]);
     const body = `
       <h1>Webhook を追加しました</h1>
-      <section class="card">
+      <section class="section">
         <div class="notice"><strong>署名の秘密はこの画面でだけ表示されます。</strong> <code>X-Headless-Vote-Signature</code> の HMAC 鍵です。</div>
         <p><code>${escapeHtml(created.secret)}</code></p>
         <p class="muted">${escapeHtml(created.url)}</p>
@@ -791,7 +794,7 @@ ui.get("/admin/account", async (c) => {
     .join("");
   const body = `
     <h1>アカウント</h1>
-    <section class="card">
+    <section class="section">
       <h2>プロフィール</h2>
       <p>名前: ${escapeHtml(user.name ?? "未設定")}</p>
       <p>メール: ${escapeHtml(user.email ?? "未設定")}</p>
@@ -801,12 +804,19 @@ ui.get("/admin/account", async (c) => {
         : `${escapeHtml(selectAuthProvider(c.env.AUTH_PROVIDER).label(c.env))} でログインしています。このアプリはパスワードを保存しないため、メール確認とパスワード再設定は認証プロバイダ側の機能です。`}</p>
     </section>
     <h2>参加しているワークスペース</h2>
-    <section class="card">
+    <section class="section">
       ${rows ? `<div class="table-wrapper" tabindex="0" role="region" aria-label="ワークスペース"><table><thead><tr><th scope="col">名前</th><th scope="col">役割</th><th scope="col">プラン</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="muted">まだ参加していません。</p>`}
       <p><a class="btn" href="/api/v1/me/export">自分のデータを JSON で書き出す</a></p>
     </section>
+    <h2>セッション</h2>
+    <section class="section">
+      <p class="muted">ログイン中のすべてのブラウザ・端末で、このアカウントのセッションを無効化します。実行すると自分もログアウトします。</p>
+      <form method="post" action="/admin/account/revoke-sessions">
+        <div class="actions"><button class="btn danger" type="submit">すべてのセッションを無効化</button></div>
+      </form>
+    </section>
     <h2>このアプリ上のデータを削除</h2>
-    <section class="card">
+    <section class="section">
       <p class="muted">あなたが唯一のオーナーであるワークスペースは削除されます。他にオーナーがいるワークスペースでは、あなたの参加だけが外れます。外部の認証プロバイダのアカウント自体は削除されません。ローカル認証の場合は、このアプリのパスワードも削除されます。</p>
       <form method="post" action="/admin/account/delete">
         <label for="confirm-delete">確認のため <code>delete my data</code> と入力</label>
@@ -821,6 +831,24 @@ ui.get("/admin/account", async (c) => {
     origin: originOf(c),
     nonce: c.get("cspNonce") ?? "",
   }));
+});
+
+ui.post("/admin/account/revoke-sessions", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  if (user.sub.startsWith("local:")) {
+    // Local accounts version their sessions on the user row instead.
+    await c.env.DB.prepare(
+      "UPDATE local_users SET session_version = session_version + 1 WHERE id = ?1",
+    )
+      .bind(user.sub.slice("local:".length))
+      .run();
+  } else {
+    await bumpSessionEpoch(c.env, user.sub);
+  }
+  c.header("Set-Cookie", clearSessionCookie(c.req.url));
+  return c.redirect("/admin", 303);
 });
 
 ui.post("/admin/account/delete", async (c) => {
@@ -1076,7 +1104,7 @@ function pollFormBody(opts: {
     <p class="muted small"><a href="/admin/workspaces/${opts.tenantId}">ワークスペースに戻る</a></p>
     <h1>${p ? "投票を編集" : "新しい投票を作る"}</h1>
     <div class="error" id="form-error" role="alert"></div>
-    <section class="card">
+    <section class="section">
     <form id="poll-form">
       <label for="question">設問文</label>
       <input id="question" type="text" required maxlength="300" value="${p ? escapeHtml(p.question) : ""}" placeholder="例: 次のイベントの日程はどれがいいですか？">
@@ -1148,6 +1176,20 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
   }));
   const origin = originOf(c);
   const nonce = c.get("cspNonce") ?? "";
+  const stepDefs = [
+    { key: "draft", label: "下書き" },
+    { key: "published", label: "公開中" },
+    { key: "closed", label: "締切" },
+  ] as const;
+  const stepOrder = { draft: 0, published: 1, closed: 2 } as const;
+  const currentStep = stepOrder[poll.status];
+  const stepsHtml = stepDefs
+    .map((s, i) => {
+      const cls = i < currentStep ? "step done" : i === currentStep ? "step current" : "step";
+      const dot = i === currentStep && poll.status === "published" ? '<span class="dot" aria-hidden="true"></span>' : "";
+      return `<span class="${cls}">${dot}${s.label}</span>`;
+    })
+    .join('<span class="arrow" aria-hidden="true">→</span>');
   const statusActions =
     poll.status === "draft"
       ? `<button class="btn primary" type="button" data-ask-status="published">公開する</button>`
@@ -1160,6 +1202,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
       <div style="flex:1;min-width:260px">
         <h1 style="margin-top:0">${escapeHtml(poll.question)}</h1>
         <p>${statusBadge(poll.status)} <span class="muted small">投票 ID: <code>${poll.id}</code></span></p>
+        <div class="steps" role="img" aria-label="状態の流れ: 下書き、公開中、締切。現在は${poll.status === "draft" ? "下書き" : poll.status === "published" ? "公開中" : "締切"}です">${stepsHtml}</div>
         <div class="actions">${statusActions}
           <a class="btn" href="/admin/workspaces/${tenantId}/polls/${poll.id}/results">結果を見る</a>
         </div>
@@ -1167,7 +1210,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
       ${poll.image_key ? `<img src="/images/${escapeHtml(poll.image_key)}" alt="設問の画像">` : ""}
     </div>
     <h2>公開 API</h2>
-    <section class="card">
+    <section class="section">
       <p class="small">投票の取得: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}</code><br>
       投票の実行: <code>POST ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/vote</code><br>
       結果の取得: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/results</code></p>
@@ -1263,7 +1306,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
         flash.hidden = false;
       });
     `)}
-    ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, questions: questionSeed, nonce }) : `<h2>内容</h2><section class="card">${questionSeed.map((q) => `<h3>${escapeHtml(q.prompt)}</h3><p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : "単一選択"}</p><ul>${q.options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul>`).join("")}</section>`}`;
+    ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, questions: questionSeed, nonce }) : `<h2>内容</h2><section class="section">${questionSeed.map((q) => `<h3>${escapeHtml(q.prompt)}</h3><p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : "単一選択"}</p><ul>${q.options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul>`).join("")}</section>`}`;
   return c.html(
     layout({
       title: poll.question,
@@ -1289,6 +1332,9 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
   const poll = await getPollRow(c.env, pollId);
   if (!poll || poll.tenant_id !== tenantId) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
   const results = await computeResults(c.env, originOf(c), poll, { includeText: true });
+  // Saturated categorical palette for the stacked share bar (no pastels).
+  const SEGMENT_COLORS = ["#1e4fd8", "#e07b00", "#0c6b34", "#b91c1c", "#6d28d9", "#0e7490"];
+  const colorOf = (i: number) => SEGMENT_COLORS[i % SEGMENT_COLORS.length] as string;
   const sections = (results.questions.length > 0 ? results.questions : [{
     id: poll.id,
     prompt: poll.question,
@@ -1301,19 +1347,24 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
   }]).map((q) => {
     const denom = q.options.reduce((sum, o) => sum + o.votes, 0);
     const maxVotes = Math.max(1, ...q.options.map((o) => o.votes));
-    const bars = q.options.map((o) => {
+    const bars = q.options.map((o, i) => {
       const pct = denom > 0 ? Math.round((o.votes / denom) * 1000) / 10 : 0;
       const width = Math.round((o.votes / maxVotes) * 1000) / 10;
       return `<div class="bar-row">
         <div>${escapeHtml(o.label)}</div>
-        <div class="bar-track" role="img" aria-label="${escapeHtml(o.label)}: ${o.votes}票 (${pct}%)"><div class="bar-fill" style="width:${width}%"></div></div>
+        <div class="bar-track" role="img" aria-label="${escapeHtml(o.label)}: ${o.votes}票 (${pct}%)"><div class="bar-fill" style="width:${width}%;--d:${(i * 0.08).toFixed(2)}s"></div></div>
         <div><strong>${o.votes}</strong> 票 <span class="muted">(${pct}%)</span></div>
       </div>`;
     }).join("");
+    const stackSegments = q.options.map((o, i) => {
+      const pct = denom > 0 ? (o.votes / denom) * 100 : 0;
+      return `<div class="stack-seg" style="width:${pct}%;background:${colorOf(i)};--d:${(i * 0.08).toFixed(2)}s"></div>`;
+    }).join("");
+    const legend = q.options.map((o, i) => `<span><span class="sw" style="background:${colorOf(i)}"></span>${escapeHtml(o.label)}</span>`).join("");
     const texts = (q.texts ?? []).map((t) => `<li>${escapeHtml(t)}</li>`).join("");
     return `<h2>${escapeHtml(q.prompt)}</h2>
       <p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : "単一選択"} ／ 回答 ${q.response_count}</p>
-      ${q.kind === "text" ? `<ul>${texts || '<li class="muted">まだ回答がありません。</li>'}</ul>` : bars}`;
+      ${q.kind === "text" ? `<ul>${texts || '<li class="muted">まだ回答がありません。</li>'}</ul>` : `${bars}${denom > 0 ? `<div class="stack" role="img" aria-label="得票割合の積み上げグラフ">${stackSegments}</div><div class="legend">${legend}</div>` : ""}`}`;
   }).join("");
   const body = `
     <p class="muted small"><a href="/admin/workspaces/${tenantId}/polls/${pollId}">投票に戻る</a></p>
@@ -1322,7 +1373,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
       <a class="btn" href="/api/v1/tenants/${escapeHtml(tenantId)}/polls/${escapeHtml(pollId)}/export?format=csv">CSV で書き出す</a>
       <a class="btn" href="/api/v1/tenants/${escapeHtml(tenantId)}/polls/${escapeHtml(pollId)}/export?format=json">JSON で書き出す</a>
     </div>
-    <section class="card">
+    <section class="section">
       <div class="poll-head">
         <div style="flex:1;min-width:260px">
           <strong>${escapeHtml(poll.question)}</strong>

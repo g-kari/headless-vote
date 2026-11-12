@@ -63,6 +63,15 @@ export async function ensureVoterKeysHashed(env: Env): Promise<void> {
   }
 }
 
+/* Remove one voter's ballot (folds an anonymous ballot into a login ballot). */
+export async function deleteBallot(env: Env, pollId: string, rawVoterKey: string): Promise<void> {
+  await ensureVoterKeysHashed(env);
+  const stored = await hashVoterKey(env, rawVoterKey);
+  await env.DB.prepare("DELETE FROM vote_ballots WHERE poll_id = ?1 AND voter_key = ?2")
+    .bind(pollId, stored)
+    .run();
+}
+
 export async function ballotCount(env: Env, pollId: string): Promise<number> {
   await ensureVoterKeysHashed(env);
   const row = await env.DB.prepare(

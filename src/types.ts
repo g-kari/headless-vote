@@ -109,6 +109,8 @@ export type AdminPrincipal =
 export interface SessionUser {
   kind: "session";
   sessionVersion?: number;
+  /** OIDC session epoch at issue time; bumped server-side to revoke all sessions. */
+  sessionEpoch?: number;
   authProvider?: "local" | "oidc";
   sub: string;
   name?: string;

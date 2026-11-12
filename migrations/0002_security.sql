@@ -1,42 +1,40 @@
--- Security and embed-origin settings.
--- Applied after 0001. Safe on databases that already have votes.
+-- Security hardening (review follow-up):
+-- - sessions: server-side admin sessions so a session can be revoked
+--   (logout / revoke-all) instead of living until the cookie signature
+--   expires.
+-- - rate_limit_buckets: fixed-window counters for the Worker-side rate
+--   limits (identifiers are stored SHA-256 hashed).
+-- - tenant_image_usage: per-tenant image count / total-bytes quota
+--   bookkeeping for R2 uploads.
+-- - app_migrations: bookkeeping table for Worker-applied data
+--   migrations (reserved; the voter-key rewrite is idempotent and
+--   poll-scoped, so it does not depend on this table).
+CREATE TABLE IF NOT EXISTS sessions (
+  id_hash TEXT PRIMARY KEY,
+  user_sub TEXT NOT NULL,
+  name TEXT,
+  email TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_sub);
 
-ALTER TABLE polls ADD COLUMN revision TEXT NOT NULL DEFAULT '';
-
-CREATE TABLE IF NOT EXISTS vote_ballots (
-  poll_id TEXT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
-  voter_key TEXT NOT NULL,
-  option_ids TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (poll_id, voter_key)
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+  bucket TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  count INTEGER NOT NULL,
+  PRIMARY KEY (bucket, window_start)
 );
 
--- One row per voter. Existing per-option rows are folded in so a deploy
--- does not let those voters vote a second time under a new table.
-INSERT INTO vote_ballots (poll_id, voter_key, option_ids, updated_at)
-SELECT poll_id, voter_key, json_group_array(option_id), MAX(updated_at)
-FROM votes
-GROUP BY poll_id, voter_key;
-
-CREATE TABLE IF NOT EXISTS tenant_origins (
-  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  origin TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (tenant_id, origin)
+CREATE TABLE IF NOT EXISTS tenant_image_usage (
+  tenant_id TEXT PRIMARY KEY,
+  image_count INTEGER NOT NULL,
+  total_bytes INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS rate_limits (
-  bucket TEXT PRIMARY KEY,
-  hits INTEGER NOT NULL,
-  reset_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS app_meta (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS oidc_states (
-  state_hash TEXT PRIMARY KEY,
-  expires_at INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS app_migrations (
+  name TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
 );

@@ -181,6 +181,18 @@ CREATE TABLE IF NOT EXISTS object_cleanup (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_epochs (
+  sub TEXT PRIMARY KEY,
+  epoch INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS tenant_image_usage (
+  tenant_id TEXT PRIMARY KEY,
+  image_count INTEGER NOT NULL,
+  total_bytes INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS email_outbox (
   id TEXT PRIMARY KEY,
   recipient TEXT NOT NULL,

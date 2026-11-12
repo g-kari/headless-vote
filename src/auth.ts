@@ -86,6 +86,28 @@ export function clearSessionCookie(requestUrl: string): string {
   return cookieHeader(sessionCookieName(requestUrl), "", 0, https);
 }
 
+/* ------------------------------------------------------------------ */
+/* OIDC session epochs (revoke-all for stateless session cookies)      */
+/* ------------------------------------------------------------------ */
+
+/** Current session epoch for an OIDC user; 0 when never revoked. */
+export async function getSessionEpoch(env: Env, sub: string): Promise<number> {
+  const row = await env.DB.prepare("SELECT epoch FROM session_epochs WHERE sub = ?1")
+    .bind(sub)
+    .first<{ epoch: number }>();
+  return Number(row?.epoch ?? 0);
+}
+
+/** Invalidate every outstanding OIDC session cookie for this user. */
+export async function bumpSessionEpoch(env: Env, sub: string): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO session_epochs (sub, epoch) VALUES (?1, 1)
+     ON CONFLICT(sub) DO UPDATE SET epoch = epoch + 1`,
+  )
+    .bind(sub)
+    .run();
+}
+
 export async function getSessionUser(c: Ctx): Promise<SessionUser | null> {
   const cookies = parseCookies(c);
   const raw = cookies[sessionCookieName(c.req.url)];
@@ -106,6 +128,12 @@ export async function getSessionUser(c: Ctx): Promise<SessionUser | null> {
     const user = await c.env.DB.prepare("SELECT session_version FROM local_users WHERE id = ?1 AND email_verified_at IS NOT NULL")
       .bind(payload.sub.slice("local:".length)).first<{ session_version: number }>();
     if (!user || user.session_version !== payload.sessionVersion) return null;
+  }
+  if (sessionProvider === "oidc") {
+    // Revoke-all support for stateless cookies (PR #4 parity): the epoch
+    // baked into the cookie must still match the server-side epoch.
+    const epoch = await getSessionEpoch(c.env, payload.sub);
+    if ((payload.sessionEpoch ?? 0) !== epoch) return null;
   }
   return payload;
 }
@@ -271,12 +299,15 @@ export async function newSessionCookieForToken(
   requestUrl: string,
   sessionVersion?: number,
 ): Promise<string> {
+  const sessionEpoch =
+    sessionVersion === undefined ? await getSessionEpoch(env, sub) : undefined;
   return makeSessionCookie(
     env,
     {
       sub,
       authProvider: sessionVersion === undefined ? "oidc" : "local",
       sessionVersion,
+      sessionEpoch,
       name: cleanClaim(claims["name"], 120),
       email: cleanClaim(claims["email"], 200),
     },

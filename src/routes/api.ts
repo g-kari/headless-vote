@@ -3,7 +3,7 @@ import { deleteAccountData, deleteWorkspace, listMemberships } from "../account"
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
 import { bearerToken, getSessionUser, optionalVoterSub, requireAdmin } from "../auth";
-import { ballotCount, upsertBallot } from "../ballots";
+import { ballotCount, deleteBallot, upsertBallot } from "../ballots";
 import { addTenantOrigin, listTenantOrigins, isAllowedTenantOrigin, removeTenantOrigin } from "../cors";
 import { randomId } from "../crypto";
 import { resultsToCsv } from "../export";
@@ -425,6 +425,47 @@ api.get("/tenants/:tenantId/polls/:pollId/results", async (c) => {
 /* Admin: image upload (R2)                                            */
 /* ------------------------------------------------------------------ */
 
+/** Per-tenant image quota: count and total bytes across all uploads (PR #4 parity). */
+const MAX_IMAGES_PER_TENANT = 500;
+const MAX_IMAGE_BYTES_PER_TENANT = 500 * 1024 * 1024;
+
+interface ImageUsage {
+  image_count: number;
+  total_bytes: number;
+}
+
+/**
+ * Read the tenant's image usage. The row is initialized from the actual
+ * R2 prefix on first use, so images uploaded before quotas existed are
+ * counted too.
+ */
+async function getImageUsage(env: Env, tenantId: string): Promise<ImageUsage> {
+  const row = await env.DB.prepare(
+    "SELECT image_count, total_bytes FROM tenant_image_usage WHERE tenant_id = ?1",
+  )
+    .bind(tenantId)
+    .first<ImageUsage>();
+  if (row) return { image_count: Number(row.image_count), total_bytes: Number(row.total_bytes) };
+  let count = 0;
+  let bytes = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await env.IMAGES.list({ prefix: `t/${tenantId}/`, cursor, limit: 1000 });
+    for (const obj of page.objects) {
+      count += 1;
+      bytes += obj.size;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at)
+     VALUES (?1, ?2, ?3, ?4)`,
+  )
+    .bind(tenantId, count, bytes, nowIso())
+    .run();
+  return { image_count: count, total_bytes: bytes };
+}
+
 api.post("/tenants/:tenantId/images", async (c) => {
   const tenantId = c.req.param("tenantId");
   await requireAdmin(c, tenantId);
@@ -437,6 +478,21 @@ api.post("/tenants/:tenantId/images", async (c) => {
   if (bytes.byteLength === 0) throw badRequest("Image body is empty");
   const sniffed = sniffImage(bytes, contentType);
   if (!sniffed) throw badRequest("File contents do not match the declared image type");
+  const usage = await getImageUsage(c.env, tenantId);
+  if (usage.image_count >= MAX_IMAGES_PER_TENANT) {
+    throw new ApiError(
+      429,
+      "IMAGE_QUOTA_EXCEEDED",
+      `Image count quota reached for this workspace (${MAX_IMAGES_PER_TENANT} images)`,
+    );
+  }
+  if (usage.total_bytes + bytes.byteLength > MAX_IMAGE_BYTES_PER_TENANT) {
+    throw new ApiError(
+      429,
+      "IMAGE_QUOTA_EXCEEDED",
+      "Image storage quota reached for this workspace (500 MiB total)",
+    );
+  }
   const key = `t/${tenantId}/${randomId()}.${sniffed.ext}`;
   await createObjectStore(c.env).put(key, bytes, sniffed.contentType);
   const stillExists = await c.env.DB.prepare("SELECT id FROM tenants WHERE id = ?1").bind(tenantId).first();
@@ -445,6 +501,16 @@ api.post("/tenants/:tenantId/images", async (c) => {
       .bind(tenantId, nowIso()).run();
     throw notFound("Workspace not found");
   }
+  await c.env.DB.prepare(
+    `INSERT INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at)
+     VALUES (?1, 1, ?2, ?3)
+     ON CONFLICT (tenant_id) DO UPDATE SET
+       image_count = image_count + 1,
+       total_bytes = total_bytes + excluded.total_bytes,
+       updated_at = excluded.updated_at`,
+  )
+    .bind(tenantId, bytes.byteLength, nowIso())
+    .run();
   return c.json({ key, url: `${originOf(c)}/images/${key}` }, 201);
 });
 
@@ -524,6 +590,18 @@ api.post("/polls/:pollId/vote", async (c) => {
   const options = await listOptionRows(c.env, poll.id);
   const answers = resolveAnswers(body, questions, options);
   await upsertBallot(c.env, poll, voterKey, ballotDocument(answers), sub !== null);
+  if (sub) {
+    // A logged-in vote that also presents the anonymous voter token folds
+    // that token's earlier anonymous ballot into this login ballot, so the
+    // same person is not counted twice (PR #4 L7 parity).
+    const presented = body["voter_token"];
+    if (typeof presented === "string") {
+      const token = presented.trim();
+      if (token.length >= 8 && token.length <= 128) {
+        await deleteBallot(c.env, poll.id, `anon:${token}`);
+      }
+    }
+  }
   await dispatchWebhooks(c.env, poll.tenant_id, "vote.cast", {
     poll_id: poll.id,
     voter: sub ? "user" : "anonymous",
