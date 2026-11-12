@@ -3,8 +3,12 @@
  * - Admin UI login: authorization code flow + PKCE S256.
  * - Logged-in voting: verifies JWTs (id_token) issued by 0g0-id via JWKS (ES256).
  */
-import { base64UrlDecode } from "./crypto";
+import { base64UrlDecode, timingSafeEqual } from "./crypto";
+import { readBodyLimited } from "./security";
 import type { Env } from "./types";
+
+const OIDC_BODY_LIMIT = 64 * 1024;
+const JWT_MAX_LENGTH = 8192;
 
 export interface OidcDiscovery {
   issuer: string;
@@ -16,20 +20,75 @@ export interface OidcDiscovery {
 
 let discoveryCache: { issuer: string; doc: OidcDiscovery } | null = null;
 
+/** Issuer and every OIDC URL must be https and on the same origin. */
+export function assertPinnedOidcUrl(issuer: string, endpoint: string): void {
+  const issuerUrl = new URL(issuer);
+  const endpointUrl = new URL(endpoint);
+  if (issuerUrl.protocol !== "https:" || endpointUrl.protocol !== "https:") {
+    throw new Error("OIDC URLs must use https");
+  }
+  if (
+    issuerUrl.username ||
+    issuerUrl.password ||
+    endpointUrl.username ||
+    endpointUrl.password
+  ) {
+    throw new Error("OIDC URLs must not include credentials");
+  }
+  if (issuerUrl.pathname !== "/" && issuerUrl.pathname !== "") {
+    throw new Error("OIDC issuer must not include a path");
+  }
+  if (issuerUrl.origin === "null" || endpointUrl.origin !== issuerUrl.origin) {
+    throw new Error("OIDC endpoint is not on the issuer origin");
+  }
+}
+
+function assertDiscovery(doc: OidcDiscovery): void {
+  assertPinnedOidcUrl(doc.issuer, doc.authorization_endpoint);
+  assertPinnedOidcUrl(doc.issuer, doc.token_endpoint);
+  assertPinnedOidcUrl(doc.issuer, doc.jwks_uri);
+}
+
+async function fetchNoRedirect(url: string, init?: RequestInit): Promise<Response> {
+  const res = await fetch(url, {
+    ...init,
+    redirect: "manual",
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (res.status >= 300 && res.status < 400) {
+    await res.body?.cancel();
+    throw new Error("OIDC endpoint returned a redirect");
+  }
+  return res;
+}
+
+async function readOidcJson(res: Response): Promise<unknown> {
+  const bytes = await readBodyLimited(res, OIDC_BODY_LIMIT);
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
 export async function getDiscovery(env: Env): Promise<OidcDiscovery> {
   const issuer = env.OIDC_ISSUER.replace(/\/+$/, "");
   if (env.OIDC_AUTHORIZATION_ENDPOINT && env.OIDC_TOKEN_ENDPOINT && env.OIDC_JWKS_URI) {
-    return {
+    const doc = {
       issuer,
       authorization_endpoint: env.OIDC_AUTHORIZATION_ENDPOINT,
       token_endpoint: env.OIDC_TOKEN_ENDPOINT,
       jwks_uri: env.OIDC_JWKS_URI,
     };
+    assertDiscovery(doc);
+    return doc;
   }
   if (discoveryCache?.issuer === issuer) return discoveryCache.doc;
-  const res = await fetch(`${issuer}/.well-known/openid-configuration`);
-  if (!res.ok) throw new Error(`OIDC discovery failed: ${res.status}`);
-  const doc = (await res.json()) as OidcDiscovery;
+  assertPinnedOidcUrl(issuer, `${issuer}/.well-known/openid-configuration`);
+  const res = await fetchNoRedirect(`${issuer}/.well-known/openid-configuration`);
+  if (!res.ok) {
+    await res.body?.cancel();
+    throw new Error(`OIDC discovery failed: ${res.status}`);
+  }
+  const doc = (await readOidcJson(res)) as OidcDiscovery;
+  doc.issuer = issuer;
+  assertDiscovery(doc);
   discoveryCache = { issuer, doc };
   return doc;
 }
@@ -58,9 +117,13 @@ async function getJwks(env: Env): Promise<Jwk[]> {
   if (jwksCache && jwksCache.uri === discovery.jwks_uri && now - jwksCache.fetchedAt < JWKS_TTL_MS) {
     return jwksCache.keys;
   }
-  const res = await fetch(discovery.jwks_uri);
-  if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
-  const doc = (await res.json()) as { keys: Jwk[] };
+  assertPinnedOidcUrl(discovery.issuer, discovery.jwks_uri);
+  const res = await fetchNoRedirect(discovery.jwks_uri);
+  if (!res.ok) {
+    await res.body?.cancel();
+    throw new Error(`JWKS fetch failed: ${res.status}`);
+  }
+  const doc = (await readOidcJson(res)) as { keys: Jwk[] };
   jwksCache = { uri: discovery.jwks_uri, keys: doc.keys, fetchedAt: now };
   return doc.keys;
 }
@@ -71,9 +134,13 @@ export interface VerifiedToken {
 }
 
 function decodeJsonPart(part: string): Record<string, unknown> {
-  return JSON.parse(
-    new TextDecoder().decode(base64UrlDecode(part)),
-  ) as Record<string, unknown>;
+  try {
+    return JSON.parse(
+      new TextDecoder().decode(base64UrlDecode(part)),
+    ) as Record<string, unknown>;
+  } catch {
+    throw new Error("malformed JWT");
+  }
 }
 
 /**
@@ -87,8 +154,10 @@ function decodeJsonPart(part: string): Record<string, unknown> {
 export async function verifyJwt(
   env: Env,
   token: string,
-  opts: { audience?: string; nonce?: string } = {},
+  opts: { audience: string; nonce?: string },
 ): Promise<VerifiedToken> {
+  if (!opts.audience) throw new Error("audience is required");
+  if (token.length === 0 || token.length > JWT_MAX_LENGTH) throw new Error("malformed JWT");
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("malformed JWT");
   const [headerPart, payloadPart, signaturePart] = parts as [string, string, string];
@@ -96,28 +165,41 @@ export async function verifyJwt(
   const claims = decodeJsonPart(payloadPart);
 
   if (header["alg"] !== "ES256") throw new Error("unexpected JWT alg");
+  if (header["crit"] !== undefined) throw new Error("unsupported crit");
+  const typ = header["typ"];
+  if (typ !== undefined && typ !== "JWT" && typ !== "jwt") throw new Error("unexpected JWT typ");
   const issuer = env.OIDC_ISSUER.replace(/\/+$/, "");
   if (claims["iss"] !== issuer) throw new Error("issuer mismatch");
 
   const nowSeconds = Math.floor(Date.now() / 1000);
   const exp = claims["exp"];
-  if (typeof exp !== "number" || exp <= nowSeconds) throw new Error("token expired");
-  const nbf = claims["nbf"];
-  if (typeof nbf === "number" && nbf > nowSeconds) throw new Error("token not yet valid");
-
-  if (opts.audience) {
-    const aud = claims["aud"];
-    const audiences = Array.isArray(aud) ? aud : aud ? [aud] : [];
-    if (!audiences.includes(opts.audience)) throw new Error("audience mismatch");
+  if (typeof exp !== "number" || !Number.isFinite(exp) || exp <= nowSeconds) {
+    throw new Error("token expired");
   }
-  if (opts.nonce !== undefined && claims["nonce"] !== opts.nonce) {
-    throw new Error("nonce mismatch");
+  const nbf = claims["nbf"];
+  if (nbf !== undefined && (typeof nbf !== "number" || !Number.isFinite(nbf) || nbf > nowSeconds)) {
+    throw new Error("token not yet valid");
+  }
+
+  const aud = claims["aud"];
+  const audiences = Array.isArray(aud) ? aud : aud ? [aud] : [];
+  if (!audiences.includes(opts.audience)) throw new Error("audience mismatch");
+  if (opts.nonce !== undefined) {
+    const claimNonce = claims["nonce"];
+    if (typeof claimNonce !== "string" || !timingSafeEqual(claimNonce, opts.nonce)) {
+      throw new Error("nonce mismatch");
+    }
   }
 
   const keys = await getJwks(env);
-  const kid = header["kid"];
+  if (header["kid"] !== undefined && typeof header["kid"] !== "string") {
+    throw new Error("bad kid");
+  }
+  const kid = typeof header["kid"] === "string" ? header["kid"] : undefined;
   const jwk = keys.find((k) => (kid ? k.kid === kid : true) && k.kty === "EC" && k.crv === "P-256");
-  if (!jwk) throw new Error("signing key not found");
+  if (!jwk || typeof jwk.x !== "string" || typeof jwk.y !== "string") {
+    throw new Error("signing key not found");
+  }
 
   const key = await crypto.subtle.importKey(
     "jwk",
@@ -127,7 +209,12 @@ export async function verifyJwt(
     ["verify"],
   );
   const signed = new TextEncoder().encode(`${headerPart}.${payloadPart}`);
-  const signature = base64UrlDecode(signaturePart);
+  let signature: Uint8Array;
+  try {
+    signature = base64UrlDecode(signaturePart);
+  } catch {
+    throw new Error("malformed signature");
+  }
   const ok = await crypto.subtle.verify(
     { name: "ECDSA", hash: "SHA-256" },
     key,
@@ -137,7 +224,7 @@ export async function verifyJwt(
   if (!ok) throw new Error("signature verification failed");
 
   const sub = claims["sub"];
-  if (typeof sub !== "string" || sub.length === 0) throw new Error("missing sub");
+  if (typeof sub !== "string" || sub.length === 0 || sub.length > 256) throw new Error("missing sub");
   return { sub, claims };
 }
 
@@ -145,8 +232,9 @@ export async function verifyJwt(
 export async function exchangeCode(
   env: Env,
   params: { code: string; codeVerifier: string; redirectUri: string },
-): Promise<{ idToken: string; accessToken?: string }> {
+): Promise<{ idToken: string }> {
   const discovery = await getDiscovery(env);
+  assertPinnedOidcUrl(discovery.issuer, discovery.token_endpoint);
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code: params.code,
@@ -161,16 +249,18 @@ export async function exchangeCode(
     const basic = btoa(`${env.OIDC_CLIENT_ID}:${env.OIDC_CLIENT_SECRET}`);
     headers["authorization"] = `Basic ${basic}`;
   }
-  const res = await fetch(discovery.token_endpoint, {
+  const res = await fetchNoRedirect(discovery.token_endpoint, {
     method: "POST",
     headers,
     body: body.toString(),
   });
   if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`token exchange failed: ${res.status} ${detail.slice(0, 200)}`);
+    await res.body?.cancel();
+    throw new Error(`token exchange failed: ${res.status}`);
   }
-  const json = (await res.json()) as { id_token?: string; access_token?: string };
-  if (!json.id_token) throw new Error("token response has no id_token");
-  return { idToken: json.id_token, accessToken: json.access_token };
+  const json = (await readOidcJson(res)) as { id_token?: unknown };
+  if (typeof json.id_token !== "string" || json.id_token.length === 0 || json.id_token.length > JWT_MAX_LENGTH) {
+    throw new Error("token response has no id_token");
+  }
+  return { idToken: json.id_token };
 }

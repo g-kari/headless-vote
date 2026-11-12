@@ -1,6 +1,6 @@
 /**
- * Database schema. Kept in sync with migrations/0001_init.sql (the SQL text is
- * identical; tests apply SCHEMA_SQL directly to a fresh D1 database).
+ * Full database schema for a fresh database (what tests apply).
+ * Production upgrades go through migrations/ (0001, then 0002, ...).
  */
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS tenants (
@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS polls (
   require_login INTEGER NOT NULL DEFAULT 0,
   closes_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  revision TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_polls_tenant ON polls(tenant_id);
 
@@ -53,6 +54,37 @@ CREATE TABLE IF NOT EXISTS votes (
   UNIQUE (poll_id, voter_key, option_id)
 );
 CREATE INDEX IF NOT EXISTS idx_votes_poll ON votes(poll_id);
+
+CREATE TABLE IF NOT EXISTS vote_ballots (
+  poll_id TEXT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+  voter_key TEXT NOT NULL,
+  option_ids TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (poll_id, voter_key)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_origins (
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  origin TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, origin)
+);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+  bucket TEXT PRIMARY KEY,
+  hits INTEGER NOT NULL,
+  reset_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oidc_states (
+  state_hash TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
+);
 `;
 
 /** Split a multi-statement SQL script into individual statements. */

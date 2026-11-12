@@ -9,6 +9,20 @@ export function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+/** JSON for embedding inside a <script> element. Escapes HTML-significant characters. */
+export function safeJsonForScript(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
+export function scriptTag(nonce: string, code: string): string {
+  return `<script nonce="${escapeHtml(nonce)}">${code}</script>`;
+}
+
 export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="img" aria-label="headless-vote logo"><rect width="64" height="64" rx="14" fill="#5b5bd6"/><path d="M19.2 30.1 L27.8 39.4 L45.4 20.2" fill="none" stroke="#ffffff" stroke-width="6.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="17.9" y="44.8" width="28.2" height="4.8" rx="2.4" fill="#ffffff" opacity="0.92"/></svg>`;
 
 const CSS = `
@@ -113,6 +127,7 @@ export function layout(opts: {
   userEmail?: string | null;
   body: string;
   origin: string;
+  nonce: string;
 }): string {
   const userArea = opts.userEmail
     ? `<span class="user">${escapeHtml(opts.userEmail)}</span>
@@ -136,7 +151,7 @@ export function layout(opts: {
 <meta property="og:url" content="${escapeHtml(opts.origin)}/">
 <meta property="og:image" content="${escapeHtml(opts.origin)}/ogp.png">
 <meta name="twitter:card" content="summary_large_image">
-<style>${CSS}</style>
+<style nonce="${escapeHtml(opts.nonce)}">${CSS}</style>
 </head>
 <body>
 <header class="site"><div class="bar">

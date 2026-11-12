@@ -14,6 +14,7 @@ export default defineConfig({
         bindings: {
           SESSION_SECRET: "test-session-secret",
           OIDC_CLIENT_ID: "test-client-id",
+          APP_ORIGIN: "https://vote.test",
           OIDC_AUTHORIZATION_ENDPOINT: "https://id.0g0.xyz/auth/authorize",
           OIDC_TOKEN_ENDPOINT: "https://id.0g0.xyz/api/token",
           OIDC_JWKS_URI: "https://id.0g0.xyz/.well-known/jwks.json",

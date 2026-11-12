@@ -1,5 +1,7 @@
 import { Hono } from "hono";
-import { findTenantByApiKey, optionalVoterSub, requireAdmin } from "../auth";
+import { bearerToken, findTenantByApiKey, optionalVoterSub, requireAdmin } from "../auth";
+import { ballotCount, upsertBallot } from "../ballots";
+import { addTenantOrigin, listTenantOrigins, removeTenantOrigin } from "../cors";
 import { randomId, randomToken, sha256Hex } from "../crypto";
 import {
   computeResults,
@@ -14,7 +16,8 @@ import {
   pollToJson,
   reqString,
 } from "../domain";
-import { ApiError, badRequest, conflict, notFound, payloadTooLarge, unauthorized } from "../errors";
+import { ApiError, badRequest, conflict, notFound, unauthorized } from "../errors";
+import { assertPlainText, isSafeImageKey, normalizeUuid, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
 import type { Env, OptionRow, PollRow, TenantRow, Variables } from "../types";
 
 export const api = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -37,6 +40,7 @@ function originOf(c: { req: { url: string } }): string {
 
 /** Self-serve tenant creation (SaaS onboarding). The API key is shown once. */
 api.post("/tenants", async (c) => {
+  await rateLimitByIp(c, "tenant-create", 80, 3600);
   const body = await jsonBody(c);
   const name = reqString(body, "name", { max: 120 });
   const tenantId = randomId();
@@ -56,7 +60,7 @@ api.post("/tenants", async (c) => {
 /** Rotate the tenant API key (authenticated with the current key). */
 api.post("/tenants/:tenantId/rotate-key", async (c) => {
   const tenantId = c.req.param("tenantId");
-  const token = c.req.header("authorization")?.replace(/^Bearer\s+/i, "").trim();
+  const token = bearerToken(c);
   if (!token) throw unauthorized("UNAUTHORIZED", "API key required");
   const tenant = await findTenantByApiKey(c.env, token);
   if (!tenant || tenant.id !== tenantId) {
@@ -100,7 +104,7 @@ async function assertImageKeyBelongsToTenant(
   imageKey: string | null,
 ): Promise<void> {
   if (imageKey === null) return;
-  if (!imageKey.startsWith(`t/${tenantId}/`)) {
+  if (!isSafeImageKey(imageKey, tenantId)) {
     throw badRequest("image_key does not belong to this tenant");
   }
   const obj = await env.IMAGES.head(imageKey);
@@ -136,7 +140,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   await requireAdmin(c, tenantId);
   const body = await jsonBody(c);
   const question = reqString(body, "question", { max: 300 });
-  const description = optString(body, "description", { max: 5000 }) ?? "";
+  const description = optString(body, "description", { max: 5000, newlines: true }) ?? "";
   const imageKey = optString(body, "image_key", { max: 300 });
   const allowMultiple = optBool(body, "allow_multiple");
   const requireLogin = optBool(body, "require_login");
@@ -149,8 +153,8 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const pollId = randomId();
   const now = nowIso();
   await c.env.DB.prepare(
-    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, closes_at, created_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?9)`,
+    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, closes_at, created_at, updated_at, revision)
+     VALUES (?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?9, ?10)`,
   )
     .bind(
       pollId,
@@ -162,6 +166,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       requireLogin ? 1 : 0,
       closesAt,
       now,
+      randomId(),
     )
     .run();
   await insertOptions(c.env, pollId, options);
@@ -208,7 +213,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
       : poll.question;
   const description =
     body["description"] !== undefined
-      ? (optString(body, "description", { max: 5000 }) ?? "")
+      ? (optString(body, "description", { max: 5000, newlines: true }) ?? "")
       : poll.description;
   const imageKey =
     body["image_key"] !== undefined
@@ -227,19 +232,23 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
 
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
 
+  const cast = await ballotCount(c.env, poll.id);
+  if (cast > 0) {
+    if (allowMultiple !== (poll.allow_multiple === 1) || requireLogin !== (poll.require_login === 1)) {
+      throw conflict(
+        "RULES_LOCKED",
+        "Voting rules cannot be changed after votes have been cast",
+      );
+    }
+  }
+
   let replacementOptions: OptionInput[] | null = null;
   if (body["options"] !== undefined) {
     replacementOptions = parseOptions(body);
     for (const o of replacementOptions) {
       await assertImageKeyBelongsToTenant(c.env, tenantId, o.image_key);
     }
-    // Options can only be replaced while nobody has voted yet.
-    const voted = await c.env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM votes WHERE poll_id = ?1",
-    )
-      .bind(poll.id)
-      .first<{ n: number }>();
-    if ((voted?.n ?? 0) > 0) {
+    if (cast > 0) {
       throw conflict(
         "OPTIONS_LOCKED",
         "Options cannot be replaced after votes have been cast",
@@ -247,25 +256,61 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     }
   }
 
-  await c.env.DB.prepare(
+  // revision always changes, so a matching WHERE is a real write even when
+  // the other columns stay the same. Concurrent editors lose the compare.
+  const newRevision = randomId();
+  const updatePoll = c.env.DB.prepare(
     `UPDATE polls SET question = ?1, description = ?2, image_key = ?3,
-     allow_multiple = ?4, require_login = ?5, closes_at = ?6, updated_at = ?7
-     WHERE id = ?8`,
-  )
-    .bind(
-      question,
-      description,
-      imageKey,
-      allowMultiple ? 1 : 0,
-      requireLogin ? 1 : 0,
-      closesAt,
-      nowIso(),
-      poll.id,
-    )
-    .run();
+     allow_multiple = ?4, require_login = ?5, closes_at = ?6, updated_at = ?7,
+     revision = ?8
+     WHERE id = ?9 AND revision = ?10`,
+  ).bind(
+    question,
+    description,
+    imageKey,
+    allowMultiple ? 1 : 0,
+    requireLogin ? 1 : 0,
+    closesAt,
+    nowIso(),
+    newRevision,
+    poll.id,
+    poll.revision,
+  );
 
-  if (replacementOptions) {
-    await c.env.DB.prepare("DELETE FROM options WHERE poll_id = ?1").bind(poll.id).run();
+  if (!replacementOptions) {
+    const updatedPoll = await updatePoll.run();
+    if (Number(updatedPoll.meta.changes ?? 0) !== 1) {
+      throw conflict(
+        "CONCURRENT_UPDATE",
+        "The poll was updated at the same time. Reload and try again.",
+      );
+    }
+  } else {
+    const existing = await listOptionRows(c.env, poll.id);
+    const deleteOptions = c.env.DB.prepare(
+      `DELETE FROM options WHERE poll_id = ?1
+       AND NOT EXISTS (SELECT 1 FROM vote_ballots WHERE poll_id = ?1)
+       AND (SELECT revision FROM polls WHERE id = ?1) = ?2`,
+    ).bind(poll.id, newRevision);
+    const [updatedPoll, deleted] = await c.env.DB.batch([updatePoll, deleteOptions]);
+    if (!updatedPoll || !deleted || Number(updatedPoll.meta.changes ?? 0) !== 1) {
+      throw conflict(
+        "CONCURRENT_UPDATE",
+        "The poll was updated at the same time. Reload and try again.",
+      );
+    }
+    if (Number(deleted?.meta.changes ?? 0) !== existing.length) {
+      if ((await ballotCount(c.env, poll.id)) > 0) {
+        throw conflict(
+          "OPTIONS_LOCKED",
+          "Options cannot be replaced after votes have been cast",
+        );
+      }
+      throw conflict(
+        "CONCURRENT_UPDATE",
+        "The poll was updated at the same time. Reload and try again.",
+      );
+    }
     await insertOptions(c.env, poll.id, replacementOptions);
   }
 
@@ -316,18 +361,17 @@ api.get("/tenants/:tenantId/polls/:pollId/results", async (c) => {
 api.post("/tenants/:tenantId/images", async (c) => {
   const tenantId = c.req.param("tenantId");
   await requireAdmin(c, tenantId);
-  const contentType = (c.req.header("content-type") ?? "").split(";")[0]?.trim() ?? "";
-  const ext = IMAGE_TYPES[contentType];
-  if (!ext) {
+  await rateLimitByIp(c, `image:${tenantId}`, 30, 3600);
+  const contentType = (c.req.header("content-type") ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+  if (!IMAGE_TYPES[contentType]) {
     throw badRequest("Content-Type must be image/png, image/jpeg, image/webp or image/gif");
   }
-  const data = await c.req.arrayBuffer();
-  if (data.byteLength === 0) throw badRequest("Image body is empty");
-  if (data.byteLength > MAX_IMAGE_BYTES) {
-    throw payloadTooLarge("Image must be at most 5 MiB");
-  }
-  const key = `t/${tenantId}/${randomId()}.${ext}`;
-  await c.env.IMAGES.put(key, data, { httpMetadata: { contentType } });
+  const bytes = await readBodyLimited(c.req.raw, MAX_IMAGE_BYTES);
+  if (bytes.byteLength === 0) throw badRequest("Image body is empty");
+  const sniffed = sniffImage(bytes, contentType);
+  if (!sniffed) throw badRequest("File contents do not match the declared image type");
+  const key = `t/${tenantId}/${randomId()}.${sniffed.ext}`;
+  await c.env.IMAGES.put(key, bytes, { httpMetadata: { contentType: sniffed.contentType } });
   return c.json({ key, url: `${originOf(c)}/images/${key}` }, 201);
 });
 
@@ -353,6 +397,7 @@ api.get("/polls/:pollId/results", async (c) => {
 });
 
 api.post("/polls/:pollId/vote", async (c) => {
+  await rateLimitByIp(c, "vote", 600, 60);
   const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
   if (isClosedForVoting(poll)) {
     throw conflict("POLL_CLOSED", "This poll is closed for voting");
@@ -373,24 +418,27 @@ api.post("/polls/:pollId/vote", async (c) => {
       );
     }
     const voterToken = body["voter_token"];
-    if (
-      typeof voterToken !== "string" ||
-      voterToken.trim().length < 8 ||
-      voterToken.trim().length > 128
-    ) {
+    if (typeof voterToken !== "string") {
       throw badRequest(
         '"voter_token" (8-128 chars) is required when voting anonymously',
       );
     }
-    voterKey = `anon:${voterToken.trim()}`;
+    const trimmedToken = voterToken.trim();
+    if (trimmedToken.length < 8 || trimmedToken.length > 128) {
+      throw badRequest(
+        '"voter_token" (8-128 chars) is required when voting anonymously',
+      );
+    }
+    assertPlainText(trimmedToken);
+    voterKey = `anon:${trimmedToken}`;
   }
 
   const rawOptionIds = body["option_ids"];
-  if (!Array.isArray(rawOptionIds) || rawOptionIds.length === 0) {
+  if (!Array.isArray(rawOptionIds) || rawOptionIds.length === 0 || rawOptionIds.length > 50) {
     throw badRequest('"option_ids" must be a non-empty array');
   }
   const optionIds = [...new Set(rawOptionIds)];
-  if (optionIds.some((id) => typeof id !== "string")) {
+  if (optionIds.some((id) => typeof id !== "string" || !normalizeUuid(id))) {
     throw badRequest('"option_ids" must contain option id strings');
   }
   if (poll.allow_multiple !== 1 && optionIds.length !== 1) {
@@ -402,21 +450,7 @@ api.post("/polls/:pollId/vote", async (c) => {
     if (!validIds.has(id)) throw badRequest(`Unknown option id: ${id}`);
   }
 
-  // One person, one vote: replace any previous selections atomically.
-  const now = nowIso();
-  const stmts = [
-    c.env.DB.prepare("DELETE FROM votes WHERE poll_id = ?1 AND voter_key = ?2").bind(
-      poll.id,
-      voterKey,
-    ),
-    ...(optionIds as string[]).map((optionId) =>
-      c.env.DB.prepare(
-        `INSERT INTO votes (id, poll_id, option_id, voter_key, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)`,
-      ).bind(randomId(), poll.id, optionId, voterKey, now),
-    ),
-  ];
-  await c.env.DB.batch(stmts);
+  await upsertBallot(c.env, poll.id, voterKey, optionIds as string[]);
 
   const results = await computeResults(c.env, originOf(c), poll);
   return c.json({
@@ -429,21 +463,73 @@ api.post("/polls/:pollId/vote", async (c) => {
 /* Images (public read through the Worker)                             */
 /* ------------------------------------------------------------------ */
 
-export async function serveImage(
-  env: Env,
-  key: string,
-): Promise<Response> {
-  if (!/^t\/[0-9a-f-]{36}\/[0-9a-f-]{36}\.(png|jpg|webp|gif)$/.test(key)) {
-    throw notFound("Image not found");
+export async function serveImage(env: Env, key: string): Promise<Response> {
+  const match =
+    /^t\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(png|jpg|webp|gif)$/.exec(
+      key.toLowerCase(),
+    );
+  if (!match) {
+    return Response.json(
+      { error: { code: "NOT_FOUND", message: "Image not found" } },
+      { status: 404 },
+    );
   }
-  const obj = await env.IMAGES.get(key);
-  if (!obj) throw notFound("Image not found");
+  const ext = match[3];
+  const contentType =
+    ext === "png" ? "image/png" :
+    ext === "jpg" ? "image/jpeg" :
+    ext === "webp" ? "image/webp" :
+    ext === "gif" ? "image/gif" :
+    null;
+  if (!contentType || !ext) {
+    return Response.json(
+      { error: { code: "NOT_FOUND", message: "Image not found" } },
+      { status: 404 },
+    );
+  }
+  const obj = await env.IMAGES.get(key.toLowerCase());
+  if (!obj) {
+    return Response.json(
+      { error: { code: "NOT_FOUND", message: "Image not found" } },
+      { status: 404 },
+    );
+  }
   const headers = new Headers();
-  obj.writeHttpMetadata(headers);
-  headers.set("etag", obj.httpEtag);
+  headers.set("content-type", contentType);
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("content-disposition", `inline; filename="image.${ext}"`);
   headers.set("cache-control", "public, max-age=86400, immutable");
+  headers.set("etag", obj.httpEtag);
   return new Response(obj.body, { headers });
 }
+
+api.get("/tenants/:tenantId/origins", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId);
+  return c.json({ origins: await listTenantOrigins(c.env, tenantId) });
+});
+
+api.post("/tenants/:tenantId/origins", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId);
+  await rateLimitByIp(c, `origins:${tenantId}`, 60, 3600);
+  const body = await jsonBody(c);
+  const raw = body["origin"];
+  if (typeof raw !== "string") throw badRequest('"origin" must be a string');
+  const saved = await addTenantOrigin(c.env, tenantId, raw);
+  return c.json(saved, saved.created ? 201 : 200);
+});
+
+api.delete("/tenants/:tenantId/origins", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId);
+  const body = await jsonBody(c);
+  const raw = body["origin"];
+  if (typeof raw !== "string") throw badRequest('"origin" must be a string');
+  const removed = await removeTenantOrigin(c.env, tenantId, raw);
+  if (!removed) throw notFound("Origin is not on the allowlist");
+  return c.json({ removed: true });
+});
 
 export { ApiError };
 export type { OptionRow, TenantRow };

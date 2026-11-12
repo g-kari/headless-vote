@@ -46,7 +46,7 @@ async function loginAs(sub: string, email: string): Promise<string> {
   expect(params.get("client_id")).toBe("test-client-id");
   expect(params.get("redirect_uri")).toBe(`${BASE}/auth/callback`);
 
-  const flowCookie = getCookie(loginRes, "hv_oidc_flow");
+  const flowCookie = getCookie(loginRes, "__Host-hv_oidc_flow");
   expect(flowCookie).toBeTruthy();
   const flow = decodeFlowPayload(flowCookie as string);
   expect(params.get("state")).toBe(flow.state);
@@ -57,13 +57,20 @@ async function loginAs(sub: string, email: string): Promise<string> {
     `${BASE}/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(flow.state)}`,
     {
       redirect: "manual",
-      headers: { cookie: `hv_oidc_flow=${flowCookie}` },
+      headers: { cookie: `__Host-hv_oidc_flow=${flowCookie}` },
     },
   );
   expect(callbackRes.status).toBe(302);
   expect(callbackRes.headers.get("location")).toBe("/admin");
-  const session = getCookie(callbackRes, "hv_session");
+  const session = getCookie(callbackRes, "__Host-hv_session");
   expect(session).toBeTruthy();
+  const sessionHeader = callbackRes.headers.getSetCookie().find((h) =>
+    h.startsWith("__Host-hv_session="),
+  );
+  expect(sessionHeader).toMatch(/HttpOnly/i);
+  expect(sessionHeader).toMatch(/Secure/);
+  expect(sessionHeader).toMatch(/SameSite=Lax/i);
+  expect(sessionHeader).not.toMatch(/Domain=/i);
   return session as string;
 }
 
@@ -72,7 +79,7 @@ describe("0g0-id login flow for the admin UI", () => {
     const session = await loginAs("ui-user-1", "one@example.com");
 
     const adminRes = await SELF.fetch(`${BASE}/admin`, {
-      headers: { cookie: `hv_session=${session}` },
+      headers: { cookie: `__Host-hv_session=${session}` },
     });
     expect(adminRes.status).toBe(200);
     const adminHtml = await adminRes.text();
@@ -81,7 +88,7 @@ describe("0g0-id login flow for the admin UI", () => {
     const createRes = await SELF.fetch(`${BASE}/admin/workspaces`, {
       method: "POST",
       headers: {
-        cookie: `hv_session=${session}`,
+        cookie: `__Host-hv_session=${session}`,
         "content-type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams({ name: "私の投票所" }).toString(),
@@ -94,7 +101,7 @@ describe("0g0-id login flow for the admin UI", () => {
 
     // The owner can open the workspace dashboard.
     const dashRes = await SELF.fetch(`${BASE}/admin/workspaces/${tenantId}`, {
-      headers: { cookie: `hv_session=${session}` },
+      headers: { cookie: `__Host-hv_session=${session}` },
     });
     expect(dashRes.status).toBe(200);
     expect(await dashRes.text()).toContain("私の投票所");
@@ -102,12 +109,12 @@ describe("0g0-id login flow for the admin UI", () => {
     // Another logged-in user is not a member and cannot open it.
     const otherSession = await loginAs("ui-user-2", "two@example.com");
     const otherRes = await SELF.fetch(`${BASE}/admin/workspaces/${tenantId}`, {
-      headers: { cookie: `hv_session=${otherSession}` },
+      headers: { cookie: `__Host-hv_session=${otherSession}` },
       redirect: "manual",
     });
     expect(otherRes.status).toBe(302);
     const otherAdmin = await SELF.fetch(`${BASE}/admin`, {
-      headers: { cookie: `hv_session=${otherSession}` },
+      headers: { cookie: `__Host-hv_session=${otherSession}` },
     });
     expect(await otherAdmin.text()).not.toContain("私の投票所");
   });
@@ -116,12 +123,12 @@ describe("0g0-id login flow for the admin UI", () => {
     const loginRes = await SELF.fetch(`${BASE}/admin/login`, {
       redirect: "manual",
     });
-    const flowCookie = getCookie(loginRes, "hv_oidc_flow");
+    const flowCookie = getCookie(loginRes, "__Host-hv_oidc_flow");
     const res = await SELF.fetch(
       `${BASE}/auth/callback?code=test-code&state=bogus-state`,
       {
         redirect: "manual",
-        headers: { cookie: `hv_oidc_flow=${flowCookie}` },
+        headers: { cookie: `__Host-hv_oidc_flow=${flowCookie}` },
       },
     );
     expect(res.status).toBe(400);

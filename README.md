@@ -55,11 +55,12 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 { "error": { "code": "POLL_CLOSED", "message": "This poll is closed for voting." } }
 ```
 
-主なエラーコード: `VALIDATION_ERROR`（400）、`UNAUTHORIZED`（401）、
+主なエラーコード: `BAD_REQUEST`（400）、`UNAUTHORIZED`（401）、`RATE_LIMITED`（429）、
 `LOGIN_REQUIRED`（401、ログイン必須の投票に未ログインで投票）、
 `INVALID_TOKEN`（401）、`FORBIDDEN`（403）、`NOT_FOUND`（404）、
 `POLL_CLOSED`（409）、`OPTIONS_LOCKED`（409、投票が入った投票の選択肢は変更不可）、
-`PAYLOAD_TOO_LARGE`（413）。
+`RULES_LOCKED`（409、投票後はログイン必須・複数選択を変更不可）、
+`CONCURRENT_UPDATE`（409）、`PAYLOAD_TOO_LARGE`（413）。
 
 ### テナント管理（要 API キー、作成のみ認証不要）
 
@@ -78,7 +79,10 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 | PATCH | `/tenants/:tenantId/polls/:pollId` | 編集（締切済みは不可） |
 | POST | `/tenants/:tenantId/polls/:pollId/status` | 状態変更（`published` / `closed` / `draft`） |
 | GET | `/tenants/:tenantId/polls/:pollId/results` | 結果 |
-| POST | `/tenants/:tenantId/images` | 画像アップロード（R2）。本文に画像バイナリ、対応形式は PNG / JPEG / WebP / GIF、5 MiB まで |
+| POST | `/tenants/:tenantId/images` | 画像アップロード（R2）。本文に画像バイナリ、対応形式は PNG / JPEG / WebP / GIF、5 MiB まで。中身が宣言した形式と一致すること |
+| GET | `/tenants/:tenantId/origins` | ブラウザ埋め込みを許可するオリジン一覧 |
+| POST | `/tenants/:tenantId/origins` | オリジンを追加。`{ "origin": "https://www.example.com" }` |
+| DELETE | `/tenants/:tenantId/origins` | オリジンを削除。`{ "origin": "https://www.example.com" }` |
 
 投票の作成リクエスト例:
 
@@ -117,9 +121,24 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 画像は `GET /images/t/<tenantId>/<file>` で配信します。
 投票の JSON では `image_url` として絶対 URL が返ります。
 
+### ブラウザからの埋め込み（CORS）
+
+公開 API（投票の取得・投票・結果）と画像を、別サイトのブラウザから読むには、そのサイトのオリジンをワークスペースの許可リストに入れます。リストはワークスペースごとで、管理画面の「埋め込み設定」（`/admin/workspaces/<tenantId>/settings`）から追加・削除します。API キーでも同じ操作ができます。
+
+- 例: `https://www.example.com`
+- `https://vote.0g0.xyz` 自身からの利用は同一オリジンなので、リストへの追加は不要です
+- `https` のみ。例外は `http://localhost`、`http://127.0.0.1`、`http://[::1]`（ポート付き可）
+- パス、クエリ、ユーザー情報、ワイルドカード（`*`）は拒否します。保存時に `https://Example.COM:443/` のような入力は `https://example.com` に正規化します
+- 1 ワークスペースあたり 20 件まで
+- リクエストの `Origin` が保存した値と完全一致するときだけ `Access-Control-Allow-Origin` を返します。`*` は使いません。`Vary: Origin` を付けます
+- 一致しない、または `Origin` が無い場合は CORS ヘッダーを付けません（サーバーからの呼び出しはそのまま動きます）
+- 管理 API と管理画面は、許可オリジンからでもクロスオリジンでは開きません
+
+未ログインの投票は、呼び出し側が渡す `voter_token` ごとに 1 票です。トークンは呼び出し側が安定して発行する前提で、データベースには HMAC だけを保存します。人と 1 対 1 にしたい投票は「ログイン必須」にしてください。
+
 ## 管理画面
 
-- `/admin` から 0g0-id でログインします。
+- `/admin` から 0g0-id でログインします。ログアウトは POST のみです（`/admin/logout` を開いただけではセッションは消えません）。
 - ワークスペースの作成、投票の作成・編集・公開・締切ができます。
 - 設問と選択肢に画像を付けられます（R2 にアップロード）。
 - 結果はバーと集計表で確認できます。
@@ -139,8 +158,8 @@ node scripts/register-oidc-client.mjs
 
 必要な設定:
 
-- 変数: `OIDC_ISSUER`（既定 `https://id.0g0.xyz`）、`OIDC_CLIENT_ID`、`OIDC_SCOPES`（既定 `openid profile email`）
-- シークレット: `SESSION_SECRET`（セッション Cookie の署名用。`wrangler secret put SESSION_SECRET`）
+- 変数: `OIDC_ISSUER`（既定 `https://id.0g0.xyz`）、`OIDC_CLIENT_ID`、`OIDC_SCOPES`（既定 `openid profile email`）、`APP_ORIGIN`（本番は `https://vote.0g0.xyz`。管理ログインをこのオリジンに限定します）
+- シークレット: `SESSION_SECRET`（セッション Cookie の署名用。`wrangler secret put SESSION_SECRET`）。任意で `VOTER_KEY_SECRET`（投票者識別子の HMAC。未設定時は `SESSION_SECRET` を使います。セッション秘密だけをローテーションしたいときに分けてください）
 
 ## ローカル開発
 
@@ -164,7 +183,7 @@ npx wrangler r2 bucket create headless-vote-images
 npx wrangler secret put SESSION_SECRET
 npx wrangler d1 migrations apply headless-vote --remote
 node scripts/register-oidc-client.mjs          # client_id を wrangler.toml に記入
-npx wrangler deploy                            # vote.0g0.xyz のカスタムドメインが付きます
+npx wrangler deploy                            # vote.0g0.xyz のカスタムドメインが付きます。workers.dev のホスト名は出しません
 ```
 
 ### GitHub 連携の自動デプロイ（Workers Builds）

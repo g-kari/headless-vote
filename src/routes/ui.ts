@@ -1,8 +1,20 @@
 import { Hono } from "hono";
 import { getSessionUser, isTenantMember, listTenantsForUser } from "../auth";
+import {
+  addTenantOrigin,
+  listTenantOrigins,
+  removeTenantOrigin,
+} from "../cors";
 import { randomId, randomToken, sha256Hex } from "../crypto";
 import { computeResults, getPollRow, listOptionRows, nowIso } from "../domain";
-import { escapeHtml, layout } from "../views";
+import { ApiError } from "../errors";
+import {
+  assertSameOriginMutation,
+  normalizeUuid,
+  rateLimitByIp,
+  readUrlEncodedForm,
+} from "../security";
+import { escapeHtml, layout, safeJsonForScript, scriptTag } from "../views";
 import type { Env, PollRow, SessionUser, Variables } from "../types";
 
 export const ui = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -11,13 +23,19 @@ function originOf(c: { req: { url: string } }): string {
   return new URL(c.req.url).origin;
 }
 
+function routeTenant(c: { req: { param: (name: string) => string } }): string | null {
+  return normalizeUuid(c.req.param("tenantId"));
+}
+
 async function requireMember(
   c: { env: Env; req: { url: string } },
   tenantId: string,
 ): Promise<SessionUser | null> {
+  const id = normalizeUuid(tenantId);
+  if (!id) return null;
   const user = await getSessionUser(c as never);
   if (!user) return null;
-  if (!(await isTenantMember(c.env, tenantId, user.sub))) return null;
+  if (!(await isTenantMember(c.env, id, user.sub))) return null;
   return user;
 }
 
@@ -50,6 +68,7 @@ ui.get("/", async (c) => {
       userEmail: user?.email ?? user?.sub ?? null,
       body,
       origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
     }),
   );
 });
@@ -63,7 +82,7 @@ ui.get("/admin", async (c) => {
       <div class="actions"><a class="btn primary" href="/admin/login">0g0-id でログイン</a></div>
       <h2>API キーで使う場合</h2>
       <p class="muted">画面を使わない運用では、テナント作成時に発行される API キーで管理 API を呼び出せます。API キーの発行は <code>POST /api/v1/tenants</code> から行えます（README 参照）。</p>`;
-    return c.html(layout({ title: "管理画面", userEmail: null, body, origin: originOf(c) }));
+    return c.html(layout({ title: "管理画面", userEmail: null, body, origin: originOf(c), nonce: c.get("cspNonce") ?? "" }));
   }
 
   const tenants = await listTenantsForUser(c.env, user.sub);
@@ -94,6 +113,7 @@ ui.get("/admin", async (c) => {
       userEmail: user.email ?? user.sub,
       body,
       origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
     }),
   );
 });
@@ -101,7 +121,9 @@ ui.get("/admin", async (c) => {
 ui.post("/admin/workspaces", async (c) => {
   const user = await getSessionUser(c);
   if (!user) return c.redirect("/admin/login", 302);
-  const form = await c.req.formData();
+  assertSameOriginMutation(c);
+  await rateLimitByIp(c, "tenant-create", 80, 3600);
+  const form = await readUrlEncodedForm(c);
   const name = String(form.get("name") ?? "").trim();
   if (!name || name.length > 120) {
     return c.html(
@@ -110,6 +132,7 @@ ui.post("/admin/workspaces", async (c) => {
         userEmail: user.email ?? user.sub,
         body: `<h1>名前を確認してください</h1><p class="muted">ワークスペース名は1〜120文字で入力してください。</p><p><a href="/admin">戻る</a></p>`,
         origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
       }),
       400,
     );
@@ -140,6 +163,7 @@ ui.post("/admin/workspaces", async (c) => {
       userEmail: user.email ?? user.sub,
       body,
       origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
     }),
   );
 });
@@ -154,7 +178,8 @@ function statusBadge(status: PollRow["status"]): string {
 }
 
 ui.get("/admin/workspaces/:tenantId", async (c) => {
-  const tenantId = c.req.param("tenantId");
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
   const user = await requireMember(c, tenantId);
   if (!user) return c.redirect("/admin", 302);
   const tenant = await c.env.DB.prepare("SELECT * FROM tenants WHERE id = ?1")
@@ -181,7 +206,10 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
   const body = `
     <p class="muted small"><a href="/admin">ワークスペース一覧</a></p>
     <h1>${escapeHtml(tenant.name)}</h1>
-    <div class="actions"><a class="btn primary" href="/admin/workspaces/${tenantId}/polls/new">新しい投票を作る</a></div>
+    <div class="actions">
+      <a class="btn primary" href="/admin/workspaces/${escapeHtml(tenantId)}/polls/new">新しい投票を作る</a>
+      <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/settings">埋め込み設定</a>
+    </div>
     <h2>投票一覧</h2>
     <section class="card">
       ${rows ? `<div class="table-wrapper" tabindex="0" role="region" aria-label="投票一覧"><table><thead><tr><th scope="col">設問</th><th scope="col">状態</th><th scope="col">設定</th><th scope="col">締切</th><th scope="col"><span class="muted">操作</span></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">まだ投票がありません。</p>'}
@@ -189,17 +217,25 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
     <h2>API キー</h2>
     <section class="card">
       <p class="muted">管理 API（<code>/api/v1/tenants/${tenantId}/…</code>）の認証には、このワークスペースの API キーを使います。キーを再発行すると、古いキーは使えなくなります。</p>
-      <button class="btn danger" type="button" onclick="document.getElementById('rotate-dialog').showModal()">API キーを再発行する</button>
+      <button class="btn danger" type="button" id="open-rotate">API キーを再発行する</button>
       <dialog id="rotate-dialog" aria-labelledby="rotate-dialog-title">
         <h2 id="rotate-dialog-title">API キーを再発行しますか？</h2>
         <p>再発行すると、古いキーは使えなくなります。新しいキーは発行直後に一度だけ表示されます。</p>
-        <form method="post" action="/admin/workspaces/${tenantId}/rotate-key">
+        <form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/rotate-key">
           <div class="dialog-actions">
-            <button class="btn" type="button" autofocus onclick="this.closest('dialog').close()">やめる</button>
+            <button class="btn" type="button" id="close-rotate" autofocus>やめる</button>
             <button class="btn danger" type="submit">再発行する</button>
           </div>
         </form>
       </dialog>
+      ${scriptTag(c.get("cspNonce") ?? "", `
+        document.getElementById("open-rotate").addEventListener("click", () => {
+          document.getElementById("rotate-dialog").showModal();
+        });
+        document.getElementById("close-rotate").addEventListener("click", () => {
+          document.getElementById("rotate-dialog").close();
+        });
+      `)}
     </section>`;
   return c.html(
     layout({
@@ -207,14 +243,18 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
       userEmail: user.email ?? user.sub,
       body,
       origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
     }),
   );
 });
 
 ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
-  const tenantId = c.req.param("tenantId");
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
   const user = await requireMember(c, tenantId);
   if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  await readUrlEncodedForm(c);
   const apiKey = randomToken("hvk");
   await c.env.DB.prepare("UPDATE tenants SET api_key_hash = ?1 WHERE id = ?2")
     .bind(await sha256Hex(apiKey), tenantId)
@@ -232,38 +272,165 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
       userEmail: user.email ?? user.sub,
       body,
       origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
     }),
   );
+});
+
+/* ------------------------------------------------------------------ */
+/* Embed origin settings (per workspace)                               */
+/* ------------------------------------------------------------------ */
+
+function settingsBody(
+  tenantId: string,
+  workspaceName: string,
+  origins: string[],
+  error: string | null,
+): string {
+  const tid = escapeHtml(tenantId);
+  const items = origins
+    .map(
+      (origin) => `<li>
+        <code>${escapeHtml(origin)}</code>
+        <form method="post" action="/admin/workspaces/${tid}/origins/remove" style="display:inline">
+          <input type="hidden" name="origin" value="${escapeHtml(origin)}">
+          <button class="btn small" type="submit">削除</button>
+        </form>
+      </li>`,
+    )
+    .join("");
+  return `
+    <p class="muted small"><a href="/admin/workspaces/${tid}">ワークスペースに戻る</a></p>
+    <h1>埋め込み設定</h1>
+    <p class="lead">${escapeHtml(workspaceName)} の投票を、別のサイトのブラウザから呼ぶときに許可するオリジンです。
+    <code>https://vote.0g0.xyz</code> と同じサイトから使う場合は追加不要です。ワイルドカードやパスは使えません。</p>
+    ${error ? `<div class="notice bad" role="alert">${escapeHtml(error)}</div>` : ""}
+    <h2>許可しているオリジン</h2>
+    <section class="card">
+      ${items ? `<ul>${items}</ul>` : `<p class="muted">まだ許可しているオリジンはありません。この状態では、別サイトのブラウザから公開 API の応答を読めません。</p>`}
+    </section>
+    <h2 id="origin-heading">許可するオリジンを追加</h2>
+    <section class="card">
+      <form method="post" action="/admin/workspaces/${tid}/origins" aria-labelledby="origin-heading">
+        <label for="origin">オリジン <span class="hint">例: https://www.example.com 。https のみ（localhost は http も可）。</span></label>
+        <input id="origin" name="origin" type="url" required maxlength="200" placeholder="https://www.example.com" spellcheck="false" autocapitalize="none" autocomplete="off" inputmode="url">
+        <div class="actions"><button class="btn primary" type="submit">追加する</button></div>
+      </form>
+    </section>`;
+}
+
+ui.get("/admin/workspaces/:tenantId/settings", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  const tenant = await c.env.DB.prepare("SELECT name FROM tenants WHERE id = ?1")
+    .bind(tenantId)
+    .first<{ name: string }>();
+  if (!tenant) return c.redirect("/admin", 302);
+  const origins = await listTenantOrigins(c.env, tenantId);
+  return c.html(
+    layout({
+      title: "埋め込み設定",
+      userEmail: user.email ?? user.sub,
+      body: settingsBody(tenantId, tenant.name, origins, null),
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }),
+  );
+});
+
+ui.post("/admin/workspaces/:tenantId/origins", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  try {
+    await addTenantOrigin(c.env, tenantId, String(form.get("origin") ?? ""));
+  } catch (err) {
+    if (err instanceof ApiError) {
+      const tenant = await c.env.DB.prepare("SELECT name FROM tenants WHERE id = ?1")
+        .bind(tenantId)
+        .first<{ name: string }>();
+      const origins = await listTenantOrigins(c.env, tenantId);
+      return c.html(
+        layout({
+          title: "埋め込み設定",
+          userEmail: user.email ?? user.sub,
+          body: settingsBody(tenantId, tenant?.name ?? "", origins, err.message),
+          origin: originOf(c),
+          nonce: c.get("cspNonce") ?? "",
+        }),
+        400,
+      );
+    }
+    throw err;
+  }
+  return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
+});
+
+ui.post("/admin/workspaces/:tenantId/origins/remove", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  await removeTenantOrigin(c.env, tenantId, String(form.get("origin") ?? ""));
+  return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
 });
 
 /* ------------------------------------------------------------------ */
 /* Poll form (new / edit)                                              */
 /* ------------------------------------------------------------------ */
 
-function pollFormScript(tenantId: string, pollId: string | null): string {
-  const isEdit = pollId !== null;
-  return `
-<script>
-const TENANT = ${JSON.stringify(tenantId)};
-const POLL_ID = ${JSON.stringify(pollId)};
+function pollFormScript(tenantId: string, pollId: string | null, nonce: string): string {
+  const code = `
+const TENANT = ${safeJsonForScript(tenantId)};
+const POLL_ID = ${safeJsonForScript(pollId)};
 const optionsEl = document.getElementById('options');
 const errorEl = document.getElementById('form-error');
 
 function addOptionRow(label, imageKey) {
   const row = document.createElement('div');
   row.className = 'option-row';
-  row.innerHTML =
-    '<input type="text" class="opt-label" maxlength="200" placeholder="選択肢の文言" value="">' +
-    (imageKey ? '<img class="opt-preview" alt="">' : '') +
-    '<label class="btn small" style="margin:0">画像<input type="file" class="opt-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden></label>' +
-    '<input type="hidden" class="opt-key">' +
-    '<button type="button" class="btn small danger opt-remove">削除</button>';
-  row.querySelector('.opt-label').value = label || '';
-  row.querySelector('.opt-key').value = imageKey || '';
-  const img = row.querySelector('.opt-preview');
-  if (img && imageKey) img.src = '/images/' + imageKey;
-  row.querySelector('.opt-remove').addEventListener('click', () => row.remove());
-  optionsEl.appendChild(row);
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'opt-label';
+  input.maxLength = 200;
+  input.placeholder = '選択肢の文言';
+  input.value = label || '';
+  row.append(input);
+  if (imageKey) {
+    const img = document.createElement('img');
+    img.className = 'opt-preview';
+    img.alt = '';
+    img.src = '/images/' + imageKey;
+    row.append(img);
+  }
+  const fileLabel = document.createElement('label');
+  fileLabel.className = 'btn small';
+  fileLabel.style.margin = '0';
+  fileLabel.append(document.createTextNode('画像'));
+  const file = document.createElement('input');
+  file.type = 'file';
+  file.className = 'opt-file';
+  file.accept = 'image/png,image/jpeg,image/webp,image/gif';
+  file.hidden = true;
+  fileLabel.append(file);
+  const key = document.createElement('input');
+  key.type = 'hidden';
+  key.className = 'opt-key';
+  key.value = imageKey || '';
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn small danger opt-remove';
+  remove.textContent = '削除';
+  remove.addEventListener('click', () => row.remove());
+  row.append(fileLabel, key, remove);
+  optionsEl.append(row);
 }
 document.getElementById('add-option').addEventListener('click', () => addOptionRow('', null));
 
@@ -330,22 +497,27 @@ async function submitPoll(ev) {
   }
 }
 document.getElementById('poll-form').addEventListener('submit', submitPoll);
-</script>`;
+const seedEl = document.getElementById('poll-seed');
+let pending = [];
+try { pending = JSON.parse(seedEl && seedEl.textContent ? seedEl.textContent : '[]'); } catch (e) { pending = []; }
+if (!Array.isArray(pending)) pending = [];
+for (const o of pending) addOptionRow(o.label, o.image_key);
+if (pending.length === 0) { addOptionRow('', null); addOptionRow('', null); }
+`;
+  return scriptTag(nonce, code);
 }
 
 function pollFormBody(opts: {
   tenantId: string;
   poll: PollRow | null;
   options: { label: string; image_key: string | null }[];
+  nonce: string;
 }): string {
   const p = opts.poll;
-  const closesLocal = p?.closes_at ? p.closes_at.slice(0, 16) : "";
-  const optionRows = opts.options
-    .map(
-      (o) => `
-    <script>window.__pendingOptions = window.__pendingOptions || []; window.__pendingOptions.push(${JSON.stringify(o)});</script>`,
-    )
-    .join("");
+  const closesLocal = p?.closes_at ? escapeHtml(p.closes_at.slice(0, 16)) : "";
+  const seed = safeJsonForScript(
+    opts.options.map((o) => ({ label: o.label, image_key: o.image_key })),
+  );
   return `
     <p class="muted small"><a href="/admin/workspaces/${opts.tenantId}">ワークスペースに戻る</a></p>
     <h1>${p ? "投票を編集" : "新しい投票を作る"}</h1>
@@ -360,7 +532,7 @@ function pollFormBody(opts: {
         <label for="poll-image-file">設問の画像 <span class="hint">任意。PNG / JPEG / WebP / GIF、5 MiB まで。</span></label>
         ${p?.image_key ? `<p><img src="/images/${escapeHtml(p.image_key)}" alt="設問の画像" style="max-width:240px;border-radius:10px;border:1px solid var(--border)"></p>` : ""}
         <input id="poll-image-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
-        <input type="hidden" id="poll-image-key" value="${p?.image_key ?? ""}">
+        <input type="hidden" id="poll-image-key" value="${escapeHtml(p?.image_key ?? "")}">
       </div>
       <label for="closes-at">締切日時 <span class="hint">任意。空欄なら手動で締め切るまで投票できます。</span></label>
       <input id="closes-at" type="datetime-local" value="${closesLocal}">
@@ -380,42 +552,43 @@ function pollFormBody(opts: {
       <div class="actions"><button class="btn primary" type="submit">${p ? "変更を保存" : "下書きとして作成"}</button></div>
     </form>
     </section>
-    ${optionRows}
-    ${pollFormScript(opts.tenantId, p?.id ?? null)}
-    <script>
-      for (const o of (window.__pendingOptions || [])) addOptionRow(o.label, o.image_key);
-      if (!window.__pendingOptions || window.__pendingOptions.length === 0) { addOptionRow('', null); addOptionRow('', null); }
-    </script>`;
+    <script type="application/json" id="poll-seed">${seed}</script>
+    ${pollFormScript(opts.tenantId, p?.id ?? null, opts.nonce)}`;
 }
 
 ui.get("/admin/workspaces/:tenantId/polls/new", async (c) => {
-  const tenantId = c.req.param("tenantId");
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
   const user = await requireMember(c, tenantId);
   if (!user) return c.redirect("/admin", 302);
   return c.html(
     layout({
       title: "新しい投票を作る",
       userEmail: user.email ?? user.sub,
-      body: pollFormBody({ tenantId, poll: null, options: [] }),
+      body: pollFormBody({ tenantId, poll: null, options: [], nonce: c.get("cspNonce") ?? "" }),
       origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
     }),
   );
 });
 
 ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
-  const tenantId = c.req.param("tenantId");
-  const pollId = c.req.param("pollId");
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const pollId = normalizeUuid(c.req.param("pollId"));
+  if (!pollId) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
   const user = await requireMember(c, tenantId);
   if (!user) return c.redirect("/admin", 302);
   const poll = await getPollRow(c.env, pollId);
   if (!poll || poll.tenant_id !== tenantId) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
   const options = await listOptionRows(c.env, pollId);
   const origin = originOf(c);
+  const nonce = c.get("cspNonce") ?? "";
   const statusActions =
     poll.status === "draft"
-      ? `<button class="btn primary" type="button" onclick="askStatus('published','公開する')">公開する</button>`
+      ? `<button class="btn primary" type="button" data-ask-status="published">公開する</button>`
       : poll.status === "published"
-        ? `<button class="btn danger" type="button" onclick="askStatus('closed','締め切る')">締め切る</button>`
+        ? `<button class="btn danger" type="button" data-ask-status="closed">締め切る</button>`
         : `<span class="muted">締切済みのため、状態は変更できません。</span>`;
   const body = `
     <p class="muted small"><a href="/admin/workspaces/${tenantId}">ワークスペースに戻る</a></p>
@@ -440,39 +613,52 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
       <h2 id="status-dialog-title">状態を変更しますか？</h2>
       <p id="status-dialog-text" class="muted"></p>
       <div class="dialog-actions">
-        <button class="btn" type="button" autofocus onclick="document.getElementById('status-dialog').close()">やめる</button>
-        <button class="btn primary" type="button" onclick="doStatus()">変更する</button>
+        <button class="btn" type="button" id="status-cancel" autofocus>やめる</button>
+        <button class="btn primary" type="button" id="status-confirm">変更する</button>
       </div>
     </dialog>
-    <script>
+    ${scriptTag(nonce, `
+      const TENANT = ${safeJsonForScript(tenantId)};
+      const POLL = ${safeJsonForScript(poll.id)};
       let pendingStatus = null;
-      function askStatus(status, label) {
-        pendingStatus = status;
-        document.getElementById('status-dialog-text').textContent =
-          status === 'published' ? 'この投票を公開します。公開後は API から投票できるようになります。' : 'この投票を締め切ります。締切後は投票できなくなります。';
-        document.getElementById('status-dialog-title').textContent = label + 'しますか？';
-        document.getElementById('status-dialog').showModal();
+      for (const button of document.querySelectorAll("[data-ask-status]")) {
+        button.addEventListener("click", () => {
+          pendingStatus = button.getAttribute("data-ask-status");
+          const text = document.getElementById("status-dialog-text");
+          const title = document.getElementById("status-dialog-title");
+          text.textContent = pendingStatus === "published"
+            ? "この投票を公開します。公開後は API から投票できるようになります。"
+            : "この投票を締め切ります。締切後は投票できなくなります。";
+          title.textContent = (pendingStatus === "published" ? "公開" : "締め切る") + "しますか？";
+          document.getElementById("status-dialog").showModal();
+        });
       }
-      async function doStatus() {
-        document.getElementById('status-dialog').close();
-        const res = await fetch('/api/v1/tenants/${tenantId}/polls/${poll.id}/status', {
-          method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ status: pendingStatus }), credentials: 'same-origin',
+      document.getElementById("status-cancel").addEventListener("click", () => {
+        document.getElementById("status-dialog").close();
+      });
+      document.getElementById("status-confirm").addEventListener("click", async () => {
+        document.getElementById("status-dialog").close();
+        const res = await fetch("/api/v1/tenants/" + TENANT + "/polls/" + POLL + "/status", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ status: pendingStatus }),
+          credentials: "same-origin",
         });
         if (res.ok) { location.reload(); return; }
         const d = await res.json().catch(() => ({}));
-        const flash = document.getElementById('flash');
-        flash.textContent = (d.error && d.error.message) || '状態の変更に失敗しました';
+        const flash = document.getElementById("flash");
+        flash.textContent = (d.error && d.error.message) || "状態の変更に失敗しました";
         flash.hidden = false;
-      }
-    </script>
-    ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, options }) : `<h2>内容</h2><section class="card"><p>${escapeHtml(poll.description || "")}</p><ul>${options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul></section>`}`;
+      });
+    `)}
+    ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, options, nonce }) : `<h2>内容</h2><section class="card"><p>${escapeHtml(poll.description || "")}</p><ul>${options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul></section>`}`;
   return c.html(
     layout({
       title: poll.question,
       userEmail: user.email ?? user.sub,
       body,
       origin,
+      nonce: c.get("cspNonce") ?? "",
     }),
   );
 });
@@ -482,8 +668,10 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
 /* ------------------------------------------------------------------ */
 
 ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
-  const tenantId = c.req.param("tenantId");
-  const pollId = c.req.param("pollId");
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const pollId = normalizeUuid(c.req.param("pollId"));
+  if (!pollId) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
   const user = await requireMember(c, tenantId);
   if (!user) return c.redirect("/admin", 302);
   const poll = await getPollRow(c.env, pollId);
@@ -526,6 +714,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
       userEmail: user.email ?? user.sub,
       body,
       origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
     }),
   );
 });

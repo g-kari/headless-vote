@@ -13,6 +13,17 @@ export interface Env {
   OIDC_SCOPES?: string;
   /** HMAC secret for session / flow cookies. Set with `wrangler secret put`. */
   SESSION_SECRET: string;
+  /**
+   * Optional pepper for voter-key HMAC. When unset, SESSION_SECRET is used.
+   * Set this if you want to rotate the session secret without resetting
+   * one-person-one-vote identity. `wrangler secret put VOTER_KEY_SECRET`.
+   */
+  VOTER_KEY_SECRET?: string;
+  /**
+   * Canonical origin of this deployment, e.g. "https://vote.0g0.xyz".
+   * Login is rejected on any other host (http localhost is still allowed).
+   */
+  APP_ORIGIN?: string;
   /** Test-only override: inline JWKS JSON used instead of fetching jwks_uri. */
   OIDC_JWKS_JSON?: string;
   /** Test-only override for the token endpoint. */
@@ -42,6 +53,8 @@ export interface PollRow {
   closes_at: string | null;
   created_at: string;
   updated_at: string;
+  /** Optimistic concurrency token. Changes on every successful edit. */
+  revision: string;
 }
 
 export interface OptionRow {
@@ -60,6 +73,7 @@ export type AdminPrincipal =
 
 /** A signed-in 0g0-id user (admin UI session). */
 export interface SessionUser {
+  kind: "session";
   sub: string;
   name?: string;
   email?: string;
@@ -69,6 +83,7 @@ export interface SessionUser {
 export type Variables = {
   admin?: AdminPrincipal;
   sessionUser?: SessionUser;
+  cspNonce?: string;
 };
 
 /** Hono context type used across the app. */

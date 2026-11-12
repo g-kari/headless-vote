@@ -2,11 +2,13 @@
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly retryAfter?: number;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, retryAfter?: number) {
     super(message);
     this.status = status;
     this.code = code;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -32,4 +34,13 @@ export function conflict(code: string, message: string): ApiError {
 
 export function payloadTooLarge(message: string): ApiError {
   return new ApiError(413, "PAYLOAD_TOO_LARGE", message);
+}
+
+export function tooManyRequests(retryAfter: number): ApiError {
+  return new ApiError(
+    429,
+    "RATE_LIMITED",
+    "Too many requests. Please try again later.",
+    retryAfter,
+  );
 }

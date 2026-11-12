@@ -1,6 +1,7 @@
 import { sha256Hex, signValue, verifySignedValue } from "./crypto";
 import { unauthorized } from "./errors";
 import { verifyJwt } from "./oidc";
+import { assertSameOriginMutation } from "./security";
 import type { AdminPrincipal, AppContext, Env, SessionUser, TenantRow } from "./types";
 
 type Ctx = AppContext;
@@ -30,10 +31,22 @@ export function bearerToken(c: Ctx): string | null {
 /* Session cookie (admin UI, signed with SESSION_SECRET)               */
 /* ------------------------------------------------------------------ */
 
-export const SESSION_COOKIE = "hv_session";
-export const FLOW_COOKIE = "hv_oidc_flow";
+export const SESSION_COOKIE = "__Host-hv_session";
+export const FLOW_COOKIE = "__Host-hv_oidc_flow";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const FLOW_TTL_SECONDS = 60 * 10; // 10 minutes
+
+function httpsRequest(requestUrl: string): boolean {
+  return new URL(requestUrl).protocol === "https:";
+}
+
+export function sessionCookieName(requestUrl: string): string {
+  return httpsRequest(requestUrl) ? SESSION_COOKIE : "hv_session";
+}
+
+export function flowCookieName(requestUrl: string): string {
+  return httpsRequest(requestUrl) ? FLOW_COOKIE : "hv_oidc_flow";
+}
 
 export function parseCookies(c: Ctx): Record<string, string> {
   const header = c.req.header("cookie");
@@ -48,60 +61,75 @@ export function parseCookies(c: Ctx): Record<string, string> {
   return out;
 }
 
-function cookieHeader(name: string, value: string, maxAge: number): string {
-  const secure = "; Secure";
-  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+function cookieHeader(name: string, value: string, maxAge: number, secure: boolean): string {
+  const secureAttr = secure ? "; Secure" : "";
+  const expires = maxAge === 0 ? "; Expires=Thu, 01 Jan 1970 00:00:00 GMT" : "";
+  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${expires}${secureAttr}`;
 }
 
 export async function makeSessionCookie(
   env: Env,
-  user: Omit<SessionUser, "exp">,
+  user: Omit<SessionUser, "exp" | "kind">,
+  requestUrl: string,
 ): Promise<string> {
   const payload: SessionUser = {
+    kind: "session",
     ...user,
     exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
   };
   const value = await signValue(env.SESSION_SECRET, payload);
-  return cookieHeader(SESSION_COOKIE, value, SESSION_TTL_SECONDS);
+  const https = httpsRequest(requestUrl);
+  return cookieHeader(sessionCookieName(requestUrl), value, SESSION_TTL_SECONDS, https);
 }
 
-export function clearSessionCookie(): string {
-  return cookieHeader(SESSION_COOKIE, "", 0);
+export function clearSessionCookie(requestUrl: string): string {
+  const https = httpsRequest(requestUrl);
+  return cookieHeader(sessionCookieName(requestUrl), "", 0, https);
 }
 
 export async function getSessionUser(c: Ctx): Promise<SessionUser | null> {
   const cookies = parseCookies(c);
-  const raw = cookies[SESSION_COOKIE];
+  const raw = cookies[sessionCookieName(c.req.url)];
   if (!raw) return null;
   const payload = await verifySignedValue<SessionUser>(c.env.SESSION_SECRET, raw);
-  if (!payload || typeof payload.sub !== "string") return null;
-  if (payload.exp <= Math.floor(Date.now() / 1000)) return null;
+  if (!payload || payload.kind !== "session") return null;
+  if (typeof payload.sub !== "string" || payload.sub.length === 0 || payload.sub.length > 256) {
+    return null;
+  }
+  if (typeof payload.exp !== "number" || payload.exp <= Math.floor(Date.now() / 1000)) return null;
   return payload;
 }
 
 export interface FlowState {
+  kind: "flow";
   state: string;
   nonce: string;
   verifier: string;
   exp: number;
 }
 
-export async function makeFlowCookie(env: Env, flow: FlowState): Promise<string> {
+export async function makeFlowCookie(env: Env, flow: FlowState, requestUrl: string): Promise<string> {
   const value = await signValue(env.SESSION_SECRET, flow);
-  return cookieHeader(FLOW_COOKIE, value, FLOW_TTL_SECONDS);
+  const https = httpsRequest(requestUrl);
+  return cookieHeader(flowCookieName(requestUrl), value, FLOW_TTL_SECONDS, https);
 }
 
 export async function readFlowCookie(c: Ctx): Promise<FlowState | null> {
   const cookies = parseCookies(c);
-  const raw = cookies[FLOW_COOKIE];
+  const raw = cookies[flowCookieName(c.req.url)];
   if (!raw) return null;
   const flow = await verifySignedValue<FlowState>(c.env.SESSION_SECRET, raw);
-  if (!flow || flow.exp <= Math.floor(Date.now() / 1000)) return null;
+  if (!flow || flow.kind !== "flow") return null;
+  if (typeof flow.state !== "string" || typeof flow.nonce !== "string" || typeof flow.verifier !== "string") {
+    return null;
+  }
+  if (typeof flow.exp !== "number" || flow.exp <= Math.floor(Date.now() / 1000)) return null;
   return flow;
 }
 
-export function clearFlowCookie(): string {
-  return cookieHeader(FLOW_COOKIE, "", 0);
+export function clearFlowCookie(requestUrl: string): string {
+  const https = httpsRequest(requestUrl);
+  return cookieHeader(flowCookieName(requestUrl), "", 0, https);
 }
 
 /* ------------------------------------------------------------------ */
@@ -156,6 +184,10 @@ export async function requireAdmin(
     }
     throw unauthorized("INVALID_API_KEY", "API key is not valid for this tenant");
   }
+  const method = c.req.method.toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    assertSameOriginMutation(c);
+  }
   const user = await getSessionUser(c);
   if (user && (await isTenantMember(c.env, tenantId, user.sub))) {
     return { kind: "session", tenantId, sub: user.sub };
@@ -172,9 +204,12 @@ export async function requireAdmin(
 export async function optionalVoterSub(c: Ctx): Promise<string | null> {
   const token = bearerToken(c);
   if (!token) return null;
+  if (!c.env.OIDC_CLIENT_ID) {
+    throw unauthorized("INVALID_TOKEN", "Presented login token is not valid");
+  }
   try {
     const verified = await verifyJwt(c.env, token, {
-      audience: c.env.OIDC_CLIENT_ID || undefined,
+      audience: c.env.OIDC_CLIENT_ID,
     });
     return verified.sub;
   } catch {
@@ -182,16 +217,29 @@ export async function optionalVoterSub(c: Ctx): Promise<string | null> {
   }
 }
 
+function cleanClaim(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > max) return undefined;
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
 export async function newSessionCookieForToken(
   env: Env,
   claims: Record<string, unknown>,
   sub: string,
+  requestUrl: string,
 ): Promise<string> {
-  return makeSessionCookie(env, {
-    sub,
-    name: typeof claims["name"] === "string" ? (claims["name"] as string) : undefined,
-    email: typeof claims["email"] === "string" ? (claims["email"] as string) : undefined,
-  });
+  return makeSessionCookie(
+    env,
+    {
+      sub,
+      name: cleanClaim(claims["name"], 120),
+      email: cleanClaim(claims["email"], 200),
+    },
+    requestUrl,
+  );
 }
 
 export { signValue };

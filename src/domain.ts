@@ -1,14 +1,21 @@
-import { badRequest } from "./errors";
+import { ensureVoterKeysHashed } from "./ballots";
+import { ApiError, badRequest } from "./errors";
+import { assertPlainText, readBodyLimited } from "./security";
 import type { AppContext, Env, OptionRow, PollRow } from "./types";
 
-/** Parse a JSON request body, or throw a uniform 400. */
+const MAX_JSON_BYTES = 64 * 1024;
+
+/** Parse a JSON request body, or throw a uniform 400. Bodies are size-capped. */
 export async function jsonBody<T extends Record<string, unknown>>(
   c: AppContext,
 ): Promise<T> {
   let parsed: unknown;
   try {
-    parsed = await c.req.json();
-  } catch {
+    const bytes = await readBodyLimited(c.req.raw, MAX_JSON_BYTES);
+    if (bytes.byteLength === 0) throw badRequest("Request body must be valid JSON");
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
     throw badRequest("Request body must be valid JSON");
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -29,19 +36,21 @@ export function reqString(
   const trimmed = value.trim();
   if (trimmed.length < min) throw badRequest(`"${field}" is too short`);
   if (trimmed.length > max) throw badRequest(`"${field}" is too long (max ${max})`);
+  assertPlainText(trimmed);
   return trimmed;
 }
 
 export function optString(
   body: Record<string, unknown>,
   field: string,
-  opts: { max?: number } = {},
+  opts: { max?: number; newlines?: boolean } = {},
 ): string | null {
   const value = body[field];
   if (value === undefined || value === null) return null;
   if (typeof value !== "string") throw badRequest(`"${field}" must be a string`);
   const max = opts.max ?? 5000;
   if (value.length > max) throw badRequest(`"${field}" is too long (max ${max})`);
+  assertPlainText(value, { newlines: opts.newlines ?? false });
   return value;
 }
 
@@ -135,15 +144,23 @@ export async function computeResults(
   origin: string,
   poll: PollRow,
 ): Promise<PollResults> {
+  await ensureVoterKeysHashed(env);
   const options = await listOptionRows(env, poll.id);
   const counts = await env.DB.prepare(
-    "SELECT option_id, COUNT(*) AS votes FROM votes WHERE poll_id = ?1 GROUP BY option_id",
+    `SELECT j.value AS option_id, COUNT(*) AS votes
+     FROM vote_ballots AS b, json_each(b.option_ids) AS j
+     WHERE b.poll_id = ?1
+     GROUP BY j.value`,
   )
     .bind(poll.id)
     .all<{ option_id: string; votes: number }>();
-  const byOption = new Map(counts.results.map((r) => [r.option_id, r.votes]));
+  const byOption = new Map(
+    counts.results.map((r) => [String(r.option_id), Number(r.votes)]),
+  );
   const totals = await env.DB.prepare(
-    "SELECT COUNT(DISTINCT voter_key) AS voters, COUNT(*) AS votes FROM votes WHERE poll_id = ?1",
+    `SELECT
+       (SELECT COUNT(*) FROM vote_ballots WHERE poll_id = ?1) AS voters,
+       (SELECT COUNT(*) FROM vote_ballots AS b, json_each(b.option_ids) AS j WHERE b.poll_id = ?1) AS votes`,
   )
     .bind(poll.id)
     .first<{ voters: number; votes: number }>();
@@ -151,8 +168,8 @@ export async function computeResults(
     poll_id: poll.id,
     status: poll.status,
     closes_at: poll.closes_at,
-    total_voters: totals?.voters ?? 0,
-    total_votes: totals?.votes ?? 0,
+    total_voters: Number(totals?.voters ?? 0),
+    total_votes: Number(totals?.votes ?? 0),
     options: options.map((o) => ({
       id: o.id,
       label: o.label,

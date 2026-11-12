@@ -73,11 +73,17 @@ export async function verifySignedValue<T>(
   if (dot <= 0) return null;
   const body = value.slice(0, dot);
   const signature = value.slice(dot + 1);
+  let signatureBytes: Uint8Array;
+  try {
+    signatureBytes = base64UrlDecode(signature);
+  } catch {
+    return null;
+  }
   const key = await hmacKey(secret);
   const ok = await crypto.subtle.verify(
     "HMAC",
     key,
-    base64UrlDecode(signature) as BufferSource,
+    signatureBytes as BufferSource,
     encoder.encode(body),
   );
   if (!ok) return null;
@@ -86,6 +92,13 @@ export async function verifySignedValue<T>(
   } catch {
     return null;
   }
+}
+
+/** HMAC-SHA256, base64url, for voter keys and rate-limit buckets. */
+export async function hmacSha256Base64Url(secret: string, data: string): Promise<string> {
+  const key = await hmacKey(secret);
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(data));
+  return base64UrlEncode(new Uint8Array(sig));
 }
 
 /** PKCE (RFC 7636) S256 challenge for a verifier. */
