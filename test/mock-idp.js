@@ -1,9 +1,9 @@
 /**
- * Mock 0g0-id (OIDC provider) used only by the test suite.
+ * Mock OIDC provider used only by the test suite.
  *
  * The main worker's outbound fetch is routed to this worker (Miniflare
  * `outboundService`), so the app's server-side calls to the token endpoint
- * are answered here instead of reaching the real https://id.0g0.xyz.
+ * are answered here instead of reaching the real https://idp.example.test.
  *
  * The authorization "code" the test passes to /auth/callback encodes what
  * this mock should return:  mock:<sub>:<nonce>:<email>
@@ -24,7 +24,7 @@ async function signIdToken(env, claims) {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "ES256", typ: "JWT", kid: "test-key-1" };
   const payload = {
-    iss: "https://id.0g0.xyz",
+    iss: "https://idp.example.test",
     aud: env.CLIENT_ID,
     iat: now,
     exp: now + 3600,
@@ -52,10 +52,10 @@ export default {
 
     if (url.pathname === "/.well-known/openid-configuration") {
       return Response.json({
-        issuer: "https://id.0g0.xyz",
-        authorization_endpoint: "https://id.0g0.xyz/auth/authorize",
-        token_endpoint: "https://id.0g0.xyz/api/token",
-        jwks_uri: "https://id.0g0.xyz/.well-known/jwks.json",
+        issuer: "https://idp.example.test",
+        authorization_endpoint: "https://idp.example.test/auth/authorize",
+        token_endpoint: "https://idp.example.test/api/token",
+        jwks_uri: "https://idp.example.test/.well-known/jwks.json",
       });
     }
 

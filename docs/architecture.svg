@@ -16,8 +16,8 @@
   <text x="130" y="310" text-anchor="middle" font-size="13" fill="#5b6172">API を呼ぶ（ログイン任意）</text>
 
   <rect x="30" y="430" width="200" height="70" rx="12" fill="#ffffff" stroke="#d9dce8"/>
-  <text x="130" y="462" text-anchor="middle" font-size="17" font-weight="700" fill="#171a26">0g0-id</text>
-  <text x="130" y="485" text-anchor="middle" font-size="13" fill="#5b6172">id.0g0.xyz（OIDC）</text>
+  <text x="130" y="462" text-anchor="middle" font-size="17" font-weight="700" fill="#171a26">Auth adapter</text>
+  <text x="130" y="485" text-anchor="middle" font-size="13" fill="#5b6172">OIDC or local</text>
 
   <!-- worker -->
   <rect x="400" y="120" width="250" height="270" rx="14" fill="#ececff" stroke="#5b5bd6" stroke-width="2"/>

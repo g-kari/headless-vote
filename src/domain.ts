@@ -1,15 +1,22 @@
-import { badRequest } from "./errors";
-import { migrateLegacyAnonVoterKeys } from "./voter-keys";
-import type { AppContext, Env, OptionRow, PollRow } from "./types";
+import { ensureVoterKeysHashed } from "./ballots";
+import { ApiError, badRequest } from "./errors";
+import { listQuestionRows, parseBallotDocument } from "./questions";
+import { assertPlainText, readBodyLimited } from "./security";
+import type { AppContext, Env, OptionRow, PollRow, QuestionRow } from "./types";
 
-/** Parse a JSON request body, or throw a uniform 400. */
+const MAX_JSON_BYTES = 64 * 1024;
+
+/** Parse a JSON request body, or throw a uniform 400. Bodies are size-capped. */
 export async function jsonBody<T extends Record<string, unknown>>(
   c: AppContext,
 ): Promise<T> {
   let parsed: unknown;
   try {
-    parsed = await c.req.json();
-  } catch {
+    const bytes = await readBodyLimited(c.req.raw, MAX_JSON_BYTES);
+    if (bytes.byteLength === 0) throw badRequest("Request body must be valid JSON");
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
     throw badRequest("Request body must be valid JSON");
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -30,19 +37,21 @@ export function reqString(
   const trimmed = value.trim();
   if (trimmed.length < min) throw badRequest(`"${field}" is too short`);
   if (trimmed.length > max) throw badRequest(`"${field}" is too long (max ${max})`);
+  assertPlainText(trimmed);
   return trimmed;
 }
 
 export function optString(
   body: Record<string, unknown>,
   field: string,
-  opts: { max?: number } = {},
+  opts: { max?: number; newlines?: boolean } = {},
 ): string | null {
   const value = body[field];
   if (value === undefined || value === null) return null;
   if (typeof value !== "string") throw badRequest(`"${field}" must be a string`);
   const max = opts.max ?? 5000;
   if (value.length > max) throw badRequest(`"${field}" is too long (max ${max})`);
+  assertPlainText(value, { newlines: opts.newlines ?? false });
   return value;
 }
 
@@ -84,19 +93,37 @@ export function optionToJson(origin: string, row: OptionRow) {
   };
 }
 
-export function pollToJson(origin: string, poll: PollRow, options: OptionRow[]) {
+export function pollToJson(
+  origin: string,
+  poll: PollRow,
+  options: OptionRow[],
+  questions: QuestionRow[] = [],
+) {
+  const questionJson = questions.map((q) => ({
+    id: q.id,
+    prompt: q.prompt,
+    description: q.description,
+    image_url: imageUrl(origin, q.image_key),
+    kind: q.kind,
+    required: q.required === 1,
+    position: q.position,
+    options: options.filter((o) => o.question_id === q.id).map((o) => optionToJson(origin, o)),
+  }));
+  const firstChoice = questions.find((q) => q.kind !== "text");
   return {
     id: poll.id,
     question: poll.question,
     description: poll.description,
     image_url: imageUrl(origin, poll.image_key),
     status: poll.status,
-    allow_multiple: poll.allow_multiple === 1,
+    allow_multiple: firstChoice ? firstChoice.kind === "multiple" : poll.allow_multiple === 1,
     require_login: poll.require_login === 1,
+    opens_at: poll.opens_at,
     closes_at: poll.closes_at,
     created_at: poll.created_at,
     updated_at: poll.updated_at,
-    options: options.map((o) => optionToJson(origin, o)),
+    options: questionJson.flatMap((q) => q.options),
+    questions: questionJson,
   };
 }
 
@@ -115,6 +142,19 @@ export async function listOptionRows(env: Env, pollId: string): Promise<OptionRo
   return res.results;
 }
 
+/** True when a published poll has an open time that is still in the future. */
+export function isNotYetOpen(poll: PollRow, now = new Date()): boolean {
+  if (!poll.opens_at) return false;
+  const time = Date.parse(poll.opens_at);
+  return !Number.isNaN(time) && time > now.getTime();
+}
+
+export function assertSchedule(opensAt: string | null, closesAt: string | null): void {
+  if (opensAt && closesAt && Date.parse(opensAt) >= Date.parse(closesAt)) {
+    throw badRequest('"opens_at" must be earlier than "closes_at"');
+  }
+}
+
 /** A poll rejects new votes when closed manually or past its deadline. */
 export function isClosedForVoting(poll: PollRow, now = new Date()): boolean {
   if (poll.status === "closed") return true;
@@ -122,46 +162,86 @@ export function isClosedForVoting(poll: PollRow, now = new Date()): boolean {
   return false;
 }
 
+export interface QuestionResult {
+  id: string;
+  prompt: string;
+  kind: QuestionRow["kind"];
+  required: boolean;
+  position: number;
+  response_count: number;
+  options: { id: string; label: string; image_url: string | null; votes: number }[];
+  texts?: string[];
+}
+
 export interface PollResults {
   poll_id: string;
   status: PollRow["status"];
+  opens_at: string | null;
   closes_at: string | null;
   total_voters: number;
   total_votes: number;
   options: { id: string; label: string; image_url: string | null; votes: number }[];
+  questions: QuestionResult[];
 }
 
 export async function computeResults(
   env: Env,
   origin: string,
   poll: PollRow,
+  opts: { includeText?: boolean } = {},
 ): Promise<PollResults> {
-  // Counting is by voter key, so make sure any legacy plaintext anon
-  // keys have been rewritten to the HMAC form first.
-  await migrateLegacyAnonVoterKeys(env, poll.id);
+  await ensureVoterKeysHashed(env);
+  const questions = await listQuestionRows(env, poll.id);
   const options = await listOptionRows(env, poll.id);
-  const counts = await env.DB.prepare(
-    "SELECT option_id, COUNT(*) AS votes FROM votes WHERE poll_id = ?1 GROUP BY option_id",
+  const ballots = await env.DB.prepare(
+    "SELECT option_ids FROM vote_ballots WHERE poll_id = ?1",
   )
     .bind(poll.id)
-    .all<{ option_id: string; votes: number }>();
-  const byOption = new Map(counts.results.map((r) => [r.option_id, r.votes]));
-  const totals = await env.DB.prepare(
-    "SELECT COUNT(DISTINCT voter_key) AS voters, COUNT(*) AS votes FROM votes WHERE poll_id = ?1",
-  )
-    .bind(poll.id)
-    .first<{ voters: number; votes: number }>();
-  return {
-    poll_id: poll.id,
-    status: poll.status,
-    closes_at: poll.closes_at,
-    total_voters: totals?.voters ?? 0,
-    total_votes: totals?.votes ?? 0,
-    options: options.map((o) => ({
+    .all<{ option_ids: string }>();
+  const defaultQuestionId = questions[0]?.id ?? poll.id;
+  const optionVotes = new Map<string, number>();
+  const textAnswers = new Map<string, string[]>();
+  const answered = new Map<string, number>();
+  for (const ballot of ballots.results) {
+    for (const answer of parseBallotDocument(ballot.option_ids, defaultQuestionId)) {
+      answered.set(answer.question_id, (answered.get(answer.question_id) ?? 0) + 1);
+      for (const id of answer.option_ids) optionVotes.set(id, (optionVotes.get(id) ?? 0) + 1);
+      if (answer.text) {
+        const list = textAnswers.get(answer.question_id) ?? [];
+        list.push(answer.text);
+        textAnswers.set(answer.question_id, list);
+      }
+    }
+  }
+  const questionResults: QuestionResult[] = questions.map((q) => {
+    const qOptions = options.filter((o) => o.question_id === q.id).map((o) => ({
       id: o.id,
       label: o.label,
       image_url: imageUrl(origin, o.image_key),
-      votes: byOption.get(o.id) ?? 0,
-    })),
+      votes: optionVotes.get(o.id) ?? 0,
+    }));
+    const result: QuestionResult = {
+      id: q.id,
+      prompt: q.prompt,
+      kind: q.kind,
+      required: q.required === 1,
+      position: q.position,
+      response_count: answered.get(q.id) ?? 0,
+      options: qOptions,
+    };
+    if (opts.includeText && q.kind === "text") result.texts = textAnswers.get(q.id) ?? [];
+    return result;
+  });
+  const flat = questionResults.flatMap((q) => q.options);
+  const totalVotes = flat.reduce((sum, o) => sum + o.votes, 0);
+  return {
+    poll_id: poll.id,
+    status: poll.status,
+    opens_at: poll.opens_at,
+    closes_at: poll.closes_at,
+    total_voters: ballots.results.length,
+    total_votes: totalVotes,
+    options: flat,
+    questions: questionResults,
   };
 }

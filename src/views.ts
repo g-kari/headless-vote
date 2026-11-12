@@ -9,14 +9,8 @@ export function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
-/**
- * Serialize a value for embedding inside an inline <script> element.
- * JSON.stringify alone does not escape `<`, so a string containing
- * "</script>" would break out of the element; escaping `<`, `>`, `&`
- * (and the JS line separators U+2028/U+2029) as \uXXXX keeps the JSON
- * valid and the script element closed.
- */
-export function jsonForScript(value: unknown): string {
+/** JSON for embedding inside a <script> element. Escapes HTML-significant characters. */
+export function safeJsonForScript(value: unknown): string {
   return JSON.stringify(value)
     .replace(/</g, "\\u003c")
     .replace(/>/g, "\\u003e")
@@ -25,10 +19,8 @@ export function jsonForScript(value: unknown): string {
     .replace(/\u2029/g, "\\u2029");
 }
 
-export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="img" aria-label="headless-vote logo"><rect width="64" height="64" rx="14" fill="#1e4fd8"/><path d="M19.2 30.1 L27.8 39.4 L45.4 20.2" fill="none" stroke="#ffffff" stroke-width="6.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="17.9" y="44.8" width="28.2" height="4.8" rx="2.4" fill="#ffffff" opacity="0.92"/></svg>`;
-
 /*
- * Design system (2026-11-13 revision):
+ * Design system (carried over from the PR #4 revision):
  * - No card layouts and no pastel tints: flat sections separated by
  *   rules, neutral grays, and one saturated accent color.
  * - Structure and results are shown as diagrams (flow steps, bars,
@@ -36,6 +28,12 @@ export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="i
  * - Motion: cross-document view transitions, entrance animation and
  *   animated bars, all only under prefers-reduced-motion: no-preference.
  */
+export function scriptTag(nonce: string, code: string): string {
+  return `<script nonce="${escapeHtml(nonce)}">${code}</script>`;
+}
+
+export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="img" aria-label="headless-vote logo"><rect width="64" height="64" rx="14" fill="#1e4fd8"/><path d="M19.2 30.1 L27.8 39.4 L45.4 20.2" fill="none" stroke="#ffffff" stroke-width="6.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="17.9" y="44.8" width="28.2" height="4.8" rx="2.4" fill="#ffffff" opacity="0.92"/></svg>`;
+
 const CSS = `
 :root{
   --bg:light-dark(#ffffff,#0c1015); --surface-2:light-dark(#eceff3,#1a212b);
@@ -181,6 +179,13 @@ input:user-invalid,textarea:user-invalid,select:user-invalid{border-color:var(--
 @keyframes dialog-in{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
 @keyframes fade-in{from{opacity:0}to{opacity:1}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* Embed snippet + form helpers (flat, no cards). */
+.copyable{border:1px solid var(--border);padding:.8rem;margin:.6rem 0}
+.copyable pre{margin:.5rem 0 0;overflow-x:auto;font-size:.85rem;line-height:1.5}
+.copy{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.tip{color:var(--muted);font-size:.85rem}
+.field-error{color:var(--danger);font-size:.88rem;font-weight:600}
 `;
 
 export function layout(opts: {
@@ -188,15 +193,13 @@ export function layout(opts: {
   userEmail?: string | null;
   body: string;
   origin: string;
-  csrfToken?: string | null;
+  nonce: string;
 }): string {
-  const csrfField = opts.csrfToken
-    ? `<input type="hidden" name="csrf_token" value="${escapeHtml(opts.csrfToken)}">`
-    : "";
   const userArea = opts.userEmail
     ? `<span class="user">${escapeHtml(opts.userEmail)}</span>
-       <form method="post" action="/admin/logout" style="margin:0">${csrfField}<button class="btn small" type="submit">ログアウト</button></form>`
-    : `<a class="btn small primary" href="/admin/login">0g0-id でログイン</a>`;
+       <a class="btn small" href="/admin/account">アカウント</a>
+       <form method="post" action="/admin/logout" style="margin:0"><button class="btn small" type="submit">ログアウト</button></form>`
+    : `<a class="btn small primary" href="/admin/login">ログイン</a>`;
   return `<!doctype html>
 <html lang="ja">
 <head>
@@ -215,10 +218,10 @@ export function layout(opts: {
 <meta property="og:url" content="${escapeHtml(opts.origin)}/">
 <meta property="og:image" content="${escapeHtml(opts.origin)}/ogp.png">
 <meta name="twitter:card" content="summary_large_image">
-<style>${CSS}</style>
+<style nonce="${escapeHtml(opts.nonce)}">${CSS}</style>
 </head>
 <body>
-<a class="skip" href="#main">本文へスキップ</a>
+<a class="skip" href="#main">本文へ移動</a>
 <header class="site"><div class="bar">
   <a class="brand" href="/admin">${LOGO_SVG}<span>headless-vote</span></a>
   <span class="spacer"></span>

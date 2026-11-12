@@ -14,8 +14,8 @@ Headless な投票 SaaS です。
 - Cloudflare Workers（Hono / TypeScript）
 - D1（テナント・投票・票のデータ）
 - R2（設問・選択肢の画像）
-- 管理画面のログインは 0g0-id（OIDC、認可コード + PKCE）
-- 本番ドメインは https://vote.0g0.xyz
+- ログインは差し替え可能な認証アダプタ（既定は汎用 OIDC。ローカルのメールとパスワードも同梱）
+- ホスト名、発行者、クライアント ID は設定で与えます。リポジトリには本番の値を含めません
 
 ## 概念
 
@@ -27,7 +27,7 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 
 管理操作の認証は 2 通りです。
 
-- 管理画面: 0g0-id でログインし、セッション Cookie で認証します。
+- 管理画面: 設定した認証プロバイダでログインし、セッション Cookie で認証します。
   ログインしたユーザー（sub）がメンバーであるテナントだけを操作できます。
 - 管理 API: `Authorization: Bearer <API キー>` で認証します。
 
@@ -35,49 +35,16 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 
 投票はログインしてもしなくてもできます。
 
-- ログイン時: 0g0-id の ID トークン（`Authorization: Bearer <ID トークン>`）を送ります。
+- ログイン時: 認証プロバイダの ID トークン（`Authorization: Bearer <ID トークン>`）を送ります。ローカル認証ではセッション Cookie を使います。
   1 人 1 票の判定はユーザー（sub）単位です。
 - 未ログイン時: 投票者トークン（任意の不透明な文字列）を送ります。
-  判定はトークン単位です。トークンそのものは保存されず、サーバ側では
-  HMAC ハッシュとしてのみ保持されます。
-
-ログインした状態で、以前の匿名投票と同じ `voter_token` を送ると、
-匿名の票はログイン側の票に寄せられ、二重に数えられません。
+  判定はトークン単位です。
 
 再投票すると上書きされます。締切後は投票できません。
 投票ごとに「ログイン必須」か「誰でも投票可」かを選べます。既定は「誰でも投票可」です。
 
-匿名投票の限界: トークンを変えた同一人物は別人として数えられます。
-匿名のままでは同一人物かどうかを判定できないためです。
-厳密に 1 人 1 票が必要な投票では「ログイン必須」を選んでください。
-
-注意: 0g0-id の sub はクライアントごとに変わります（pairwise）。
-このアプリの ID トークンで投票した票は、このアプリの sub に紐付きます。
-
-## 制限とセキュリティ
-
-濫用を防ぐため、Worker 側で次の制限を入れています（固定ウィンドウ方式、
-超過時は `429` と `Retry-After` を返します）。
-
-| 対象 | 制限 |
-|---|---|
-| テナント作成（未認証） | 送信元 IP ごとに 30 回 / 時 |
-| ワークスペース作成（画面） | ユーザーごとに 30 回 / 時 |
-| ログイン開始 | 送信元 IP ごとに 60 回 / 時 |
-| 投票 | 投票 × 送信元 IP ごとに 600 回 / 時 |
-| 画像アップロード | テナントごとに 120 回 / 時 |
-| API キー再発行 | テナントごとに 30 回 / 時 |
-| 画像クォータ | テナントごとに 500 件まで、合計 500 MiB まで（1 件 5 MiB、形式は PNG / JPEG / WebP / GIF のみ。実体バイトで検証します） |
-
-そのほかの対策:
-
-- 管理画面のセッションはサーバ側（D1）で保持し、ログアウトや
-  「すべてのセッションを無効化」で即時に失効できます。
-- 管理画面の変更操作には CSRF トークンが必須です。
-- レスポンスには Content-Security-Policy などのセキュリティヘッダを
-  Worker 自身が付けます。
-- 匿名投票の投票者トークンは HMAC ハッシュでのみ保存されます
-  （旧形式の平文キーは、投票・集計のタイミングで自動的に移行されます）。
+注意: OIDC の sub はクライアントごとに変わることがあります（pairwise）。
+このアプリの ID トークンで投票した票は、そのクライアントの sub に紐付きます。
 
 ## API 仕様
 
@@ -88,12 +55,12 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 { "error": { "code": "POLL_CLOSED", "message": "This poll is closed for voting." } }
 ```
 
-主なエラーコード: `VALIDATION_ERROR`（400）、`UNAUTHORIZED`（401）、
+主なエラーコード: `BAD_REQUEST`（400）、`UNAUTHORIZED`（401）、`RATE_LIMITED`（429）、
 `LOGIN_REQUIRED`（401、ログイン必須の投票に未ログインで投票）、
 `INVALID_TOKEN`（401）、`FORBIDDEN`（403）、`NOT_FOUND`（404）、
 `POLL_CLOSED`（409）、`OPTIONS_LOCKED`（409、投票が入った投票の選択肢は変更不可）、
-`PAYLOAD_TOO_LARGE`（413）、`RATE_LIMITED`（429）、
-`IMAGE_QUOTA_EXCEEDED`（429、テナントの画像クォータ超過）。
+`RULES_LOCKED`（409、投票後はログイン必須・複数選択を変更不可）、
+`CONCURRENT_UPDATE`（409）、`PAYLOAD_TOO_LARGE`（413）。
 
 ### テナント管理（要 API キー、作成のみ認証不要）
 
@@ -101,6 +68,21 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 |---|---|---|
 | POST | `/tenants` | テナント作成。API キーを返す（1 回だけ） |
 | POST | `/tenants/:tenantId/rotate-key` | API キーの再発行 |
+| GET | `/tenants/:tenantId/api-keys` | キー一覧（秘密は含まない） |
+| POST | `/tenants/:tenantId/api-keys` | キー発行。`{ "name", "scope": "read" \| "write" }`。平文は 1 回だけ |
+| POST | `/tenants/:tenantId/api-keys/:keyId/revoke` | キー失効 |
+| GET | `/tenants/:tenantId/members` | メンバー一覧 |
+| POST | `/tenants/:tenantId/members` | メンバー追加。`{ "user_sub", "role": "owner" \| "member" }`。オーナーのみ |
+| PATCH | `/tenants/:tenantId/members` | 役割変更。最後のオーナーは降格不可 |
+| DELETE | `/tenants/:tenantId/members` | メンバー削除。最後のオーナーは不可 |
+| GET | `/tenants/:tenantId/webhooks` | Webhook 一覧（秘密は含まない） |
+| POST | `/tenants/:tenantId/webhooks` | Webhook 追加。署名の秘密は 1 回だけ。オーナーのみ |
+| POST | `/tenants/:tenantId/webhooks/:webhookId/disable` | Webhook 停止 |
+| GET | `/tenants/:tenantId/quotas` | プランと上限、現在の使用量 |
+| GET | `/tenants/:tenantId/analytics` | 直近 14 日の送信件数 |
+| GET | `/me` | ログイン中のプロフィールと参加ワークスペース（セッション） |
+| GET | `/me/export` | 自分のデータの JSON 書き出し（秘密・票の本文は含まない） |
+| DELETE | `/me` | `{ "confirm": "delete my data" }` でこのアプリ上のデータを削除 |
 
 ### 投票の管理（要 API キー、または管理画面のセッション）
 
@@ -112,24 +94,41 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 | PATCH | `/tenants/:tenantId/polls/:pollId` | 編集（締切済みは不可） |
 | POST | `/tenants/:tenantId/polls/:pollId/status` | 状態変更（`published` / `closed` / `draft`） |
 | GET | `/tenants/:tenantId/polls/:pollId/results` | 結果 |
-| POST | `/tenants/:tenantId/images` | 画像アップロード（R2）。本文に画像バイナリ、対応形式は PNG / JPEG / WebP / GIF、5 MiB まで |
+| GET | `/tenants/:tenantId/polls/:pollId/analytics` | その投票の直近 14 日の送信件数 |
+| GET | `/tenants/:tenantId/polls/:pollId/export` | 結果の CSV / JSON（`?format=csv`） |
+| POST | `/tenants/:tenantId/images` | 画像アップロード（R2）。本文に画像バイナリ、対応形式は PNG / JPEG / WebP / GIF、5 MiB まで。中身が宣言した形式と一致すること |
+| GET | `/tenants/:tenantId/origins` | ブラウザ埋め込みを許可するオリジン一覧 |
+| POST | `/tenants/:tenantId/origins` | オリジンを追加。`{ "origin": "https://www.example.com" }` |
+| DELETE | `/tenants/:tenantId/origins` | オリジンを削除。`{ "origin": "https://www.example.com" }` |
 
 投票の作成リクエスト例:
 
 ```json
 {
-  "question": "好きな季節は？",
-  "description": "1 つ選んでください",
-  "image_key": "t/<tenantId>/<uuid>.png",
-  "allow_multiple": false,
+  "question": "イベントアンケート",
+  "description": "すべて答えてください",
   "require_login": false,
+  "opens_at": "2026-12-01T00:00:00.000Z",
   "closes_at": "2026-12-31T15:00:00.000Z",
-  "options": [
-    { "label": "春" },
-    { "label": "夏", "image_key": "t/<tenantId>/<uuid>.png" }
+  "questions": [
+    {
+      "prompt": "好きな季節は？",
+      "kind": "single",
+      "required": true,
+      "options": [{ "label": "春" }, { "label": "夏" }]
+    },
+    {
+      "prompt": "当てはまるものをすべて",
+      "kind": "multiple",
+      "required": true,
+      "options": [{ "label": "午前" }, { "label": "午後" }]
+    },
+    { "prompt": "ひとこと", "kind": "text", "required": false }
   ]
 }
 ```
+
+`questions` を省略した場合は、従来どおり `question` と `options` と `allow_multiple` から設問が 1 つ作られます。設問は 1〜20 個です。選択式は選択肢 2〜50 個、自由記述は 2000 文字までです。票が入ったあとは設問の追加・削除・種類変更・選択肢の増減はできません（文言と並びの更新はできます）。
 
 ### 公開 API（投票者向け）
 
@@ -142,39 +141,81 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 投票リクエスト例（未ログイン）:
 
 ```json
-{ "voter_token": "any-opaque-string-1234", "option_ids": ["<optionId>"] }
+{
+  "voter_token": "any-opaque-string-1234",
+  "answers": [
+    { "question_id": "<questionId>", "option_ids": ["<optionId>"] },
+    { "question_id": "<textQuestionId>", "text": "よかったです" }
+  ]
+}
 ```
 
-ログイン時は `voter_token` の代わりに `Authorization: Bearer <ID トークン>` を付けます。
-レスポンスには、記録された票と最新の集計が入ります。
+設問が 1 つだけの投票は、従来の `{ "option_ids": ["<optionId>"] }` も受け付けます。必須の設問はすべてこの 1 回の送信に含めます。ログイン時は `voter_token` の代わりに `Authorization: Bearer <ID トークン>` を付けます。
+
+集計は設問ごとです。自由記述の本文は、管理 API・管理画面・書き出しにだけ含まれ、公開の結果 API では件数だけです。
 
 画像は `GET /images/t/<tenantId>/<file>` で配信します。
 投票の JSON では `image_url` として絶対 URL が返ります。
 
+### ブラウザからの埋め込み（CORS）
+
+公開 API（投票の取得・投票・結果）と画像を、別サイトのブラウザから読むには、そのサイトのオリジンをワークスペースの許可リストに入れます。リストはワークスペースごとで、管理画面の設定（`/admin/workspaces/<tenantId>/settings`）から追加・削除します。書き込み API キーでも同じ操作ができます。読み取りキーとメンバー権限のセッションでは変更できません。
+
+- 例: `https://www.example.com`
+- このデプロイ自身からの利用は同一オリジンなので、リストへの追加は不要です
+- `https` のみ。例外は `http://localhost`、`http://127.0.0.1`、`http://[::1]`（ポート付き可）
+- パス、クエリ、ユーザー情報、ワイルドカード（`*`）は拒否します。保存時に `https://Example.COM:443/` のような入力は `https://example.com` に正規化します
+- 1 ワークスペースあたり 20 件まで
+- リクエストの `Origin` が保存した値と完全一致するときだけ `Access-Control-Allow-Origin` を返します。`*` は使いません。`Vary: Origin` を付けます
+- 一致しない、または `Origin` が無い場合は CORS ヘッダーを付けません（サーバーからの呼び出しはそのまま動きます）
+- 管理 API と管理画面は、許可オリジンからでもクロスオリジンでは開きません
+
+未ログインの投票は、呼び出し側が渡す `voter_token` ごとに 1 票です。トークンは呼び出し側が安定して発行する前提で、データベースには HMAC だけを保存します。人と 1 対 1 にしたい投票は「ログイン必須」にしてください。
+
+## ワークスペースの運用機能
+
+- **API キー**: ワークスペースごとに複数持てます。権限は `read`（参照と書き出し）か `write`（作成・更新に加え、メンバー・Webhook・許可オリジン・削除も可）。平文は発行時に一度だけ返り、保存するのは SHA-256 と先頭のプレフィックスです。`POST /api/v1/tenants/:id/api-keys`、失効は `POST .../api-keys/:keyId/revoke`。従来の `POST .../rotate-key` は、そのリクエストのキーを失効して書き込みキーを 1 つ発行します。有効なキーの上限はワークスペースの `quota_keys`（初期値 10）です。読み取りキーでは発行・失効できません。
+- **役割**: セッションの利用者は `owner` か `member` です。オーナーはメンバー、API キー、Webhook、許可オリジン、ワークスペース削除を操作できます。メンバーは投票・結果・書き出し・推移・操作履歴の閲覧ができます。最後のオーナーは外せません。追加は認証プロバイダの `sub` 指定で、招待メールは送りません。
+- **複数設問**: 1 つの投票に単一選択・複数選択・自由記述を混在できます。投票は全設問を 1 回で送ります。
+- **開始日時**: `opens_at` を付けると、その時刻より前の投票は `POLL_NOT_OPEN`（409）です。`closes_at` より前である必要があります。
+- **結果の書き出し**: `GET /api/v1/tenants/:id/polls/:pollId/export?format=csv` または `format=json`。集計だけで、投票者トークンは含みません。CSV はスプレッドシートの式として解釈されないようセルを中和します。
+- **ワークスペースの書き出しと削除**: `GET /api/v1/tenants/:id/export`。削除は `DELETE /api/v1/tenants/:id` に `{ "confirm_name": "ワークスペース名" }`。管理画面の設定からも行えます。オーナー（または書き込みキー）だけが削除できます。
+- **アカウント**: `/admin/account` に、セッションの名前・メール・sub を表示します。OIDC ではパスワードを保存せず、メール確認と再設定は認証プロバイダ側です。`AUTH_PROVIDER=local` のときはこのアプリがパスワードをハッシュ保存し、確認と再設定のリンクをメールアダプタへ渡します。`GET /api/v1/me/export` で参加ワークスペースの一覧を書き出します。`DELETE /api/v1/me` は `{ "confirm": "delete my data" }` で、唯一のオーナーであるワークスペースを削除し、それ以外では参加だけを外します。外部の認証アカウント自体は削除しません。
+- **操作履歴**: `GET /api/v1/tenants/:id/audit` と管理画面の「操作履歴」。キーの秘密は記録しません。
+- **埋め込みスニペット**: 公開中の投票の管理画面に、取得と投票の例を出します。
+- **推移**: `GET /api/v1/tenants/:id/analytics` と投票ごとの `.../polls/:pollId/analytics`。直近 14 日の送信件数です。同じ人の再投票は別の送信として数えます。
+- **Webhook**: `POST /api/v1/tenants/:id/webhooks` に `{ "url": "https://example.com/hook" }`。イベントは `vote.cast`、`poll.published`、`poll.closed`、`poll.updated`。本文の HMAC-SHA256 を `X-Headless-Vote-Signature: v1=<hex>` で送ります。秘密は作成時に一度だけ表示し、保存時は AES-GCM で暗号化します。投票者トークンと自由記述の本文は送りません。`https` のみ（`localhost` は `http` 可）。プライベートアドレス、リンクローカル、メタデータ用ホストは拒否し、リダイレクトは追いません。配信失敗でも投票や状態変更は成功します。
+- **上限**: ワークスペースの列 `quota_polls`（100）、`quota_keys`（10）、`quota_webhooks`（5）、`quota_votes_per_day`（5000）を超えると `QUOTA_EXCEEDED` または 429 です。初期プランは `free` です。画面から上限は上げられません。
+
 ## 管理画面
 
-- `/admin` から 0g0-id でログインします。
+- `/admin` から、設定した認証プロバイダでログインします。ログアウトは POST のみです（`/admin/logout` を開いただけではセッションは消えません）。
+- `/admin/account` でプロフィール、参加ワークスペース、自分のデータの書き出しと削除ができます。
 - ワークスペースの作成、投票の作成・編集・公開・締切ができます。
+- 設定画面で許可オリジン、メンバー、Webhook、利用上限を扱います。
 - 設問と選択肢に画像を付けられます（R2 にアップロード）。
-- 結果はバーと集計表で確認できます。
+- 結果はバーと集計表で確認できます。推移は日ごとの送信件数です。
 
-### 0g0-id のクライアント登録
+### 認証プロバイダ
 
-認可コードフロー（PKCE S256、パブリッククライアント）を使います。
-クライアントは DCR（RFC 7591）で登録できます。
+既定は汎用 OIDC（認可コード + PKCE S256）です。発行者とクライアント ID は環境変数で与えます。DCR（RFC 7591）に対応した発行者なら、次で公開クライアントを登録できます。発行者とリダイレクト URI は必須です。
 
 ```bash
+OIDC_ISSUER=https://idp.example.com \
+REDIRECT_URI=https://vote.example.com/auth/callback \
 node scripts/register-oidc-client.mjs
-# 既定のリダイレクト URI: https://vote.0g0.xyz/auth/callback
 ```
 
-表示された `client_id` を `wrangler.toml` の `OIDC_CLIENT_ID` に設定して再デプロイします。
-ローカル開発では `REDIRECT_URI=http://localhost:8787/auth/callback` を付けて登録します。
+ローカル開発では `REDIRECT_URI=http://localhost:8787/auth/callback` を付けます。表示された `client_id` を `OIDC_CLIENT_ID` に設定します。
+
+`AUTH_PROVIDER=local` にすると、メールとパスワードをこのアプリのデータベースに保存します。確認と再設定のメールは `EMAIL_PROVIDER`（`outbox`、`http`、`noop`）が送ります。
+
+セルフホストの手順、アダプタの差し替え、設定例は [docs/self-hosting.md](docs/self-hosting.md)、[docs/adapters.md](docs/adapters.md)、[docs/architecture.md](docs/architecture.md) と [config/example.env](config/example.env) にあります。
 
 必要な設定:
 
-- 変数: `OIDC_ISSUER`（既定 `https://id.0g0.xyz`）、`OIDC_CLIENT_ID`、`OIDC_SCOPES`（既定 `openid profile email`）
-- シークレット: `SESSION_SECRET`（セッション Cookie の署名用。`wrangler secret put SESSION_SECRET`）
+- 変数: `AUTH_PROVIDER`、`OIDC_ISSUER`、`OIDC_CLIENT_ID`、`OIDC_SCOPES`（例 `openid profile email`）、`APP_ORIGIN`（管理ログインをこのオリジンに限定します）、`EMAIL_PROVIDER`
+- シークレット: `SESSION_SECRET`（セッション Cookie の署名用。`wrangler secret put SESSION_SECRET`）。任意で `VOTER_KEY_SECRET`（投票者識別子の HMAC。未設定時は `SESSION_SECRET` を使います。セッション秘密だけをローテーションしたいときに分けてください）。値はコミットしません。
 
 ## ローカル開発
 
@@ -198,7 +239,7 @@ npx wrangler r2 bucket create headless-vote-images
 npx wrangler secret put SESSION_SECRET
 npx wrangler d1 migrations apply headless-vote --remote
 node scripts/register-oidc-client.mjs          # client_id を wrangler.toml に記入
-npx wrangler deploy                            # vote.0g0.xyz のカスタムドメインが付きます
+npx wrangler deploy                            # ホスト名は wrangler.toml の routes で付けます。workers.dev は出しません
 ```
 
 ### GitHub 連携の自動デプロイ（Workers Builds）

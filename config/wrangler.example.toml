@@ -1,0 +1,39 @@
+# Example Worker config. Copy the pieces you need into wrangler.toml.
+# Resource ids and hostnames below are placeholders, not a live deployment.
+
+name = "headless-vote"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+workers_dev = false
+
+# Add your own hostname. Do not copy someone else's domain.
+# routes = [
+#   { pattern = "vote.example.com", custom_domain = true },
+# ]
+
+[vars]
+AUTH_PROVIDER = "oidc"
+AUTH_LABEL = "Example IdP"
+OIDC_ISSUER = "https://idp.example.com"
+OIDC_CLIENT_ID = "your-public-client-id"
+OIDC_SCOPES = "openid profile email"
+APP_ORIGIN = "https://vote.example.com"
+EMAIL_PROVIDER = "outbox"
+RATE_LIMIT_STORE = "d1"
+WEBHOOK_TRANSPORT = "fetch"
+ANALYTICS_STORE = "d1"
+OBJECT_STORE = "r2"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "headless-vote"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "headless-vote-images"
+
+# Retry bounded cleanup of images belonging to deleted workspaces.
+[triggers]
+crons = ["0 3 * * *"]

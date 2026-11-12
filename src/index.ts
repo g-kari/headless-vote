@@ -1,56 +1,41 @@
 import { Hono } from "hono";
+import { drainObjectCleanup } from "./object-cleanup";
+import { allowsCrossSiteEmbed, applyPublicCors, isPublicEmbedPath } from "./cors";
 import { ApiError } from "./errors";
-import { api, serveImage } from "./routes/api";
+import { serveImage } from "./routes/api";
 import { authRoutes } from "./routes/auth";
 import { ui } from "./routes/ui";
+import { api } from "./routes/api";
+import {
+  applySecurityHeaders,
+  ASSET_PATHS,
+  newCspNonce,
+  shouldBlockCrossSite,
+} from "./security";
 import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-/**
- * Security headers set by the Worker itself (not left to zone config).
- * The CSP allows the admin UI's own inline <style>/<script> blocks
- * (script-src/style-src 'unsafe-inline') while blocking external
- * origins, objects, framing and base-tag hijacking.
- */
-const CONTENT_SECURITY_POLICY = [
-  "default-src 'self'",
-  "script-src 'self' 'unsafe-inline'",
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob:",
-  "font-src 'self' data:",
-  "connect-src 'self'",
-  "object-src 'none'",
-  "base-uri 'self'",
-  "form-action 'self'",
-  "frame-ancestors 'none'",
-].join("; ");
-
-function setSecurityHeaders(h: Headers): void {
-  h.set("content-security-policy", CONTENT_SECURITY_POLICY);
-  h.set("x-content-type-options", "nosniff");
-  h.set("x-frame-options", "DENY");
-  h.set("referrer-policy", "same-origin");
-  h.set("strict-transport-security", "max-age=31536000; includeSubDomains");
-  h.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
-  h.set("cross-origin-opener-policy", "same-origin");
-}
-
-export function applySecurityHeaders(res: Response): Response {
-  try {
-    setSecurityHeaders(res.headers);
-    return res;
-  } catch {
-    // Responses from the ASSETS binding have immutable headers: clone.
-    const clone = new Response(res.body, res);
-    setSecurityHeaders(clone.headers);
-    return clone;
+app.use("*", async (c, next) => {
+  c.set("cspNonce", newCspNonce());
+  const path = new URL(c.req.url).pathname;
+  if (
+    shouldBlockCrossSite(c.req.raw, (pathname, method) => {
+      if (ASSET_PATHS.has(pathname) && (method === "GET" || method === "HEAD")) return true;
+      return allowsCrossSiteEmbed(pathname, method);
+    })
+  ) {
+    applySecurityHeaders(c, { html: false });
+    return c.json({ error: { code: "FORBIDDEN", message: "Cross-site request blocked" } }, 403);
   }
-}
-
-app.use(async (c, next) => {
+  if (c.req.method === "OPTIONS" && isPublicEmbedPath(path)) {
+    await applyPublicCors(c);
+    applySecurityHeaders(c, { html: false });
+    return c.body(null, 204);
+  }
   await next();
-  c.res = applySecurityHeaders(c.res);
+  await applyPublicCors(c);
+  applySecurityHeaders(c);
 });
 
 app.get("/api/v1/health", (c) => c.json({ ok: true, service: "headless-vote" }));
@@ -58,15 +43,6 @@ app.get("/api/v1/health", (c) => c.json({ ok: true, service: "headless-vote" }))
 // Brand assets live in public/ and are served by the platform's asset
 // router in production. This fallback covers runtimes that dispatch every
 // request to the Worker first (e.g. the test pool).
-const ASSET_PATHS = new Set([
-  "/favicon.svg",
-  "/favicon-16x16.png",
-  "/favicon-32x32.png",
-  "/favicon.ico",
-  "/apple-touch-icon.png",
-  "/logo.svg",
-  "/ogp.png",
-]);
 app.use(async (c, next) => {
   if (c.req.method === "GET" && ASSET_PATHS.has(new URL(c.req.url).pathname) && c.env.ASSETS) {
     return c.env.ASSETS.fetch(c.req.raw);
@@ -83,44 +59,46 @@ app.get("/images/t/:tenantId/:file", async (c) => {
   return serveImage(c.env, key);
 });
 
-app.onError((err, c) => {
+app.onError(async (err, c) => {
+  await applyPublicCors(c);
   if (err instanceof ApiError) {
-    return applySecurityHeaders(
-      c.json(
-        { error: { code: err.code, message: err.message } },
-        err.status as 400,
-        err.headers,
-      ),
+    if (err.retryAfter !== undefined) {
+      c.header("Retry-After", String(err.retryAfter));
+    }
+    applySecurityHeaders(c, { html: false });
+    return c.json(
+      { error: { code: err.code, message: err.message } },
+      err.status as 400,
     );
   }
-  console.error("unhandled error", err);
+  console.error("unhandled error", err instanceof Error ? err.message : "unknown");
   const wantsHtml = (c.req.header("accept") ?? "").includes("text/html") &&
     !c.req.path.startsWith("/api/");
   if (wantsHtml) {
-    return applySecurityHeaders(
-      c.html(
-        "<!doctype html><meta charset=utf-8><title>Error</title><p>Something went wrong. Please try again.</p>",
-        500,
-      ),
+    applySecurityHeaders(c, { html: true });
+    return c.html(
+      "<!doctype html><meta charset=utf-8><title>Error</title><p>Something went wrong. Please try again.</p>",
+      500,
     );
   }
-  return applySecurityHeaders(
-    c.json(
-      { error: { code: "INTERNAL", message: "Internal server error" } },
-      500,
-    ),
+  applySecurityHeaders(c, { html: false });
+  return c.json(
+    { error: { code: "INTERNAL", message: "Internal server error" } },
+    500,
   );
 });
 
 app.notFound((c) => {
+  applySecurityHeaders(c, { html: !c.req.path.startsWith("/api/") });
   if (c.req.path.startsWith("/api/")) {
-    return applySecurityHeaders(
-      c.json({ error: { code: "NOT_FOUND", message: "Not found" } }, 404),
-    );
+    return c.json({ error: { code: "NOT_FOUND", message: "Not found" } }, 404);
   }
-  return applySecurityHeaders(
-    c.html("<!doctype html><meta charset=utf-8><title>404</title><p>Not found.</p>", 404),
-  );
+  return c.html("<!doctype html><meta charset=utf-8><title>404</title><p>Not found.</p>", 404);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    await drainObjectCleanup(env);
+  },
+};

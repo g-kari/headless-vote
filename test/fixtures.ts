@@ -21,7 +21,7 @@ export const TEST_PRIVATE_JWK = {
   d: "Gc4Vb4EHFcAU6lX0bptCzh3h_SrMs0kEWvjjNmRjZb0",
 } as const;
 
-export const TEST_ISSUER = "https://id.0g0.xyz";
+export const TEST_ISSUER = "https://idp.example.test";
 export const TEST_CLIENT_ID = "test-client-id";
 
 import { schemaStatements } from "../src/schema";
@@ -45,7 +45,7 @@ function b64urlJson(value: unknown): string {
   return b64url(new TextEncoder().encode(JSON.stringify(value)));
 }
 
-/** Sign a JWT (ES256) with the test keypair, shaped like a 0g0-id id_token. */
+/** Sign a JWT (ES256) with the test keypair, shaped like an OIDC id_token. */
 export async function signTestJwt(
   claims: Record<string, unknown>,
 ): Promise<string> {

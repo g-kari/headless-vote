@@ -118,41 +118,19 @@ describe("login-required polls", () => {
 });
 
 describe("open polls with optional login", () => {
-  it("folds the anonymous ballot into the login identity when the logged-in vote presents the same voter_token", async () => {
+  it("counts logged-in and anonymous voters as distinct voters", async () => {
     const { pollId, optionIds } = await createTenantWithPoll();
-    // Anonymous ballot first.
+    const jwt = await signTestJwt({ sub: "pairwise-user-9" });
+    const loggedIn = await vote(pollId, { option_ids: [optionIds[0]] }, jwt);
+    expect(loggedIn.status).toBe(200);
     const anon = await vote(pollId, {
       option_ids: [optionIds[0]],
       voter_token: "token-someone",
     });
     expect(anon.status).toBe(200);
-    let r = await totals(pollId);
-    expect(r.total_voters).toBe(1);
-
-    // The same person logs in and votes again, presenting their token:
-    // the anonymous ballot is claimed, not double-counted.
-    const jwt = await signTestJwt({ sub: "pairwise-user-9" });
-    const loggedIn = await vote(
-      pollId,
-      { option_ids: [optionIds[1]], voter_token: "token-someone" },
-      jwt,
-    );
-    expect(loggedIn.status).toBe(200);
-    r = await totals(pollId);
-    expect(r.total_voters).toBe(1);
-    expect(r.options.find((o) => o.id === optionIds[0])?.votes).toBe(0);
-    expect(r.options.find((o) => o.id === optionIds[1])?.votes).toBe(1);
-
-    // Residual design limit: an anonymous ballot cast under a different
-    // token with no link to the login identity still counts separately
-    // (anonymous voting cannot identify the same person across tokens).
-    const other = await vote(pollId, {
-      option_ids: [optionIds[0]],
-      voter_token: "token-unlinked",
-    });
-    expect(other.status).toBe(200);
-    r = await totals(pollId);
+    const r = await totals(pollId);
     expect(r.total_voters).toBe(2);
+    expect(r.options.find((o) => o.id === optionIds[0])?.votes).toBe(2);
   });
 
   it("rejects invalid or expired login tokens instead of downgrading", async () => {

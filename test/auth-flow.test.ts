@@ -4,7 +4,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 
 const BASE = "https://vote.test";
-const ISSUER = "https://id.0g0.xyz";
+const ISSUER = "https://idp.example.test";
 
 beforeAll(async () => {
   await applySchema(env.DB);
@@ -46,7 +46,7 @@ async function loginAs(sub: string, email: string): Promise<string> {
   expect(params.get("client_id")).toBe("test-client-id");
   expect(params.get("redirect_uri")).toBe(`${BASE}/auth/callback`);
 
-  const flowCookie = getCookie(loginRes, "hv_oidc_flow");
+  const flowCookie = getCookie(loginRes, "__Host-hv_oidc_flow");
   expect(flowCookie).toBeTruthy();
   const flow = decodeFlowPayload(flowCookie as string);
   expect(params.get("state")).toBe(flow.state);
@@ -57,17 +57,24 @@ async function loginAs(sub: string, email: string): Promise<string> {
     `${BASE}/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(flow.state)}`,
     {
       redirect: "manual",
-      headers: { cookie: `hv_oidc_flow=${flowCookie}` },
+      headers: { cookie: `__Host-hv_oidc_flow=${flowCookie}` },
     },
   );
   expect(callbackRes.status).toBe(302);
   expect(callbackRes.headers.get("location")).toBe("/admin");
   const session = getCookie(callbackRes, "__Host-hv_session");
   expect(session).toBeTruthy();
+  const sessionHeader = callbackRes.headers.getSetCookie().find((h) =>
+    h.startsWith("__Host-hv_session="),
+  );
+  expect(sessionHeader).toMatch(/HttpOnly/i);
+  expect(sessionHeader).toMatch(/Secure/);
+  expect(sessionHeader).toMatch(/SameSite=Lax/i);
+  expect(sessionHeader).not.toMatch(/Domain=/i);
   return session as string;
 }
 
-describe("0g0-id login flow for the admin UI", () => {
+describe("OIDC login flow for the admin UI", () => {
   it("logs in, creates a workspace, and isolates it from other users", async () => {
     const session = await loginAs("ui-user-1", "one@example.com");
 
@@ -77,8 +84,6 @@ describe("0g0-id login flow for the admin UI", () => {
     expect(adminRes.status).toBe(200);
     const adminHtml = await adminRes.text();
     expect(adminHtml).toContain("ワークスペース");
-    const csrf = /name="csrf_token" value="([0-9a-f]{64})"/.exec(adminHtml)?.[1];
-    expect(csrf).toBeTruthy();
 
     const createRes = await SELF.fetch(`${BASE}/admin/workspaces`, {
       method: "POST",
@@ -86,7 +91,7 @@ describe("0g0-id login flow for the admin UI", () => {
         cookie: `__Host-hv_session=${session}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ name: "私の投票所", csrf_token: csrf as string }).toString(),
+      body: new URLSearchParams({ name: "私の投票所" }).toString(),
     });
     expect(createRes.status).toBe(200);
     const createdHtml = await createRes.text();
@@ -118,12 +123,12 @@ describe("0g0-id login flow for the admin UI", () => {
     const loginRes = await SELF.fetch(`${BASE}/admin/login`, {
       redirect: "manual",
     });
-    const flowCookie = getCookie(loginRes, "hv_oidc_flow");
+    const flowCookie = getCookie(loginRes, "__Host-hv_oidc_flow");
     const res = await SELF.fetch(
       `${BASE}/auth/callback?code=test-code&state=bogus-state`,
       {
         redirect: "manual",
-        headers: { cookie: `hv_oidc_flow=${flowCookie}` },
+        headers: { cookie: `__Host-hv_oidc_flow=${flowCookie}` },
       },
     );
     expect(res.status).toBe(400);
@@ -133,7 +138,7 @@ describe("0g0-id login flow for the admin UI", () => {
     const res = await SELF.fetch(`${BASE}/admin`);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("0g0-id でログイン");
+    expect(html).toContain("OpenID Connect でログイン");
     expect(html).toContain('href="/favicon.svg"');
   });
 });
