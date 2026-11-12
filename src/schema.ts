@@ -7,7 +7,12 @@ CREATE TABLE IF NOT EXISTS tenants (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   api_key_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  plan TEXT NOT NULL DEFAULT 'free',
+  quota_polls INTEGER NOT NULL DEFAULT 100,
+  quota_keys INTEGER NOT NULL DEFAULT 10,
+  quota_webhooks INTEGER NOT NULL DEFAULT 5,
+  quota_votes_per_day INTEGER NOT NULL DEFAULT 5000
 );
 
 CREATE TABLE IF NOT EXISTS tenant_members (
@@ -125,6 +130,33 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id, created_at);
+
+CREATE TABLE IF NOT EXISTS webhooks (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  secret_enc TEXT NOT NULL,
+  events TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  disabled_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_tenant ON webhooks(tenant_id);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id TEXT PRIMARY KEY,
+  webhook_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  status INTEGER,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_hook ON webhook_deliveries(webhook_id, created_at);
+
+CREATE TABLE IF NOT EXISTS vote_events (
+  id TEXT PRIMARY KEY,
+  poll_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vote_events_poll ON vote_events(poll_id, created_at);
 `;
 
 /** Split a multi-statement SQL script into individual statements. */

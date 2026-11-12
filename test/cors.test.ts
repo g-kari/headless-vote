@@ -339,7 +339,7 @@ describe("admin settings screen", () => {
     });
     expect(page.status).toBe(200);
     const html = await page.text();
-    expect(html).toContain("埋め込み設定");
+    expect(html).toContain("許可しているオリジン");
     expect(html).toContain("https://vote.0g0.xyz");
     expect(html).toContain('name="origin"');
 

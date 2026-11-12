@@ -1,5 +1,7 @@
-import { Hono } from "hono";
-import { getSessionUser, isTenantMember, listTenantsForUser } from "../auth";
+import { Hono, type Context } from "hono";
+import { deleteAccountData, deleteWorkspace, listMemberships } from "../account";
+import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
+import { getSessionUser, isTenantMember, listTenantsForUser, memberRole } from "../auth";
 import {
   addTenantOrigin,
   listTenantOrigins,
@@ -9,6 +11,9 @@ import { listAuditEvents } from "../audit";
 import { listQuestionRows } from "../questions";
 import { computeResults, getPollRow, listOptionRows } from "../domain";
 import { issueApiKey, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
+import { addMember, listMembers, removeMember, setMemberRole } from "../members";
+import { tenantQuotas } from "../quotas";
+import { createWebhook, disableWebhook, listWebhooks } from "../webhooks";
 import { ApiError } from "../errors";
 import {
   assertSameOriginMutation,
@@ -38,6 +43,25 @@ async function requireMember(
   const user = await getSessionUser(c as never);
   if (!user) return null;
   if (!(await isTenantMember(c.env, id, user.sub))) return null;
+  return user;
+}
+
+async function requireOwnerUser(
+  c: Context<{ Bindings: Env; Variables: Variables }>,
+  tenantId: string,
+): Promise<SessionUser | Response> {
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  const role = await memberRole(c.env, tenantId, user.sub);
+  if (role !== "owner") {
+    return c.html(layout({
+      title: "権限がありません",
+      userEmail: user.email ?? user.sub,
+      body: `<h1>権限がありません</h1><p>メンバーの管理、API キー、Webhook、許可オリジン、ワークスペースの削除はオーナーだけが実行できます。</p>`,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 403);
+  }
   return user;
 }
 
@@ -183,10 +207,12 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
   )
     .bind(tenantId)
     .all<PollRow>();
+  const role = await memberRole(c.env, tenantId, user.sub);
+  const quotas = await tenantQuotas(c.env, tenantId);
   const keys = await listApiKeys(c.env, tenantId);
   const keyItems = keys
     .map(
-      (key) => `<li>${escapeHtml(key.name)} <code>${escapeHtml(key.key_prefix)}…</code> ${key.scope === "write" ? "読み書き" : "読み取り"} ${key.revoked_at ? '<span class="badge closed">失効</span>' : `<form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/api-keys/revoke" style="display:inline"><input type="hidden" name="key_id" value="${escapeHtml(key.id)}"><button class="btn small danger" type="submit">失効</button></form>`}</li>`,
+      (key) => `<li>${escapeHtml(key.name)} <code>${escapeHtml(key.key_prefix)}…</code> ${key.scope === "write" ? "読み書き" : "読み取り"} ${key.revoked_at ? '<span class="badge closed">失効</span>' : role === "owner" ? `<form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/api-keys/revoke" style="display:inline"><input type="hidden" name="key_id" value="${escapeHtml(key.id)}"><button class="btn small danger" type="submit">失効</button></form>` : ""}</li>`,
     )
     .join("");
   const rows = polls.results
@@ -197,17 +223,19 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
         <td data-label="状態">${statusBadge(p.status)}</td>
         <td data-label="設定" class="small">${p.require_login === 1 ? "ログイン必須" : "誰でも投票可"}<br>${p.allow_multiple === 1 ? "複数選択可" : "単一選択"}</td>
         <td data-label="締切" class="small">${p.closes_at ? escapeHtml(p.closes_at) : "締切なし"}</td>
-        <td><a class="btn small" href="/admin/workspaces/${tenantId}/polls/${p.id}/results">結果</a></td>
+        <td><a class="btn small" href="/admin/workspaces/${tenantId}/polls/${p.id}/results">結果</a>
+        <a class="btn small" href="/admin/workspaces/${tenantId}/polls/${p.id}/analytics">推移</a></td>
       </tr>`,
     )
     .join("");
   const body = `
     <p class="muted small"><a href="/admin">ワークスペース一覧</a></p>
     <h1>${escapeHtml(tenant.name)}</h1>
-    <p class="muted">投票 ${polls.results.length} 件（公開中 ${polls.results.filter((p) => p.status === "published").length}）／ 記録された票 ${Number((await c.env.DB.prepare("SELECT COUNT(*) AS n FROM vote_ballots WHERE poll_id IN (SELECT id FROM polls WHERE tenant_id = ?1)").bind(tenantId).first<{ n: number }>())?.n ?? 0)} 件。1 ワークスペースあたり投票は 100 件、有効な API キーは 10 個までです。</p>
+    <p class="muted">投票 ${polls.results.length} / ${quotas.polls} 件（公開中 ${polls.results.filter((p) => p.status === "published").length}）／ 記録された票 ${Number((await c.env.DB.prepare("SELECT COUNT(*) AS n FROM vote_ballots WHERE poll_id IN (SELECT id FROM polls WHERE tenant_id = ?1)").bind(tenantId).first<{ n: number }>())?.n ?? 0)} 件。プラン ${escapeHtml(quotas.plan)}。1 日の送信上限は ${quotas.votesPerDay} 件です。</p>
     <div class="actions">
       <a class="btn primary" href="/admin/workspaces/${escapeHtml(tenantId)}/polls/new">新しい投票を作る</a>
-      <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/settings">埋め込み設定</a>
+      <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/analytics">投票の推移</a>
+      <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/settings">設定</a>
       <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/audit">操作履歴</a>
     </div>
     <h2>投票一覧</h2>
@@ -218,7 +246,7 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
     <section class="card">
       <p class="muted">管理 API のキーは SHA-256 で保存し、作成時に一度だけ表示します。<code>read</code> は参照と書き出し、<code>write</code> は作成・更新・失効もできます。</p>
       ${keyItems ? `<ul>${keyItems}</ul>` : ""}
-      <form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/api-keys" aria-labelledby="key-heading">
+      ${role === "owner" ? `<form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/api-keys" aria-labelledby="key-heading">
         <h3 id="key-heading">新しいキー</h3>
         <label for="key-name">名前</label>
         <input id="key-name" name="name" type="text" required maxlength="80" autocomplete="off">
@@ -240,15 +268,18 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
             <button class="btn danger" type="submit">再発行する</button>
           </div>
         </form>
-      </dialog>
-      ${scriptTag(c.get("cspNonce") ?? "", `
-        document.getElementById("open-rotate").addEventListener("click", () => {
-          document.getElementById("rotate-dialog").showModal();
-        });
-        document.getElementById("close-rotate").addEventListener("click", () => {
-          document.getElementById("rotate-dialog").close();
-        });
-      `)}
+      </dialog>` : `<p class="muted">キーの発行と失効はオーナーだけが実行できます。</p>`}
+      ${role === "owner" ? scriptTag(c.get("cspNonce") ?? "", `
+        const openRotate = document.getElementById("open-rotate");
+        const rotateDialog = document.getElementById("rotate-dialog");
+        const closeRotate = document.getElementById("close-rotate");
+        if (openRotate instanceof HTMLButtonElement && rotateDialog instanceof HTMLDialogElement) {
+          openRotate.addEventListener("click", () => { rotateDialog.showModal(); });
+        }
+        if (closeRotate instanceof HTMLButtonElement && rotateDialog instanceof HTMLDialogElement) {
+          closeRotate.addEventListener("click", () => { rotateDialog.close(); });
+        }
+      `) : ""}
     </section>`;
   return c.html(
     layout({
@@ -264,11 +295,11 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
 ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
   const tenantId = routeTenant(c);
   if (!tenantId) return c.redirect("/admin", 302);
-  const user = await requireMember(c, tenantId);
-  if (!user) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
   assertSameOriginMutation(c);
   await readUrlEncodedForm(c);
-  const actor = { kind: "session" as const, tenantId, sub: user.sub };
+  const actor = { kind: "session" as const, tenantId, sub: user.sub, role: "owner" as const };
   const existing = await listApiKeys(c.env, tenantId);
   for (const key of existing) {
     if (!key.revoked_at) await revokeApiKey(c.env, tenantId, key.id, actor);
@@ -296,8 +327,8 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
 ui.post("/admin/workspaces/:tenantId/api-keys", async (c) => {
   const tenantId = routeTenant(c);
   if (!tenantId) return c.redirect("/admin", 302);
-  const user = await requireMember(c, tenantId);
-  if (!user) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
   assertSameOriginMutation(c);
   const form = await readUrlEncodedForm(c);
   const name = String(form.get("name") ?? "").trim();
@@ -307,6 +338,7 @@ ui.post("/admin/workspaces/:tenantId/api-keys", async (c) => {
       kind: "session",
       tenantId,
       sub: user.sub,
+      role: "owner",
     });
     const body = `
       <h1>API キーを発行しました</h1>
@@ -337,13 +369,13 @@ ui.post("/admin/workspaces/:tenantId/api-keys", async (c) => {
 ui.post("/admin/workspaces/:tenantId/api-keys/revoke", async (c) => {
   const tenantId = routeTenant(c);
   if (!tenantId) return c.redirect("/admin", 302);
-  const user = await requireMember(c, tenantId);
-  if (!user) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
   assertSameOriginMutation(c);
   const form = await readUrlEncodedForm(c);
   const keyId = String(form.get("key_id") ?? "");
   if (!normalizeUuid(keyId)) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
-  await revokeApiKey(c.env, tenantId, keyId, { kind: "session", tenantId, sub: user.sub });
+  await revokeApiKey(c.env, tenantId, keyId, { kind: "session", tenantId, sub: user.sub, role: "owner" });
   return c.redirect(`/admin/workspaces/${tenantId}`, 303);
 });
 
@@ -351,27 +383,43 @@ ui.post("/admin/workspaces/:tenantId/api-keys/revoke", async (c) => {
 /* Embed origin settings (per workspace)                               */
 /* ------------------------------------------------------------------ */
 
+function seriesTable(days: { date: string; count: number }[]): string {
+  const max = Math.max(1, ...days.map((day) => day.count));
+  const rows = days
+    .map((day) => {
+      const width = Math.round((day.count / max) * 100);
+      return `<div class="bar-row"><span>${escapeHtml(day.date)}</span><div class="bar-track" role="img" aria-label="${day.count} 件"><div class="bar-fill" style="width:${width}%"></div></div><strong>${day.count}</strong></div>`;
+    })
+    .join("");
+  return `<div role="region" aria-label="日次の送信件数">${rows}</div>`;
+}
+
 function settingsBody(
   tenantId: string,
   workspaceName: string,
   origins: string[],
   error: string | null,
+  owner: boolean,
+  extras: { quotas: string; members: string; webhooks: string },
 ): string {
   const tid = escapeHtml(tenantId);
   const items = origins
     .map(
       (origin) => `<li>
         <code>${escapeHtml(origin)}</code>
-        <form method="post" action="/admin/workspaces/${tid}/origins/remove" style="display:inline">
+        ${owner ? `<form method="post" action="/admin/workspaces/${tid}/origins/remove" style="display:inline">
           <input type="hidden" name="origin" value="${escapeHtml(origin)}">
           <button class="btn small" type="submit">削除</button>
-        </form>
+        </form>` : ""}
       </li>`,
     )
     .join("");
   return `
     <p class="muted small"><a href="/admin/workspaces/${tid}">ワークスペースに戻る</a></p>
-    <h1>埋め込み設定</h1>
+    <h1>ワークスペース設定</h1>
+    ${extras.quotas}
+    ${extras.members}
+    ${extras.webhooks}
     <p class="lead">${escapeHtml(workspaceName)} の投票を、別のサイトのブラウザから呼ぶときに許可するオリジンです。
     <code>https://vote.0g0.xyz</code> と同じサイトから使う場合は追加不要です。ワイルドカードやパスは使えません。</p>
     ${error ? `<div class="notice bad" role="alert">${escapeHtml(error)}</div>` : ""}
@@ -379,25 +427,70 @@ function settingsBody(
     <section class="card">
       ${items ? `<ul>${items}</ul>` : `<p class="muted">まだ許可しているオリジンはありません。この状態では、別サイトのブラウザから公開 API の応答を読めません。</p>`}
     </section>
-    <h2 id="origin-heading">許可するオリジンを追加</h2>
+    ${owner ? `<h2 id="origin-heading">許可するオリジンを追加</h2>
     <section class="card">
       <form method="post" action="/admin/workspaces/${tid}/origins" aria-labelledby="origin-heading">
         <label for="origin">オリジン <span class="hint">例: https://www.example.com 。https のみ（localhost は http も可）。</span></label>
         <input id="origin" name="origin" type="url" required maxlength="200" placeholder="https://www.example.com" spellcheck="false" autocapitalize="none" autocomplete="off" inputmode="url">
         <div class="actions"><button class="btn primary" type="submit">追加する</button></div>
       </form>
-    </section>
+    </section>` : `<p class="muted">許可オリジンの変更はオーナーだけが実行できます。</p>`}
     <h2>ワークスペースの書き出しと削除</h2>
     <section class="card">
       <p class="muted">書き出しには設問、集計、許可オリジン、キーのメタデータ、操作履歴が含まれます。投票者トークンやキーの秘密は含みません。</p>
       <p><a class="btn" href="/api/v1/tenants/${tid}/export">JSON で書き出す</a></p>
-      <form method="post" action="/admin/workspaces/${tid}/delete" aria-labelledby="delete-heading">
+      ${owner ? `<form method="post" action="/admin/workspaces/${tid}/delete" aria-labelledby="delete-heading">
         <h3 id="delete-heading">削除</h3>
         <label for="confirm-name">確認のためワークスペース名を入力</label>
         <input id="confirm-name" name="confirm_name" type="text" required maxlength="120" autocomplete="off">
         <div class="actions"><button class="btn danger" type="submit">ワークスペースを削除する</button></div>
-      </form>
+      </form>` : `<p class="muted">ワークスペースの削除はオーナーだけが実行できます。</p>`}
     </section>`;
+}
+
+async function settingsExtras(env: Env, tenantId: string, owner: boolean) {
+  const quotas = await tenantQuotas(env, tenantId);
+  const members = await listMembers(env, tenantId);
+  const hooks = await listWebhooks(env, tenantId);
+  const tid = escapeHtml(tenantId);
+  const memberItems = members
+    .map((member) => `<li><code>${escapeHtml(member.user_sub)}</code> ${member.role === "owner" ? "オーナー" : "メンバー"}
+      ${owner ? `<form method="post" action="/admin/workspaces/${tid}/members/role" style="display:inline">
+        <input type="hidden" name="user_sub" value="${escapeHtml(member.user_sub)}">
+        <input type="hidden" name="role" value="${member.role === "owner" ? "member" : "owner"}">
+        <button class="btn small" type="submit">${member.role === "owner" ? "メンバーにする" : "オーナーにする"}</button>
+      </form>
+      <form method="post" action="/admin/workspaces/${tid}/members/remove" style="display:inline">
+        <input type="hidden" name="user_sub" value="${escapeHtml(member.user_sub)}">
+        <button class="btn small danger" type="submit">外す</button>
+      </form>` : ""}
+    </li>`)
+    .join("");
+  const hookItems = hooks
+    .map((hook) => `<li><code>${escapeHtml(hook.url)}</code> ${hook.events.map((event) => escapeHtml(event)).join(", ")} ${hook.disabled_at ? '<span class="badge closed">停止</span>' : owner ? `<form method="post" action="/admin/workspaces/${tid}/webhooks/disable" style="display:inline"><input type="hidden" name="webhook_id" value="${escapeHtml(hook.id)}"><button class="btn small" type="submit">停止</button></form>` : ""}</li>`)
+    .join("");
+  return {
+    quotas: `<h2>利用上限</h2><section class="card"><p>プラン <strong>${escapeHtml(quotas.plan)}</strong>。投票 ${quotas.polls} 件、有効な API キー ${quotas.keys} 個、Webhook ${quotas.webhooks} 件、1 日の投票送信 ${quotas.votesPerDay} 件まで。上限はワークスペースに保存され、自分では引き上げられません。</p></section>`,
+    members: `<h2>メンバー</h2><section class="card">${memberItems ? `<ul>${memberItems}</ul>` : `<p class="muted">メンバーはいません。</p>`}
+      ${owner ? `<form method="post" action="/admin/workspaces/${tid}/members" aria-labelledby="member-heading">
+        <h3 id="member-heading">0g0-id の sub で追加</h3>
+        <label for="member-sub">sub</label>
+        <input id="member-sub" name="user_sub" type="text" required maxlength="256" autocomplete="off" spellcheck="false">
+        <label for="member-role">役割</label>
+        <select id="member-role" name="role"><option value="member" selected>メンバー</option><option value="owner">オーナー</option></select>
+        <div class="actions"><button class="btn" type="submit">追加する</button></div>
+      </form>` : `<p class="muted">メンバーの追加はオーナーだけが実行できます。招待メールはこのアプリから送りません。</p>`}
+    </section>`,
+    webhooks: `<h2>Webhook</h2><section class="card">
+      <p class="muted">投票の送信、公開、締切、更新を HTTPS の URL に送ります。署名は <code>X-Headless-Vote-Signature: v1=</code> と HMAC-SHA256 です。秘密は作成時に一度だけ表示し、保存時は暗号化します。投票者トークンや自由記述の本文は送りません。</p>
+      ${hookItems ? `<ul>${hookItems}</ul>` : `<p class="muted">Webhook はありません。</p>`}
+      ${owner ? `<form method="post" action="/admin/workspaces/${tid}/webhooks">
+        <label for="hook-url">URL</label>
+        <input id="hook-url" name="url" type="url" required maxlength="300" placeholder="https://example.com/hooks/vote" spellcheck="false" autocomplete="off">
+        <div class="actions"><button class="btn" type="submit">追加する</button></div>
+      </form>` : ""}
+    </section>`,
+  };
 }
 
 ui.get("/admin/workspaces/:tenantId/settings", async (c) => {
@@ -410,11 +503,12 @@ ui.get("/admin/workspaces/:tenantId/settings", async (c) => {
     .first<{ name: string }>();
   if (!tenant) return c.redirect("/admin", 302);
   const origins = await listTenantOrigins(c.env, tenantId);
+  const owner = (await memberRole(c.env, tenantId, user.sub)) === "owner";
   return c.html(
     layout({
-      title: "埋め込み設定",
+      title: "設定",
       userEmail: user.email ?? user.sub,
-      body: settingsBody(tenantId, tenant.name, origins, null),
+      body: settingsBody(tenantId, tenant.name, origins, null, owner, await settingsExtras(c.env, tenantId, owner)),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }),
@@ -424,8 +518,8 @@ ui.get("/admin/workspaces/:tenantId/settings", async (c) => {
 ui.post("/admin/workspaces/:tenantId/origins", async (c) => {
   const tenantId = routeTenant(c);
   if (!tenantId) return c.redirect("/admin", 302);
-  const user = await requireMember(c, tenantId);
-  if (!user) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
   assertSameOriginMutation(c);
   const form = await readUrlEncodedForm(c);
   try {
@@ -438,9 +532,9 @@ ui.post("/admin/workspaces/:tenantId/origins", async (c) => {
       const origins = await listTenantOrigins(c.env, tenantId);
       return c.html(
         layout({
-          title: "埋め込み設定",
+          title: "設定",
           userEmail: user.email ?? user.sub,
-          body: settingsBody(tenantId, tenant?.name ?? "", origins, err.message),
+          body: settingsBody(tenantId, tenant?.name ?? "", origins, err.message, true, await settingsExtras(c.env, tenantId, true)),
           origin: originOf(c),
           nonce: c.get("cspNonce") ?? "",
         }),
@@ -455,8 +549,8 @@ ui.post("/admin/workspaces/:tenantId/origins", async (c) => {
 ui.post("/admin/workspaces/:tenantId/origins/remove", async (c) => {
   const tenantId = routeTenant(c);
   if (!tenantId) return c.redirect("/admin", 302);
-  const user = await requireMember(c, tenantId);
-  if (!user) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
   assertSameOriginMutation(c);
   const form = await readUrlEncodedForm(c);
   await removeTenantOrigin(c.env, tenantId, String(form.get("origin") ?? ""));
@@ -466,8 +560,8 @@ ui.post("/admin/workspaces/:tenantId/origins/remove", async (c) => {
 ui.post("/admin/workspaces/:tenantId/delete", async (c) => {
   const tenantId = routeTenant(c);
   if (!tenantId) return c.redirect("/admin", 302);
-  const user = await requireMember(c, tenantId);
-  if (!user) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
   assertSameOriginMutation(c);
   const form = await readUrlEncodedForm(c);
   const tenant = await c.env.DB.prepare("SELECT name FROM tenants WHERE id = ?1")
@@ -476,17 +570,14 @@ ui.post("/admin/workspaces/:tenantId/delete", async (c) => {
   if (!tenant || String(form.get("confirm_name") ?? "") !== tenant.name) {
     const origins = await listTenantOrigins(c.env, tenantId);
     return c.html(layout({
-      title: "埋め込み設定",
+      title: "設定",
       userEmail: user.email ?? user.sub,
-      body: settingsBody(tenantId, tenant?.name ?? "", origins, "ワークスペース名が一致しません。"),
+      body: settingsBody(tenantId, tenant?.name ?? "", origins, "ワークスペース名が一致しません。", true, await settingsExtras(c.env, tenantId, true)),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }), 400);
   }
-  await c.env.DB.batch([
-    c.env.DB.prepare("DELETE FROM audit_events WHERE tenant_id = ?1").bind(tenantId),
-    c.env.DB.prepare("DELETE FROM tenants WHERE id = ?1").bind(tenantId),
-  ]);
+  await deleteWorkspace(c.env, tenantId);
   return c.redirect("/admin", 303);
 });
 
@@ -520,6 +611,231 @@ ui.get("/admin/workspaces/:tenantId/audit", async (c) => {
     origin: originOf(c),
     nonce: c.get("cspNonce") ?? "",
   }));
+});
+
+ui.get("/admin/workspaces/:tenantId/analytics", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  const days = await workspaceSubmissionSeries(c.env, tenantId);
+  const body = `
+    <p class="muted small"><a href="/admin/workspaces/${escapeHtml(tenantId)}">ワークスペースに戻る</a></p>
+    <h1>投票の推移</h1>
+    <p class="lead">直近 14 日の送信件数です。同じ人が投票をやり直すと、別の送信として数えます。人数ではありません。</p>
+    <section class="card">${seriesTable(days)}</section>`;
+  return c.html(layout({
+    title: "投票の推移",
+    userEmail: user.email ?? user.sub,
+    body,
+    origin: originOf(c),
+    nonce: c.get("cspNonce") ?? "",
+  }));
+});
+
+ui.get("/admin/workspaces/:tenantId/polls/:pollId/analytics", async (c) => {
+  const tenantId = routeTenant(c);
+  const pollId = normalizeUuid(c.req.param("pollId"));
+  if (!tenantId || !pollId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  const poll = await getPollRow(c.env, pollId);
+  if (!poll || poll.tenant_id !== tenantId) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
+  const days = await pollSubmissionSeries(c.env, poll.id);
+  const body = `
+    <p class="muted small"><a href="/admin/workspaces/${escapeHtml(tenantId)}/polls/${escapeHtml(poll.id)}/results">結果に戻る</a></p>
+    <h1>${escapeHtml(poll.question)}</h1>
+    <p class="lead">直近 14 日の送信件数です。人数ではなく、投票が保存された回数です。</p>
+    <section class="card">${seriesTable(days)}</section>`;
+  return c.html(layout({
+    title: "投票の推移",
+    userEmail: user.email ?? user.sub,
+    body,
+    origin: originOf(c),
+    nonce: c.get("cspNonce") ?? "",
+  }));
+});
+
+ui.post("/admin/workspaces/:tenantId/members", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  try {
+    await addMember(c.env, tenantId, String(form.get("user_sub") ?? ""), form.get("role") === "owner" ? "owner" : "member", {
+      kind: "session",
+      tenantId,
+      sub: user.sub,
+      role: "owner",
+    });
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    return c.html(layout({
+      title: "設定",
+      userEmail: user.email ?? user.sub,
+      body: `<h1>メンバーを追加できません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 400);
+  }
+  return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
+});
+
+ui.post("/admin/workspaces/:tenantId/members/role", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  try {
+    await setMemberRole(c.env, tenantId, String(form.get("user_sub") ?? ""), form.get("role"), {
+      kind: "session", tenantId, sub: user.sub, role: "owner",
+    });
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    return c.html(layout({
+      title: "設定",
+      userEmail: user.email ?? user.sub,
+      body: `<h1>役割を変更できません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 400);
+  }
+  return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
+});
+
+ui.post("/admin/workspaces/:tenantId/members/remove", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  try {
+    await removeMember(c.env, tenantId, String(form.get("user_sub") ?? ""), {
+      kind: "session", tenantId, sub: user.sub, role: "owner",
+    });
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    return c.html(layout({
+      title: "設定",
+      userEmail: user.email ?? user.sub,
+      body: `<h1>メンバーを外せません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 400);
+  }
+  return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
+});
+
+ui.post("/admin/workspaces/:tenantId/webhooks", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  try {
+    const created = await createWebhook(c.env, tenantId, String(form.get("url") ?? ""), [
+      "vote.cast", "poll.published", "poll.closed", "poll.updated",
+    ]);
+    const body = `
+      <h1>Webhook を追加しました</h1>
+      <section class="card">
+        <div class="notice"><strong>署名の秘密はこの画面でだけ表示されます。</strong> <code>X-Headless-Vote-Signature</code> の HMAC 鍵です。</div>
+        <p><code>${escapeHtml(created.secret)}</code></p>
+        <p class="muted">${escapeHtml(created.url)}</p>
+        <div class="actions"><a class="btn primary" href="/admin/workspaces/${escapeHtml(tenantId)}/settings">設定に戻る</a></div>
+      </section>`;
+    return c.html(layout({
+      title: "Webhook を追加しました",
+      userEmail: user.email ?? user.sub,
+      body,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }));
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    return c.html(layout({
+      title: "設定",
+      userEmail: user.email ?? user.sub,
+      body: `<h1>Webhook を追加できません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 400);
+  }
+});
+
+ui.post("/admin/workspaces/:tenantId/webhooks/disable", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  const id = String(form.get("webhook_id") ?? "");
+  if (normalizeUuid(id)) await disableWebhook(c.env, tenantId, id);
+  return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
+});
+
+ui.get("/admin/account", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user) return c.redirect("/admin", 302);
+  const memberships = await listMemberships(c.env, user.sub);
+  const rows = memberships
+    .map((m) => `<tr><td>${escapeHtml(m.name)}</td><td>${m.role === "owner" ? "オーナー" : "メンバー"}</td><td>${escapeHtml(m.plan)}</td></tr>`)
+    .join("");
+  const body = `
+    <h1>アカウント</h1>
+    <section class="card">
+      <h2>プロフィール</h2>
+      <p>名前: ${escapeHtml(user.name ?? "未設定")}</p>
+      <p>メール: ${escapeHtml(user.email ?? "未設定")}</p>
+      <p>sub: <code>${escapeHtml(user.sub)}</code></p>
+      <p class="muted">ログインは 0g0-id（OIDC）です。このアプリはパスワードを保存しないため、メール確認とパスワード再設定は 0g0-id 側の機能です。ここにはコピーした表示名とメールだけがあります。</p>
+    </section>
+    <h2>参加しているワークスペース</h2>
+    <section class="card">
+      ${rows ? `<div class="table-wrapper" tabindex="0" role="region" aria-label="ワークスペース"><table><thead><tr><th scope="col">名前</th><th scope="col">役割</th><th scope="col">プラン</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="muted">まだ参加していません。</p>`}
+      <p><a class="btn" href="/api/v1/me/export">自分のデータを JSON で書き出す</a></p>
+    </section>
+    <h2>このアプリ上のデータを削除</h2>
+    <section class="card">
+      <p class="muted">あなたが唯一のオーナーであるワークスペースは削除されます。他にオーナーがいるワークスペースでは、あなたの参加だけが外れます。0g0-id のアカウント自体は削除されません。</p>
+      <form method="post" action="/admin/account/delete">
+        <label for="confirm-delete">確認のため <code>delete my data</code> と入力</label>
+        <input id="confirm-delete" name="confirm" type="text" required maxlength="40" autocomplete="off">
+        <div class="actions"><button class="btn danger" type="submit">データを削除する</button></div>
+      </form>
+    </section>`;
+  return c.html(layout({
+    title: "アカウント",
+    userEmail: user.email ?? user.sub,
+    body,
+    origin: originOf(c),
+    nonce: c.get("cspNonce") ?? "",
+  }));
+});
+
+ui.post("/admin/account/delete", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  if (String(form.get("confirm") ?? "") !== "delete my data") {
+    return c.html(layout({
+      title: "アカウント",
+      userEmail: user.email ?? user.sub,
+      body: `<h1>削除できません</h1><p>確認の文字列が一致しません。</p><p><a href="/admin/account">戻る</a></p>`,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 400);
+  }
+  await deleteAccountData(c.env, user.sub);
+  return c.redirect("/", 303);
 });
 
 /* ------------------------------------------------------------------ */
@@ -853,7 +1169,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
       投票の実行: <code>POST ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/vote</code><br>
       結果の取得: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/results</code></p>
       ${poll.status === "draft" ? "" : `<h3>埋め込み用スニペット</h3>
-      <p class="muted small">別サイトから呼ぶときは、そのオリジンを埋め込み設定に追加してください。開始前は POLL_NOT_OPEN、締切後は POLL_CLOSED が返ります。</p>
+      <p class="muted small">別サイトから呼ぶときは、そのオリジンを設定画面の許可リストに追加してください。開始前は POLL_NOT_OPEN、締切後は POLL_CLOSED が返ります。</p>
       <div class="copyable">
         <span class="copy">
           <button type="button" class="btn small copy-button" command="--copy" commandfor="embed-snippet">スニペットをコピー</button>

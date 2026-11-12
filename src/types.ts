@@ -87,7 +87,7 @@ export type ApiScope = "read" | "write";
 
 export type AdminPrincipal =
   | { kind: "api_key"; tenantId: string; keyId: string; prefix: string; scope: ApiScope }
-  | { kind: "session"; tenantId: string; sub: string };
+  | { kind: "session"; tenantId: string; sub: string; role: "owner" | "member" };
 
 /** A signed-in 0g0-id user (admin UI session). */
 export interface SessionUser {

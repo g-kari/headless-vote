@@ -1,6 +1,8 @@
 import { Hono } from "hono";
+import { deleteAccountData, deleteWorkspace, listMemberships } from "../account";
+import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
-import { bearerToken, optionalVoterSub, requireAdmin } from "../auth";
+import { bearerToken, getSessionUser, optionalVoterSub, requireAdmin } from "../auth";
 import { ballotCount, upsertBallot } from "../ballots";
 import { addTenantOrigin, listTenantOrigins, removeTenantOrigin } from "../cors";
 import { randomId } from "../crypto";
@@ -22,6 +24,8 @@ import {
 } from "../domain";
 import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from "../errors";
 import { findActiveApiKey, issueApiKey, listApiKeys, provisionTenant, publicKey, revokeApiKey, rotatePresentedKey } from "../keys";
+import { addMember, listMembers, removeMember, setMemberRole } from "../members";
+import { assertDailyVoteQuota, recordVoteEvent, tenantQuotas } from "../quotas";
 import {
   ballotDocument,
   legacyQuestion,
@@ -32,7 +36,8 @@ import {
   updateQuestionText,
   type QuestionInput,
 } from "../questions";
-import { assertPlainText, isSafeImageKey, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
+import { assertPlainText, assertSameOriginMutation, isSafeImageKey, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
+import { createWebhook, disableWebhook, dispatchWebhooks, listWebhooks, WEBHOOK_EVENTS, type WebhookEvent } from "../webhooks";
 import type { Env, OptionRow, PollRow, TenantRow, Variables } from "../types";
 
 export const api = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -54,8 +59,6 @@ function originOf(c: { req: { url: string } }): string {
 /* ------------------------------------------------------------------ */
 
 /** Self-serve tenant creation (SaaS onboarding). The API key is shown once. */
-const MAX_POLLS = 100;
-
 api.post("/tenants", async (c) => {
   await rateLimitByIp(c, "tenant-create", 80, 3600);
   const body = await jsonBody(c);
@@ -90,7 +93,7 @@ api.get("/tenants/:tenantId/api-keys", async (c) => {
 
 api.post("/tenants/:tenantId/api-keys", async (c) => {
   const tenantId = c.req.param("tenantId");
-  const admin = await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
   const body = await jsonBody(c);
   const name = reqString(body, "name", { max: 80 });
   const scope = body["scope"];
@@ -101,7 +104,7 @@ api.post("/tenants/:tenantId/api-keys", async (c) => {
 
 api.post("/tenants/:tenantId/api-keys/:keyId/revoke", async (c) => {
   const tenantId = c.req.param("tenantId");
-  const admin = await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
   await revokeApiKey(c.env, tenantId, c.req.param("keyId"), admin);
   return c.json({ revoked: true });
 });
@@ -191,13 +194,14 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const questions = await questionInputsFromBody(c, tenantId, body, question, allowMultiple);
   const firstChoice = questions.find((q) => q.kind !== "text");
   const multiple = firstChoice ? firstChoice.kind === "multiple" : allowMultiple;
+  const quotas = await tenantQuotas(c.env, tenantId);
   const existingPolls = await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM polls WHERE tenant_id = ?1",
   )
     .bind(tenantId)
     .first<{ n: number }>();
-  if (Number(existingPolls?.n ?? 0) >= MAX_POLLS) {
-    throw conflict("QUOTA_EXCEEDED", `A workspace can have at most ${MAX_POLLS} polls`);
+  if (Number(existingPolls?.n ?? 0) >= quotas.polls) {
+    throw conflict("QUOTA_EXCEEDED", `A workspace can have at most ${quotas.polls} polls`);
   }
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
   const pollId = randomId();
@@ -390,6 +394,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
   }
 
   const updated = await getPollRow(c.env, poll.id);
+  await dispatchWebhooks(c.env, tenantId, "poll.updated", { poll_id: poll.id });
   return c.json({ poll: await renderPoll(c, updated as PollRow) });
 });
 
@@ -423,6 +428,8 @@ api.post("/tenants/:tenantId/polls/:pollId/status", async (c) => {
     target: poll.id,
     detail: `${poll.status}->${status}`,
   });
+  const event = status === "published" ? "poll.published" : status === "closed" ? "poll.closed" : "poll.updated";
+  await dispatchWebhooks(c.env, tenantId, event, { poll_id: poll.id, status });
   const updated = await getPollRow(c.env, poll.id);
   return c.json({ poll: await renderPoll(c, updated as PollRow) });
 });
@@ -515,10 +522,21 @@ api.post("/polls/:pollId/vote", async (c) => {
     voterKey = `anon:${trimmedToken}`;
   }
 
+  await assertDailyVoteQuota(c.env, poll.tenant_id);
   const questions = await listQuestionRows(c.env, poll.id);
   const options = await listOptionRows(c.env, poll.id);
   const answers = resolveAnswers(body, questions, options);
   await upsertBallot(c.env, poll.id, voterKey, ballotDocument(answers));
+  await recordVoteEvent(c.env, poll.id);
+  await dispatchWebhooks(c.env, poll.tenant_id, "vote.cast", {
+    poll_id: poll.id,
+    voter: sub ? "user" : "anonymous",
+    answers: answers.map((answer) => ({
+      question_id: answer.question_id,
+      option_ids: answer.option_ids,
+      text_length: answer.text ? answer.text.length : 0,
+    })),
+  });
 
   const results = await computeResults(c.env, originOf(c), poll);
   return c.json({
@@ -584,7 +602,7 @@ api.get("/tenants/:tenantId/origins", async (c) => {
 
 api.post("/tenants/:tenantId/origins", async (c) => {
   const tenantId = c.req.param("tenantId");
-  const admin = await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
   await rateLimitByIp(c, `origins:${tenantId}`, 60, 3600);
   const body = await jsonBody(c);
   const raw = body["origin"];
@@ -603,7 +621,7 @@ api.post("/tenants/:tenantId/origins", async (c) => {
 
 api.delete("/tenants/:tenantId/origins", async (c) => {
   const tenantId = c.req.param("tenantId");
-  const admin = await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
   const body = await jsonBody(c);
   const raw = body["origin"];
   if (typeof raw !== "string") throw badRequest('"origin" must be a string');
@@ -679,9 +697,175 @@ api.get("/tenants/:tenantId/export", async (c) => {
   });
 });
 
+api.get("/tenants/:tenantId/quotas", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  const quotas = await tenantQuotas(c.env, tenantId);
+  const polls = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM polls WHERE tenant_id = ?1")
+    .bind(tenantId)
+    .first<{ n: number }>();
+  const keys = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM api_keys WHERE tenant_id = ?1 AND revoked_at IS NULL",
+  )
+    .bind(tenantId)
+    .first<{ n: number }>();
+  const hooks = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM webhooks WHERE tenant_id = ?1 AND disabled_at IS NULL",
+  )
+    .bind(tenantId)
+    .first<{ n: number }>();
+  return c.json({
+    plan: quotas.plan,
+    limits: {
+      polls: quotas.polls,
+      api_keys: quotas.keys,
+      webhooks: quotas.webhooks,
+      votes_per_day: quotas.votesPerDay,
+    },
+    used: {
+      polls: Number(polls?.n ?? 0),
+      api_keys: Number(keys?.n ?? 0),
+      webhooks: Number(hooks?.n ?? 0),
+    },
+  });
+});
+
+api.get("/tenants/:tenantId/analytics", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  return c.json({
+    days: await workspaceSubmissionSeries(c.env, tenantId),
+    note: "Counts are submission events, not unique people.",
+  });
+});
+
+api.get("/tenants/:tenantId/polls/:pollId/analytics", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  const poll = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
+  return c.json({
+    poll_id: poll.id,
+    days: await pollSubmissionSeries(c.env, poll.id),
+    note: "Counts are submission events, not unique people.",
+  });
+});
+
+api.get("/tenants/:tenantId/members", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  return c.json({ members: await listMembers(c.env, tenantId) });
+});
+
+api.post("/tenants/:tenantId/members", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
+  const body = await jsonBody(c);
+  const sub = body["user_sub"];
+  if (typeof sub !== "string") throw badRequest('"user_sub" must be a string');
+  const member = await addMember(c.env, tenantId, sub, body["role"] ?? "member", admin);
+  return c.json({ member }, 201);
+});
+
+api.patch("/tenants/:tenantId/members", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
+  const body = await jsonBody(c);
+  const sub = body["user_sub"];
+  if (typeof sub !== "string") throw badRequest('"user_sub" must be a string');
+  await setMemberRole(c.env, tenantId, sub, body["role"], admin);
+  return c.json({ updated: true });
+});
+
+api.delete("/tenants/:tenantId/members", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
+  const body = await jsonBody(c);
+  const sub = body["user_sub"];
+  if (typeof sub !== "string") throw badRequest('"user_sub" must be a string');
+  await removeMember(c.env, tenantId, sub, admin);
+  return c.json({ removed: true });
+});
+
+api.get("/tenants/:tenantId/webhooks", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  return c.json({ webhooks: await listWebhooks(c.env, tenantId) });
+});
+
+api.post("/tenants/:tenantId/webhooks", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
+  const body = await jsonBody(c);
+  const url = body["url"];
+  if (typeof url !== "string") throw badRequest('"url" must be a string');
+  const rawEvents = body["events"];
+  const events = Array.isArray(rawEvents) && rawEvents.length > 0
+    ? rawEvents.filter((event): event is WebhookEvent => typeof event === "string" && (WEBHOOK_EVENTS as readonly string[]).includes(event))
+    : [...WEBHOOK_EVENTS];
+  const created = await createWebhook(c.env, tenantId, url, events);
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "webhook.create",
+    target: created.id,
+    detail: created.url.slice(0, 200),
+  });
+  return c.json({ webhook: { id: created.id, url: created.url, events }, secret: created.secret }, 201);
+});
+
+api.post("/tenants/:tenantId/webhooks/:webhookId/disable", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
+  const ok = await disableWebhook(c.env, tenantId, c.req.param("webhookId"));
+  if (!ok) throw notFound("Webhook not found");
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "webhook.disable",
+    target: c.req.param("webhookId"),
+  });
+  return c.json({ disabled: true });
+});
+
+api.get("/me", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user) throw unauthorized("UNAUTHORIZED", "Sign in required");
+  return c.json({
+    profile: { sub: user.sub, email: user.email, name: user.name },
+    auth: "oidc",
+    password: null,
+    note: "Sign-in, email verification, and password reset are handled by 0g0-id. This app stores no password.",
+    workspaces: await listMemberships(c.env, user.sub),
+  });
+});
+
+api.get("/me/export", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user) throw unauthorized("UNAUTHORIZED", "Sign in required");
+  c.header("content-disposition", 'attachment; filename="account.json"');
+  c.header("cache-control", "private, no-store");
+  return c.json({
+    profile: { sub: user.sub, email: user.email, name: user.name },
+    workspaces: await listMemberships(c.env, user.sub),
+    note: "Secrets, voter tokens, and free-text answers are omitted.",
+  });
+});
+
+api.delete("/me", async (c) => {
+  assertSameOriginMutation(c);
+  const user = await getSessionUser(c);
+  if (!user) throw unauthorized("UNAUTHORIZED", "Sign in required");
+  const body = await jsonBody(c);
+  if (body["confirm"] !== "delete my data") {
+    throw badRequest('Send {"confirm":"delete my data"} to delete this app\'s copy of your data');
+  }
+  const result = await deleteAccountData(c.env, user.sub);
+  return c.json({ deleted: true, ...result, idp_account: "unchanged" });
+});
+
 api.delete("/tenants/:tenantId", async (c) => {
   const tenantId = c.req.param("tenantId");
-  const admin = await requireAdmin(c, tenantId);
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
   const body = await jsonBody(c);
   const confirm = body["confirm_name"];
   if (typeof confirm !== "string") throw badRequest('"confirm_name" must match the workspace name');
@@ -696,7 +880,7 @@ api.delete("/tenants/:tenantId", async (c) => {
     action: "tenant.delete",
     detail: tenant.name.slice(0, 80),
   });
-  await c.env.DB.prepare("DELETE FROM tenants WHERE id = ?1").bind(tenantId).run();
+  await deleteWorkspace(c.env, tenantId);
   return c.json({ deleted: true });
 });
 

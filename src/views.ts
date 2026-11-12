@@ -137,6 +137,7 @@ export function layout(opts: {
 }): string {
   const userArea = opts.userEmail
     ? `<span class="user">${escapeHtml(opts.userEmail)}</span>
+       <a class="btn small" href="/admin/account">アカウント</a>
        <form method="post" action="/admin/logout" style="margin:0"><button class="btn small" type="submit">ログアウト</button></form>`
     : `<a class="btn small primary" href="/admin/login">0g0-id でログイン</a>`;
   return `<!doctype html>

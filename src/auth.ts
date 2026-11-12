@@ -171,10 +171,29 @@ export async function listTenantsForUser(
  * - `Authorization: Bearer <tenant API key>` for that tenant, or
  * - a valid admin-UI session whose user is a member of that tenant.
  */
+export async function memberRole(
+  env: Env,
+  tenantId: string,
+  sub: string,
+): Promise<"owner" | "member" | null> {
+  const row = await env.DB.prepare(
+    "SELECT role FROM tenant_members WHERE tenant_id = ?1 AND user_sub = ?2",
+  )
+    .bind(tenantId, sub)
+    .first<{ role: string }>();
+  if (!row) return null;
+  return row.role === "owner" ? "owner" : "member";
+}
+
+/**
+ * `access: "owner"` is required for members, keys, webhooks, origins, and deletion.
+ * A write API key counts as owner. A read key does not.
+ */
 export async function requireAdmin(
   c: Ctx,
   tenantId: string,
   need: ApiScope = "write",
+  access: "member" | "owner" = "member",
 ): Promise<AdminPrincipal> {
   const token = bearerToken(c);
   if (token) {
@@ -184,6 +203,9 @@ export async function requireAdmin(
     }
     if (need === "write" && found.key.scope !== "write") {
       throw forbidden("This API key is read-only");
+    }
+    if (access === "owner" && found.key.scope !== "write") {
+      throw forbidden("Owner access is required");
     }
     await touchApiKey(c.env, found.key.id);
     return {
@@ -199,8 +221,10 @@ export async function requireAdmin(
     assertSameOriginMutation(c);
   }
   const user = await getSessionUser(c);
-  if (user && (await isTenantMember(c.env, tenantId, user.sub))) {
-    return { kind: "session", tenantId, sub: user.sub };
+  const role = user ? await memberRole(c.env, tenantId, user.sub) : null;
+  if (user && role) {
+    if (access === "owner" && role !== "owner") throw forbidden("Owner access is required");
+    return { kind: "session", tenantId, sub: user.sub, role };
   }
   throw unauthorized("UNAUTHORIZED", "Admin authentication required");
 }

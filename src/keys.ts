@@ -1,10 +1,9 @@
 import { actorLabel, recordAudit } from "./audit";
 import { randomId, randomToken, sha256Hex } from "./crypto";
 import { badRequest, notFound } from "./errors";
+import { tenantQuotas } from "./quotas";
 import { assertPlainText } from "./security";
 import type { AdminPrincipal, ApiScope, Env, TenantRow } from "./types";
-
-export const MAX_ACTIVE_KEYS = 10;
 export type { ApiScope };
 
 export interface ApiKeyRow {
@@ -162,13 +161,14 @@ export async function issueApiKey(
   assertPlainText(name);
   if (name.length < 1 || name.length > 80) throw badRequest('"name" must be 1-80 characters');
   if (scope !== "read" && scope !== "write") throw badRequest('"scope" must be read or write');
+  const quotas = await tenantQuotas(env, tenantId);
   const active = await env.DB.prepare(
     "SELECT COUNT(*) AS n FROM api_keys WHERE tenant_id = ?1 AND revoked_at IS NULL",
   )
     .bind(tenantId)
     .first<{ n: number }>();
-  if (Number(active?.n ?? 0) >= MAX_ACTIVE_KEYS) {
-    throw badRequest(`A workspace can have at most ${MAX_ACTIVE_KEYS} active API keys`);
+  if (Number(active?.n ?? 0) >= quotas.keys) {
+    throw badRequest(`A workspace can have at most ${quotas.keys} active API keys`);
   }
   const apiKey = randomToken("hvk");
   const now = new Date().toISOString();
