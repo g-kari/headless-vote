@@ -77,6 +77,8 @@ describe("0g0-id login flow for the admin UI", () => {
     expect(adminRes.status).toBe(200);
     const adminHtml = await adminRes.text();
     expect(adminHtml).toContain("ワークスペース");
+    const csrf = /name="csrf_token" value="([0-9a-f]{64})"/.exec(adminHtml)?.[1];
+    expect(csrf).toBeTruthy();
 
     const createRes = await SELF.fetch(`${BASE}/admin/workspaces`, {
       method: "POST",
@@ -84,7 +86,7 @@ describe("0g0-id login flow for the admin UI", () => {
         cookie: `hv_session=${session}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ name: "私の投票所" }).toString(),
+      body: new URLSearchParams({ name: "私の投票所", csrf_token: csrf as string }).toString(),
     });
     expect(createRes.status).toBe(200);
     const createdHtml = await createRes.text();

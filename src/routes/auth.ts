@@ -2,13 +2,17 @@ import { Hono } from "hono";
 import {
   clearFlowCookie,
   clearSessionCookie,
+  getSessionUser,
   makeFlowCookie,
   newSessionCookieForToken,
   readFlowCookie,
+  revokeCurrentSession,
+  verifyCsrfToken,
 } from "../auth";
-import { pkceChallenge, randomToken } from "../crypto";
-import { badRequest } from "../errors";
+import { pkceChallenge, randomToken, timingSafeEqual } from "../crypto";
+import { badRequest, forbidden } from "../errors";
 import { exchangeCode, getDiscovery, verifyJwt } from "../oidc";
+import { clientIp, enforceRateLimit, HOUR, LIMITS } from "../rate-limit";
 import type { Env, Variables } from "../types";
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -19,6 +23,13 @@ function redirectUri(c: { req: { url: string } }): string {
 
 /** Start the 0g0-id login (authorization code flow + PKCE S256). */
 authRoutes.get("/admin/login", async (c) => {
+  await enforceRateLimit(
+    c.env,
+    "login-start",
+    clientIp(c),
+    LIMITS.loginStartPerIpPerHour,
+    HOUR,
+  );
   if (!c.env.OIDC_CLIENT_ID) {
     return c.html(
       "<!doctype html><meta charset=utf-8><title>Login not configured</title>" +
@@ -59,7 +70,7 @@ authRoutes.get("/auth/callback", async (c) => {
   if (error) throw badRequest(`Login failed at 0g0-id: ${error}`);
   if (!code || !state) throw badRequest("Missing code/state in callback");
   const flow = await readFlowCookie(c);
-  if (!flow || flow.state !== state) {
+  if (!flow || !timingSafeEqual(flow.state, state)) {
     throw badRequest("Login flow expired or state mismatch. Please try again.");
   }
   const { idToken } = await exchangeCode(c.env, {
@@ -77,13 +88,32 @@ authRoutes.get("/auth/callback", async (c) => {
   return c.redirect("/admin", 302);
 });
 
-authRoutes.post("/admin/logout", (c) => {
-  c.header("Set-Cookie", clearSessionCookie());
-  return c.redirect("/admin", 302);
-});
-
-/** Logout that also works from a plain link (GET). */
-authRoutes.get("/admin/logout", (c) => {
+/**
+ * Logout is POST-only (a GET here would be a logout-CSRF) and requires
+ * the session's CSRF token. The server-side session row is revoked, so
+ * the cookie value stops working immediately, not just in this browser.
+ *
+ * Note on RP-initiated logout: the discovery document advertises an
+ * end_session_endpoint, but it currently answers browser GETs with 404
+ * (verified 2026-11-13), so redirecting there would strand the user on
+ * an error page. Local logout + revocation is the reliable behavior
+ * until 0g0-id serves a browser logout flow.
+ */
+authRoutes.post("/admin/logout", async (c) => {
+  const user = await getSessionUser(c);
+  if (user) {
+    let token: string | null = null;
+    try {
+      const form = await c.req.formData();
+      token = String(form.get("csrf_token") ?? "") || null;
+    } catch {
+      token = null;
+    }
+    if (!(await verifyCsrfToken(c, token))) {
+      throw forbidden("CSRF token is missing or invalid");
+    }
+    await revokeCurrentSession(c);
+  }
   c.header("Set-Cookie", clearSessionCookie());
   return c.redirect("/admin", 302);
 });

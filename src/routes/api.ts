@@ -15,6 +15,13 @@ import {
   reqString,
 } from "../domain";
 import { ApiError, badRequest, conflict, notFound, payloadTooLarge, unauthorized } from "../errors";
+import { sniffImageExt } from "../image-format";
+import { clientIp, enforceRateLimit, HOUR, LIMITS } from "../rate-limit";
+import {
+  anonVoterKey,
+  migrateLegacyAnonVoterKeys,
+  userVoterKey,
+} from "../voter-keys";
 import type { Env, OptionRow, PollRow, TenantRow, Variables } from "../types";
 
 export const api = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -26,6 +33,9 @@ const IMAGE_TYPES: Record<string, string> = {
   "image/webp": "webp",
   "image/gif": "gif",
 };
+/** Per-tenant image quota: count and total bytes across all uploads. */
+const MAX_IMAGES_PER_TENANT = 500;
+const MAX_IMAGE_BYTES_PER_TENANT = 500 * 1024 * 1024;
 
 function originOf(c: { req: { url: string } }): string {
   return new URL(c.req.url).origin;
@@ -37,6 +47,14 @@ function originOf(c: { req: { url: string } }): string {
 
 /** Self-serve tenant creation (SaaS onboarding). The API key is shown once. */
 api.post("/tenants", async (c) => {
+  // Unauthenticated endpoint: bound tenant minting per source IP.
+  await enforceRateLimit(
+    c.env,
+    "tenant-create",
+    clientIp(c),
+    LIMITS.tenantCreatePerIpPerHour,
+    HOUR,
+  );
   const body = await jsonBody(c);
   const name = reqString(body, "name", { max: 120 });
   const tenantId = randomId();
@@ -56,6 +74,13 @@ api.post("/tenants", async (c) => {
 /** Rotate the tenant API key (authenticated with the current key). */
 api.post("/tenants/:tenantId/rotate-key", async (c) => {
   const tenantId = c.req.param("tenantId");
+  await enforceRateLimit(
+    c.env,
+    "rotate-key",
+    tenantId,
+    LIMITS.rotateKeyPerTenantPerHour,
+    HOUR,
+  );
   const token = c.req.header("authorization")?.replace(/^Bearer\s+/i, "").trim();
   if (!token) throw unauthorized("UNAUTHORIZED", "API key required");
   const tenant = await findTenantByApiKey(c.env, token);
@@ -313,12 +338,60 @@ api.get("/tenants/:tenantId/polls/:pollId/results", async (c) => {
 /* Admin: image upload (R2)                                            */
 /* ------------------------------------------------------------------ */
 
+interface ImageUsage {
+  image_count: number;
+  total_bytes: number;
+}
+
+/**
+ * Per-tenant image usage. The bookkeeping row is initialized from the
+ * actual R2 prefix on first use, so images uploaded before quotas
+ * existed are counted too.
+ */
+async function getImageUsage(env: Env, tenantId: string): Promise<ImageUsage> {
+  const row = await env.DB.prepare(
+    "SELECT image_count, total_bytes FROM tenant_image_usage WHERE tenant_id = ?1",
+  )
+    .bind(tenantId)
+    .first<ImageUsage>();
+  if (row) return row;
+  let count = 0;
+  let bytes = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await env.IMAGES.list({
+      prefix: `t/${tenantId}/`,
+      limit: 1000,
+      cursor,
+    });
+    for (const obj of page.objects) {
+      count += 1;
+      bytes += obj.size;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at)
+     VALUES (?1, ?2, ?3, ?4)`,
+  )
+    .bind(tenantId, count, bytes, nowIso())
+    .run();
+  return { image_count: count, total_bytes: bytes };
+}
+
 api.post("/tenants/:tenantId/images", async (c) => {
   const tenantId = c.req.param("tenantId");
   await requireAdmin(c, tenantId);
+  await enforceRateLimit(
+    c.env,
+    "image-upload",
+    tenantId,
+    LIMITS.imageUploadPerTenantPerHour,
+    HOUR,
+  );
   const contentType = (c.req.header("content-type") ?? "").split(";")[0]?.trim() ?? "";
-  const ext = IMAGE_TYPES[contentType];
-  if (!ext) {
+  const declaredExt = IMAGE_TYPES[contentType];
+  if (!declaredExt) {
     throw badRequest("Content-Type must be image/png, image/jpeg, image/webp or image/gif");
   }
   const data = await c.req.arrayBuffer();
@@ -326,8 +399,38 @@ api.post("/tenants/:tenantId/images", async (c) => {
   if (data.byteLength > MAX_IMAGE_BYTES) {
     throw payloadTooLarge("Image must be at most 5 MiB");
   }
-  const key = `t/${tenantId}/${randomId()}.${ext}`;
+  // The declared type is not trusted: the magic bytes must match it.
+  const sniffedExt = sniffImageExt(data);
+  if (sniffedExt === null || sniffedExt !== declaredExt) {
+    throw badRequest("Image contents do not match the declared image type");
+  }
+  const usage = await getImageUsage(c.env, tenantId);
+  if (usage.image_count >= MAX_IMAGES_PER_TENANT) {
+    throw new ApiError(
+      429,
+      "IMAGE_QUOTA_EXCEEDED",
+      `Image count quota reached for this workspace (${MAX_IMAGES_PER_TENANT} images)`,
+    );
+  }
+  if (usage.total_bytes + data.byteLength > MAX_IMAGE_BYTES_PER_TENANT) {
+    throw new ApiError(
+      429,
+      "IMAGE_QUOTA_EXCEEDED",
+      "Image storage quota reached for this workspace (500 MiB total)",
+    );
+  }
+  const key = `t/${tenantId}/${randomId()}.${declaredExt}`;
   await c.env.IMAGES.put(key, data, { httpMetadata: { contentType } });
+  await c.env.DB.prepare(
+    `INSERT INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at)
+     VALUES (?1, 1, ?2, ?3)
+     ON CONFLICT (tenant_id) DO UPDATE SET
+       image_count = image_count + 1,
+       total_bytes = total_bytes + excluded.total_bytes,
+       updated_at = excluded.updated_at`,
+  )
+    .bind(tenantId, data.byteLength, nowIso())
+    .run();
   return c.json({ key, url: `${originOf(c)}/images/${key}` }, 201);
 });
 
@@ -354,17 +457,39 @@ api.get("/polls/:pollId/results", async (c) => {
 
 api.post("/polls/:pollId/vote", async (c) => {
   const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
+  await enforceRateLimit(
+    c.env,
+    "vote",
+    `${poll.id}:${clientIp(c)}`,
+    LIMITS.votePerPollIpPerHour,
+    HOUR,
+  );
   if (isClosedForVoting(poll)) {
     throw conflict("POLL_CLOSED", "This poll is closed for voting");
   }
+  await migrateLegacyAnonVoterKeys(c.env, poll.id);
 
   // Voter identity: logged-in (0g0-id sub) wins over anonymous voter token.
   const sub = await optionalVoterSub(c);
   const body = await jsonBody(c);
 
+  // A voter_token, when present and valid, identifies the anonymous
+  // ballot this voter cast before logging in.
+  const rawToken = body["voter_token"];
+  const presentedToken =
+    typeof rawToken === "string" &&
+    rawToken.trim().length >= 8 &&
+    rawToken.trim().length <= 128
+      ? rawToken.trim()
+      : null;
+
   let voterKey: string;
+  let claimedAnonKey: string | null = null;
   if (sub) {
-    voterKey = `user:${sub}`;
+    voterKey = userVoterKey(sub);
+    if (presentedToken !== null) {
+      claimedAnonKey = await anonVoterKey(c.env.SESSION_SECRET, presentedToken);
+    }
   } else {
     if (poll.require_login === 1) {
       throw unauthorized(
@@ -372,17 +497,12 @@ api.post("/polls/:pollId/vote", async (c) => {
         "This poll requires voters to log in with 0g0-id",
       );
     }
-    const voterToken = body["voter_token"];
-    if (
-      typeof voterToken !== "string" ||
-      voterToken.trim().length < 8 ||
-      voterToken.trim().length > 128
-    ) {
+    if (presentedToken === null) {
       throw badRequest(
         '"voter_token" (8-128 chars) is required when voting anonymously',
       );
     }
-    voterKey = `anon:${voterToken.trim()}`;
+    voterKey = await anonVoterKey(c.env.SESSION_SECRET, presentedToken);
   }
 
   const rawOptionIds = body["option_ids"];
@@ -403,12 +523,22 @@ api.post("/polls/:pollId/vote", async (c) => {
   }
 
   // One person, one vote: replace any previous selections atomically.
+  // When a logged-in vote also presents the voter's anonymous token,
+  // the anonymous ballot is folded into the login identity in the same
+  // batch, so the person is not counted twice on this poll.
   const now = nowIso();
   const stmts = [
     c.env.DB.prepare("DELETE FROM votes WHERE poll_id = ?1 AND voter_key = ?2").bind(
       poll.id,
       voterKey,
     ),
+    ...(claimedAnonKey && claimedAnonKey !== voterKey
+      ? [
+          c.env.DB.prepare(
+            "DELETE FROM votes WHERE poll_id = ?1 AND voter_key = ?2",
+          ).bind(poll.id, claimedAnonKey),
+        ]
+      : []),
     ...(optionIds as string[]).map((optionId) =>
       c.env.DB.prepare(
         `INSERT INTO votes (id, poll_id, option_id, voter_key, created_at, updated_at)
@@ -440,6 +570,17 @@ export async function serveImage(
   if (!obj) throw notFound("Image not found");
   const headers = new Headers();
   obj.writeHttpMetadata(headers);
+  // The served type follows the key's whitelisted extension, never
+  // stored metadata, and nosniff is set explicitly by the Worker.
+  const ext = key.slice(key.lastIndexOf(".") + 1);
+  const servedType: Record<string, string> = {
+    png: "image/png",
+    jpg: "image/jpeg",
+    webp: "image/webp",
+    gif: "image/gif",
+  };
+  headers.set("content-type", servedType[ext] ?? "application/octet-stream");
+  headers.set("x-content-type-options", "nosniff");
   headers.set("etag", obj.httpEtag);
   headers.set("cache-control", "public, max-age=86400, immutable");
   return new Response(obj.body, { headers });

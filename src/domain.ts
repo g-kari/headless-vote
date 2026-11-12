@@ -1,4 +1,5 @@
 import { badRequest } from "./errors";
+import { migrateLegacyAnonVoterKeys } from "./voter-keys";
 import type { AppContext, Env, OptionRow, PollRow } from "./types";
 
 /** Parse a JSON request body, or throw a uniform 400. */
@@ -135,6 +136,9 @@ export async function computeResults(
   origin: string,
   poll: PollRow,
 ): Promise<PollResults> {
+  // Counting is by voter key, so make sure any legacy plaintext anon
+  // keys have been rewritten to the HMAC form first.
+  await migrateLegacyAnonVoterKeys(env, poll.id);
   const options = await listOptionRows(env, poll.id);
   const counts = await env.DB.prepare(
     "SELECT option_id, COUNT(*) AS votes FROM votes WHERE poll_id = ?1 GROUP BY option_id",

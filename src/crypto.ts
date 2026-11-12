@@ -88,6 +88,15 @@ export async function verifySignedValue<T>(
   }
 }
 
+/** HMAC-SHA256 of `value` keyed with `secret`, hex encoded. */
+export async function hmacSha256Hex(secret: string, value: string): Promise<string> {
+  const key = await hmacKey(secret);
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
+  return [...new Uint8Array(sig)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 /** PKCE (RFC 7636) S256 challenge for a verifier. */
 export async function pkceChallenge(verifier: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", encoder.encode(verifier));

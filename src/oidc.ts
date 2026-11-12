@@ -12,6 +12,7 @@ export interface OidcDiscovery {
   token_endpoint: string;
   jwks_uri: string;
   registration_endpoint?: string;
+  end_session_endpoint?: string;
 }
 
 let discoveryCache: { issuer: string; doc: OidcDiscovery } | null = null;
@@ -76,12 +77,19 @@ function decodeJsonPart(part: string): Record<string, unknown> {
   ) as Record<string, unknown>;
 }
 
+/** Clock-skew allowance (seconds) applied to exp / nbf / iat checks. */
+const CLOCK_SKEW_SECONDS = 60;
+
 /**
  * Verify a JWT issued by the configured issuer.
  * - Signature: ES256 against JWKS.
  * - iss must match the issuer exactly.
- * - exp must be in the future (nbf honored when present).
- * - When `audience` is given, aud must contain it.
+ * - exp must be in the future and iat must be present and sane
+ *   (not in the future, not after exp), with a small clock-skew
+ *   allowance; nbf is honored when present.
+ * - When `audience` is given, aud must contain it; with multiple
+ *   audiences, azp must name the expected audience (OIDC Core 3.1.3.7),
+ *   and a present azp must always match it.
  * - When `nonce` is given, the nonce claim must match.
  */
 export async function verifyJwt(
@@ -101,14 +109,31 @@ export async function verifyJwt(
 
   const nowSeconds = Math.floor(Date.now() / 1000);
   const exp = claims["exp"];
-  if (typeof exp !== "number" || exp <= nowSeconds) throw new Error("token expired");
+  if (typeof exp !== "number" || exp <= nowSeconds - CLOCK_SKEW_SECONDS) {
+    throw new Error("token expired");
+  }
   const nbf = claims["nbf"];
-  if (typeof nbf === "number" && nbf > nowSeconds) throw new Error("token not yet valid");
+  if (typeof nbf === "number" && nbf > nowSeconds + CLOCK_SKEW_SECONDS) {
+    throw new Error("token not yet valid");
+  }
+  const iat = claims["iat"];
+  if (typeof iat !== "number" || !Number.isFinite(iat)) {
+    throw new Error("token has no valid iat");
+  }
+  if (iat > nowSeconds + CLOCK_SKEW_SECONDS) throw new Error("token issued in the future");
+  if (iat > exp) throw new Error("token iat is after exp");
 
   if (opts.audience) {
     const aud = claims["aud"];
     const audiences = Array.isArray(aud) ? aud : aud ? [aud] : [];
     if (!audiences.includes(opts.audience)) throw new Error("audience mismatch");
+    const azp = claims["azp"];
+    if (audiences.length > 1 && azp !== opts.audience) {
+      throw new Error("azp mismatch for multi-audience token");
+    }
+    if (azp !== undefined && azp !== opts.audience) {
+      throw new Error("azp mismatch");
+    }
   }
   if (opts.nonce !== undefined && claims["nonce"] !== opts.nonce) {
     throw new Error("nonce mismatch");
