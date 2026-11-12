@@ -34,6 +34,8 @@ function setSecurityHeaders(h: Headers): void {
   h.set("strict-transport-security", "max-age=31536000; includeSubDomains");
   h.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
   h.set("cross-origin-opener-policy", "same-origin");
+  const type = h.get("content-type") ?? "";
+  if (type.includes("text/html") || type.includes("application/json")) h.set("cache-control", "no-store");
 }
 
 export function applySecurityHeaders(res: Response): Response {

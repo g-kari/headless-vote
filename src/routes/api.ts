@@ -16,6 +16,8 @@ import {
 } from "../domain";
 import { ApiError, badRequest, conflict, notFound, payloadTooLarge, unauthorized } from "../errors";
 import { sniffImageExt } from "../image-format";
+import { putImageWithQuota } from "../image-quota";
+import { readBodyLimited } from "../body-limit";
 import { clientIp, enforceRateLimit, HOUR, LIMITS } from "../rate-limit";
 import {
   anonVoterKey,
@@ -33,9 +35,6 @@ const IMAGE_TYPES: Record<string, string> = {
   "image/webp": "webp",
   "image/gif": "gif",
 };
-/** Per-tenant image quota: count and total bytes across all uploads. */
-const MAX_IMAGES_PER_TENANT = 500;
-const MAX_IMAGE_BYTES_PER_TENANT = 500 * 1024 * 1024;
 
 function originOf(c: { req: { url: string } }): string {
   return new URL(c.req.url).origin;
@@ -82,6 +81,12 @@ api.post("/tenants", async (c) => {
 /** Rotate the tenant API key (authenticated with the current key). */
 api.post("/tenants/:tenantId/rotate-key", async (c) => {
   const tenantId = c.req.param("tenantId");
+  const token = c.req.header("authorization")?.replace(/^Bearer\s+/i, "").trim();
+  if (!token) throw unauthorized("UNAUTHORIZED", "API key required");
+  const tenant = await findTenantByApiKey(c.env, token);
+  if (!tenant || tenant.id !== tenantId) {
+    throw unauthorized("INVALID_API_KEY", "API key is not valid for this tenant");
+  }
   await enforceRateLimit(
     c.env,
     "rotate-key",
@@ -89,16 +94,11 @@ api.post("/tenants/:tenantId/rotate-key", async (c) => {
     LIMITS.rotateKeyPerTenantPerHour,
     HOUR,
   );
-  const token = c.req.header("authorization")?.replace(/^Bearer\s+/i, "").trim();
-  if (!token) throw unauthorized("UNAUTHORIZED", "API key required");
-  const tenant = await findTenantByApiKey(c.env, token);
-  if (!tenant || tenant.id !== tenantId) {
-    throw unauthorized("INVALID_API_KEY", "API key is not valid for this tenant");
-  }
   const apiKey = randomToken("hvk");
-  await c.env.DB.prepare("UPDATE tenants SET api_key_hash = ?1 WHERE id = ?2")
-    .bind(await sha256Hex(apiKey), tenantId)
+  const rotated = await c.env.DB.prepare("UPDATE tenants SET api_key_hash = ?1 WHERE id = ?2 AND api_key_hash = ?3")
+    .bind(await sha256Hex(apiKey), tenantId, tenant.api_key_hash)
     .run();
+  if (rotated.meta.changes !== 1) throw conflict("KEY_CHANGED", "API key changed. Authenticate again.");
   return c.json({ api_key: apiKey });
 });
 
@@ -152,6 +152,32 @@ async function insertOptions(
     ).bind(randomId(), pollId, o.label, o.image_key, i, now),
   );
   await env.DB.batch(stmts);
+}
+
+/** The CHECK constraint aborts the whole batch, including preceding ballot deletes.
+ * Guard rows never survive a successful transaction; failed batches roll back.
+ */
+export async function guardedPollBatch(
+  env: Env,
+  predicate: string,
+  values: (string | number | null)[],
+  statements: D1PreparedStatement[],
+): Promise<void> {
+  const id = randomId();
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO poll_mutation_guards (id, valid)
+        VALUES (?1, CASE WHEN ${predicate} THEN 1 ELSE 0 END)`).bind(id, ...values),
+      ...statements,
+      env.DB.prepare("DELETE FROM poll_mutation_guards WHERE id = ?1").bind(id),
+    ]);
+  } catch (error) {
+    // Do not mask storage failures as a policy conflict.
+    if (String(error).includes("poll_mutation_allowed")) {
+      throw conflict("POLL_CHANGED", "Poll changed or voting is no longer allowed. Reload and retry.");
+    }
+    throw error;
+  }
 }
 
 async function loadPollForAdmin(
@@ -280,9 +306,9 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     }
   }
 
-  await c.env.DB.prepare(
+  const mutations = [c.env.DB.prepare(
     `UPDATE polls SET question = ?1, description = ?2, image_key = ?3,
-     allow_multiple = ?4, require_login = ?5, closes_at = ?6, updated_at = ?7
+     allow_multiple = ?4, require_login = ?5, closes_at = ?6, updated_at = ?7, revision = revision + 1
      WHERE id = ?8`,
   )
     .bind(
@@ -295,12 +321,21 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
       nowIso(),
       poll.id,
     )
-    .run();
+    ];
 
   if (replacementOptions) {
-    await c.env.DB.prepare("DELETE FROM options WHERE poll_id = ?1").bind(poll.id).run();
-    await insertOptions(c.env, poll.id, replacementOptions);
+    mutations.push(c.env.DB.prepare("DELETE FROM options WHERE poll_id = ?1").bind(poll.id));
+    const now = nowIso();
+    mutations.push(...replacementOptions.map((o, i) => c.env.DB.prepare(
+      "INSERT INTO options (id, poll_id, label, image_key, position, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    ).bind(randomId(), poll.id, o.label, o.image_key, i, now)));
+
   }
+
+  await guardedPollBatch(c.env,
+    `EXISTS (SELECT 1 FROM polls WHERE id = ?2 AND revision = ?3 AND status != 'closed')
+     AND (?4 = 0 OR NOT EXISTS (SELECT 1 FROM votes WHERE poll_id = ?2))`,
+    [poll.id, poll.revision, replacementOptions ? 1 : 0], mutations);
 
   const updated = await getPollRow(c.env, poll.id);
   const opts = await listOptionRows(c.env, poll.id);
@@ -327,9 +362,12 @@ api.post("/tenants/:tenantId/polls/:pollId/status", async (c) => {
       `Cannot move a ${poll.status} poll to ${status}`,
     );
   }
-  await c.env.DB.prepare("UPDATE polls SET status = ?1, updated_at = ?2 WHERE id = ?3")
-    .bind(status, nowIso(), poll.id)
-    .run();
+  await guardedPollBatch(c.env,
+    "EXISTS (SELECT 1 FROM polls WHERE id = ?2 AND revision = ?3 AND status = ?4)",
+    [poll.id, poll.revision, poll.status], [
+      c.env.DB.prepare("UPDATE polls SET status = ?1, updated_at = ?2, revision = revision + 1 WHERE id = ?3")
+        .bind(status, nowIso(), poll.id),
+    ]);
   const updated = await getPollRow(c.env, poll.id);
   const opts = await listOptionRows(c.env, poll.id);
   return c.json({ poll: pollToJson(originOf(c), updated as PollRow, opts) });
@@ -346,47 +384,6 @@ api.get("/tenants/:tenantId/polls/:pollId/results", async (c) => {
 /* Admin: image upload (R2)                                            */
 /* ------------------------------------------------------------------ */
 
-interface ImageUsage {
-  image_count: number;
-  total_bytes: number;
-}
-
-/**
- * Per-tenant image usage. The bookkeeping row is initialized from the
- * actual R2 prefix on first use, so images uploaded before quotas
- * existed are counted too.
- */
-async function getImageUsage(env: Env, tenantId: string): Promise<ImageUsage> {
-  const row = await env.DB.prepare(
-    "SELECT image_count, total_bytes FROM tenant_image_usage WHERE tenant_id = ?1",
-  )
-    .bind(tenantId)
-    .first<ImageUsage>();
-  if (row) return row;
-  let count = 0;
-  let bytes = 0;
-  let cursor: string | undefined;
-  do {
-    const page = await env.IMAGES.list({
-      prefix: `t/${tenantId}/`,
-      limit: 1000,
-      cursor,
-    });
-    for (const obj of page.objects) {
-      count += 1;
-      bytes += obj.size;
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at)
-     VALUES (?1, ?2, ?3, ?4)`,
-  )
-    .bind(tenantId, count, bytes, nowIso())
-    .run();
-  return { image_count: count, total_bytes: bytes };
-}
-
 api.post("/tenants/:tenantId/images", async (c) => {
   const tenantId = c.req.param("tenantId");
   await requireAdmin(c, tenantId);
@@ -402,7 +399,7 @@ api.post("/tenants/:tenantId/images", async (c) => {
   if (!declaredExt) {
     throw badRequest("Content-Type must be image/png, image/jpeg, image/webp or image/gif");
   }
-  const data = await c.req.arrayBuffer();
+  const data = await readBodyLimited(c.req.raw, MAX_IMAGE_BYTES);
   if (data.byteLength === 0) throw badRequest("Image body is empty");
   if (data.byteLength > MAX_IMAGE_BYTES) {
     throw payloadTooLarge("Image must be at most 5 MiB");
@@ -412,33 +409,8 @@ api.post("/tenants/:tenantId/images", async (c) => {
   if (sniffedExt === null || sniffedExt !== declaredExt) {
     throw badRequest("Image contents do not match the declared image type");
   }
-  const usage = await getImageUsage(c.env, tenantId);
-  if (usage.image_count >= MAX_IMAGES_PER_TENANT) {
-    throw new ApiError(
-      429,
-      "IMAGE_QUOTA_EXCEEDED",
-      `Image count quota reached for this workspace (${MAX_IMAGES_PER_TENANT} images)`,
-    );
-  }
-  if (usage.total_bytes + data.byteLength > MAX_IMAGE_BYTES_PER_TENANT) {
-    throw new ApiError(
-      429,
-      "IMAGE_QUOTA_EXCEEDED",
-      "Image storage quota reached for this workspace (500 MiB total)",
-    );
-  }
   const key = `t/${tenantId}/${randomId()}.${declaredExt}`;
-  await c.env.IMAGES.put(key, data, { httpMetadata: { contentType } });
-  await c.env.DB.prepare(
-    `INSERT INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at)
-     VALUES (?1, 1, ?2, ?3)
-     ON CONFLICT (tenant_id) DO UPDATE SET
-       image_count = image_count + 1,
-       total_bytes = total_bytes + excluded.total_bytes,
-       updated_at = excluded.updated_at`,
-  )
-    .bind(tenantId, data.byteLength, nowIso())
-    .run();
+  await putImageWithQuota(c.env, tenantId, key, data, contentType);
   return c.json({ key, url: `${originOf(c)}/images/${key}` }, 201);
 });
 
@@ -554,7 +526,14 @@ api.post("/polls/:pollId/vote", async (c) => {
       ).bind(randomId(), poll.id, optionId, voterKey, now),
     ),
   ];
-  await c.env.DB.batch(stmts);
+  await guardedPollBatch(c.env,
+    `EXISTS (SELECT 1 FROM polls WHERE id = ?2 AND status = 'published'
+       AND (closes_at IS NULL OR julianday(closes_at) > julianday('now'))
+       AND (require_login = 0 OR ?3 = 1)
+       AND (allow_multiple = 1 OR ?4 = 1))
+     AND (SELECT COUNT(*) FROM options WHERE poll_id = ?2
+       AND id IN (SELECT value FROM json_each(?5))) = ?4`,
+    [poll.id, sub ? 1 : 0, optionIds.length, JSON.stringify(optionIds)], stmts);
 
   const results = await computeResults(c.env, originOf(c), poll);
   return c.json({

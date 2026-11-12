@@ -1,6 +1,6 @@
 /**
  * Database schema: the union of migrations/0001_init.sql and
- * migrations/0002_security.sql. Tests apply SCHEMA_SQL directly to a
+ * migrations/0002_security.sql and 0003_main_security.sql. Tests apply SCHEMA_SQL directly to a
  * fresh D1 database.
  */
 export const SCHEMA_SQL = `
@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS tenant_members (
 CREATE TABLE IF NOT EXISTS polls (
   id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL DEFAULT 0,
   question TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   image_key TEXT,
@@ -79,6 +80,12 @@ CREATE TABLE IF NOT EXISTS tenant_image_usage (
   total_bytes INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS poll_mutation_guards (
+  id TEXT PRIMARY KEY,
+  valid INTEGER NOT NULL CONSTRAINT poll_mutation_allowed CHECK (valid = 1)
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_expiry ON rate_limit_buckets(window_start);
 
 CREATE TABLE IF NOT EXISTS app_migrations (
   name TEXT PRIMARY KEY,

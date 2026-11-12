@@ -31,6 +31,7 @@ export interface TenantRow {
 }
 
 export interface PollRow {
+  revision: number;
   id: string;
   tenant_id: string;
   question: string;
