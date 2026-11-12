@@ -40,56 +40,31 @@ export function userVoterKey(sub: string): string {
  * too.
  */
 export async function migrateLegacyAnonVoterKeys(env: Env, pollId: string): Promise<void> {
-  try {
-    const legacy = await env.DB.prepare(
-      "SELECT DISTINCT voter_key FROM votes WHERE poll_id = ?1 AND voter_key LIKE 'anon:%'",
-    )
-      .bind(pollId)
-      .all<{ voter_key: string }>();
+  const legacy = await env.DB.prepare(
+    "SELECT DISTINCT voter_key FROM votes WHERE poll_id = ?1 AND voter_key LIKE 'anon:%'",
+  ).bind(pollId).all<{ voter_key: string }>();
 
-    for (const row of legacy.results) {
-      const token = row.voter_key.slice(LEGACY_ANON_KEY_PREFIX.length);
-      const canonical = await anonVoterKey(env.SESSION_SECRET, token);
-      const legacyRows = await env.DB.prepare(
-        "SELECT updated_at FROM votes WHERE poll_id = ?1 AND voter_key = ?2",
-      )
-        .bind(pollId, row.voter_key)
-        .all<{ updated_at: string }>();
-      const canonicalRows = await env.DB.prepare(
-        "SELECT updated_at FROM votes WHERE poll_id = ?1 AND voter_key = ?2",
-      )
-        .bind(pollId, canonical)
-        .all<{ updated_at: string }>();
-      const newest = (rows: { updated_at: string }[]) =>
-        rows.reduce((max, r) => (r.updated_at > max ? r.updated_at : max), "");
-
-      if (
-        canonicalRows.results.length > 0 &&
-        newest(canonicalRows.results) >= newest(legacyRows.results)
-      ) {
-        // The migrated set is at least as new: drop the legacy rows.
-        await env.DB.prepare(
-          "DELETE FROM votes WHERE poll_id = ?1 AND voter_key = ?2",
-        )
-          .bind(pollId, row.voter_key)
-          .run();
-      } else {
-        if (canonicalRows.results.length > 0) {
-          await env.DB.prepare(
-            "DELETE FROM votes WHERE poll_id = ?1 AND voter_key = ?2",
-          )
-            .bind(pollId, canonical)
-            .run();
-        }
-        await env.DB.prepare(
-          "UPDATE votes SET voter_key = ?1 WHERE poll_id = ?2 AND voter_key = ?3",
-        )
-          .bind(canonical, pollId, row.voter_key)
-          .run();
-      }
-    }
-  } catch {
-    // Schema not applied yet (e.g. a database without migrations):
-    // skip quietly and retry on a later request.
+  for (const row of legacy.results) {
+    const token = row.voter_key.slice(LEGACY_ANON_KEY_PREFIX.length);
+    const canonical = await anonVoterKey(env.SESSION_SECRET, token);
+    // Discovery above can be stale. All winner decisions use live rows in
+    // one transaction, so a delayed migration cannot erase a later ballot.
+    // Ties keep the canonical set, matching the original migration policy.
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM votes
+        WHERE poll_id = ?1 AND voter_key = ?2
+          AND EXISTS (SELECT 1 FROM votes WHERE poll_id = ?1 AND voter_key = ?3)
+          AND (SELECT MAX(updated_at) FROM votes WHERE poll_id = ?1 AND voter_key = ?3)
+            >= (SELECT MAX(updated_at) FROM votes WHERE poll_id = ?1 AND voter_key = ?2)`)
+        .bind(pollId, row.voter_key, canonical),
+      // A surviving legacy set is strictly newer, or has no competitor.
+      // If another migration already consumed it, this is a no-op.
+      env.DB.prepare(`DELETE FROM votes
+        WHERE poll_id = ?1 AND voter_key = ?3
+          AND EXISTS (SELECT 1 FROM votes WHERE poll_id = ?1 AND voter_key = ?2)`)
+        .bind(pollId, row.voter_key, canonical),
+      env.DB.prepare("UPDATE votes SET voter_key = ?3 WHERE poll_id = ?1 AND voter_key = ?2")
+        .bind(pollId, row.voter_key, canonical),
+    ]);
   }
 }
