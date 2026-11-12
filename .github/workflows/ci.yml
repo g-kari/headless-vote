@@ -22,3 +22,5 @@ jobs:
         run: npm run typecheck
       - name: Test
         run: npm test
+      - name: Security regressions (SQLite migration chain)
+        run: npm run test:security:node

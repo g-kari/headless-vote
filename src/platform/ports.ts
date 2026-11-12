@@ -6,6 +6,7 @@
  */
 
 export interface AuthIdentity {
+  sessionVersion?: number;
   sub: string;
   email?: string;
   name?: string;
@@ -48,6 +49,8 @@ export interface StoredObject {
 }
 
 export interface ObjectStore {
+  /** Delete one bounded page; repeat with the returned cursor until null. */
+  deletePrefix(prefix: string, cursor?: string): Promise<string | null>;
   readonly id: string;
   put(key: string, body: ArrayBuffer | Uint8Array, contentType: string): Promise<void>;
   get(key: string): Promise<StoredObject | null>;

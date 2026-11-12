@@ -58,3 +58,30 @@ npm run dev
 ```
 
 No license file is shipped. Publishing or redistributing this code needs a license decision from the repository owner. See `CONTRIBUTING.md`.
+
+## Webhook network boundary
+
+Tenant webhooks require HTTPS and reject localhost and non-public/special-use IP
+literals, including IPv6 and IPv4-mapped addresses. Destinations are checked again
+at delivery and redirects are never followed. HTTP localhost webhooks are not
+supported, including in development.
+
+A hostname string check cannot stop DNS rebinding or a public-looking hostname
+that resolves to a private address. Before enabling untrusted tenants, enforce
+public-only webhook egress in the hosting network or an outbound proxy. It must
+validate the actual connected address on every connection, reject private,
+loopback, link-local, metadata, reserved and transition addresses for both IP
+families, and prevent DNS resolution/connection races. Do not assume these
+application checks provide that guarantee on a new self-hosted runtime. Keep
+internal services authenticated independently.
+
+### Security migration and image deletion
+
+Apply migrations through `0008_object_cleanup.sql` before running this revision.
+`0007_auth_security.sql` invalidates existing local-password sessions; users sign in again.
+Workspace deletion queues image cleanup in the same D1 transaction and immediately
+blocks new image reads. Cleanup processes at most 20 pages of 100 objects per run;
+failed/unfinished jobs remain in `object_cleanup`. The supplied daily Worker cron
+retries them. Equivalent self-hosted schedulers must call `drainObjectCleanup`.
+Existing copies downloaded or cached under the previous one-day cache policy
+cannot be recalled. New image responses are `no-store`.

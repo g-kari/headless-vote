@@ -52,6 +52,7 @@ export async function assertDailyVoteQuota(env: Env, tenantId: string): Promise<
   }
 }
 
-export async function recordVoteEvent(env: Env, pollId: string): Promise<void> {
-  await createAnalyticsStore(env).record(pollId, new Date().toISOString());
+export async function recordVoteEvent(env: Env, pollId: string, at: string): Promise<void> {
+  const store = createAnalyticsStore(env);
+  if (store.id !== "d1") await store.record(pollId, at);
 }

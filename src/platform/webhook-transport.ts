@@ -1,3 +1,4 @@
+import { assertWebhookUrl } from "../webhooks";
 import type { Env } from "../types";
 import type { WebhookTransport } from "./ports";
 
@@ -5,7 +6,7 @@ export const fetchWebhookTransport: WebhookTransport = {
   id: "fetch",
   async post(url, body, headers) {
     try {
-      const res = await fetch(url, {
+      const res = await fetch(assertWebhookUrl(url), {
         method: "POST",
         redirect: "manual",
         signal: AbortSignal.timeout(3000),

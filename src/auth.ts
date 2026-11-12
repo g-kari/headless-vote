@@ -96,6 +96,17 @@ export async function getSessionUser(c: Ctx): Promise<SessionUser | null> {
     return null;
   }
   if (typeof payload.exp !== "number" || payload.exp <= Math.floor(Date.now() / 1000)) return null;
+  const provider = selectAuthProvider(c.env.AUTH_PROVIDER).id;
+  // Preserve existing OIDC cookies, but never treat an old unversioned local
+  // cookie as a current local login or carry it across a provider change.
+  const sessionProvider = payload.authProvider ?? (payload.sub.startsWith("local:") ? "local" : "oidc");
+  if (sessionProvider !== provider) return null;
+  if (sessionProvider === "local") {
+    if (!payload.sub.startsWith("local:") || !Number.isSafeInteger(payload.sessionVersion)) return null;
+    const user = await c.env.DB.prepare("SELECT session_version FROM local_users WHERE id = ?1 AND email_verified_at IS NOT NULL")
+      .bind(payload.sub.slice("local:".length)).first<{ session_version: number }>();
+    if (!user || user.session_version !== payload.sessionVersion) return null;
+  }
   return payload;
 }
 
@@ -258,11 +269,14 @@ export async function newSessionCookieForToken(
   claims: Record<string, unknown>,
   sub: string,
   requestUrl: string,
+  sessionVersion?: number,
 ): Promise<string> {
   return makeSessionCookie(
     env,
     {
       sub,
+      authProvider: sessionVersion === undefined ? "oidc" : "local",
+      sessionVersion,
       name: cleanClaim(claims["name"], 120),
       email: cleanClaim(claims["email"], 200),
     },

@@ -33,3 +33,7 @@ migrations_dir = "migrations"
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "headless-vote-images"
+
+# Retry bounded cleanup of images belonging to deleted workspaces.
+[triggers]
+crons = ["0 3 * * *"]

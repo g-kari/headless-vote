@@ -1,8 +1,8 @@
 import { actorLabel, recordAudit } from "./audit";
 import { randomId, randomToken, sha256Hex } from "./crypto";
-import { badRequest, notFound } from "./errors";
+import { badRequest, notFound, unauthorized } from "./errors";
 import { tenantQuotas } from "./quotas";
-import { assertPlainText } from "./security";
+import { assertPlainText, rateLimit } from "./security";
 import type { AdminPrincipal, ApiScope, Env, TenantRow } from "./types";
 export type { ApiScope };
 
@@ -111,6 +111,8 @@ export async function provisionTenant(
   ownerSub: string | null,
 ): Promise<{ tenantId: string; apiKey: string }> {
   assertPlainText(name);
+  // Shared by API and UI provisioning; keep the global abuse ceiling from main.
+  await rateLimit(env, await sha256Hex("rl:tenant-create-global:all"), 1000, 86_400);
   const tenantId = randomId();
   const apiKey = randomToken("hvk");
   const now = new Date().toISOString();
@@ -162,14 +164,6 @@ export async function issueApiKey(
   if (name.length < 1 || name.length > 80) throw badRequest('"name" must be 1-80 characters');
   if (scope !== "read" && scope !== "write") throw badRequest('"scope" must be read or write');
   const quotas = await tenantQuotas(env, tenantId);
-  const active = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM api_keys WHERE tenant_id = ?1 AND revoked_at IS NULL",
-  )
-    .bind(tenantId)
-    .first<{ n: number }>();
-  if (Number(active?.n ?? 0) >= quotas.keys) {
-    throw badRequest(`A workspace can have at most ${quotas.keys} active API keys`);
-  }
   const apiKey = randomToken("hvk");
   const now = new Date().toISOString();
   const row: ApiKeyRow = {
@@ -183,12 +177,18 @@ export async function issueApiKey(
     revoked_at: null,
     last_used_at: null,
   };
-  await env.DB.prepare(
+  // Count and insert in one statement: concurrent issuers cannot overrun the quota.
+  const inserted = await env.DB.prepare(
     `INSERT INTO api_keys (id, tenant_id, name, key_hash, key_prefix, scope, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+     WHERE (SELECT COUNT(*) FROM api_keys WHERE tenant_id = ?2 AND revoked_at IS NULL)
+       < (SELECT COALESCE(quota_keys, 10) FROM tenants WHERE id = ?2)`,
   )
     .bind(row.id, row.tenant_id, row.name, row.key_hash, row.key_prefix, row.scope, row.created_at)
     .run();
+  if (inserted.meta.changes !== 1) {
+    throw badRequest(`A workspace can have at most ${quotas.keys} active API keys`);
+  }
   await recordAudit(env, {
     tenantId,
     actor: actorLabel(actor),
@@ -239,20 +239,50 @@ export async function rotatePresentedKey(
   const apiKey = randomToken("hvk");
   const now = new Date().toISOString();
   const hash = await sha256Hex(apiKey);
-  const stmts = [
-    env.DB.prepare("UPDATE tenants SET api_key_hash = ?1 WHERE id = ?2").bind(hash, tenantId),
-    env.DB.prepare(
-      `INSERT INTO api_keys (id, tenant_id, name, key_hash, key_prefix, scope, created_at)
-       VALUES (?1, ?2, '再発行', ?3, ?4, 'write', ?5)`,
-    ).bind(randomId(), tenantId, hash, keyPrefix(apiKey), now),
-  ];
-  if (presented.key.id !== "legacy") {
-    stmts.unshift(
-      env.DB.prepare("UPDATE api_keys SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL")
-        .bind(now, presented.key.id),
-    );
+  const successorId = randomId();
+  if (presented.tenant.id !== tenantId || presented.key.tenant_id !== tenantId ||
+      presented.key.scope !== "write") {
+    throw unauthorized("INVALID_API_KEY", "API key cannot be rotated");
   }
-  await env.DB.batch(stmts);
+  const legacy = presented.key.id === "legacy";
+  // D1 batches are transactional. Only the first transaction observing a live
+  // predecessor inserts a successor; all subsequent writes depend on that insert.
+  // Never trust the authentication snapshot after awaiting another request.
+  const insert = legacy
+    ? env.DB.prepare(
+      `INSERT INTO api_keys (id, tenant_id, name, key_hash, key_prefix, scope, created_at)
+       SELECT ?1, ?2, '再発行', ?3, ?4, 'write', ?5
+       FROM tenants WHERE id = ?2 AND api_key_hash = ?6
+         AND NOT EXISTS (SELECT 1 FROM api_keys WHERE key_hash = ?6)
+         AND (SELECT COUNT(*) FROM api_keys WHERE tenant_id = ?2 AND revoked_at IS NULL)
+           < COALESCE(quota_keys, 10)`,
+    ).bind(successorId, tenantId, hash, keyPrefix(apiKey), now, presented.key.key_hash)
+    : env.DB.prepare(
+      `INSERT INTO api_keys (id, tenant_id, name, key_hash, key_prefix, scope, created_at)
+       SELECT ?1, ?2, '再発行', ?3, ?4, 'write', ?5
+       FROM api_keys WHERE id = ?6 AND tenant_id = ?2 AND key_hash = ?7
+         AND revoked_at IS NULL AND scope = 'write'
+         AND (SELECT COUNT(*) FROM api_keys WHERE tenant_id = ?2 AND revoked_at IS NULL)
+           <= (SELECT COALESCE(quota_keys, 10) FROM tenants WHERE id = ?2)`,
+    ).bind(successorId, tenantId, hash, keyPrefix(apiKey), now,
+      presented.key.id, presented.key.key_hash);
+  const stmts = [insert];
+  if (!legacy) {
+    stmts.push(env.DB.prepare(
+      `UPDATE api_keys SET revoked_at = ?1
+       WHERE id = ?2 AND tenant_id = ?3 AND key_hash = ?4 AND revoked_at IS NULL
+         AND EXISTS (SELECT 1 FROM api_keys WHERE id = ?5 AND tenant_id = ?3)`,
+    ).bind(now, presented.key.id, tenantId, presented.key.key_hash, successorId));
+  }
+  stmts.push(env.DB.prepare(
+    `UPDATE tenants SET api_key_hash = ?1
+     WHERE id = ?2 AND api_key_hash = ?3
+       AND EXISTS (SELECT 1 FROM api_keys WHERE id = ?4 AND tenant_id = ?2)`,
+  ).bind(hash, tenantId, presented.key.key_hash, successorId));
+  const results = await env.DB.batch(stmts);
+  if (results[0]?.meta.changes !== 1) {
+    throw unauthorized("INVALID_API_KEY", "API key is no longer active or key quota is exhausted");
+  }
   await recordAudit(env, {
     tenantId,
     actor: `key:${presented.key.key_prefix}`,

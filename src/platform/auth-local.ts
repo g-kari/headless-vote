@@ -22,6 +22,7 @@ interface LocalUserRow {
   id: string;
   email: string;
   password_hash: string;
+  session_version: number;
   name: string | null;
   email_verified_at: string | null;
 }
@@ -167,10 +168,24 @@ export async function requestPasswordReset(
 }
 
 export async function resetLocalPassword(env: Env, token: string, password: string): Promise<void> {
-  const row = await consumeToken(env, token, "reset");
-  await env.DB.prepare("UPDATE local_users SET password_hash = ?1 WHERE id = ?2")
-    .bind(await hashPassword(password), row.user_id)
-    .run();
+  // Validate/hash before the transaction so bad input cannot burn a recovery link.
+  if (token.length < 20 || token.length > 200) throw badRequest("That link is not valid");
+  const passwordHash = await hashPassword(password);
+  const tokenHash = await sha256Hex(token);
+  const now = new Date().toISOString();
+  // D1 batches are transactional: nobody can reuse the token between the
+  // conditional password update and invalidation of every outstanding reset.
+  const results = await env.DB.batch([
+    env.DB.prepare(`UPDATE local_users
+      SET password_hash = ?1, session_version = session_version + 1
+      WHERE id = (SELECT user_id FROM local_tokens
+        WHERE token_hash = ?2 AND purpose = 'reset' AND expires_at > ?3)`)
+      .bind(passwordHash, tokenHash, now),
+    env.DB.prepare(`DELETE FROM local_tokens WHERE purpose = 'reset' AND user_id =
+      (SELECT user_id FROM local_tokens WHERE token_hash = ?1 AND purpose = 'reset' AND expires_at > ?2)`)
+      .bind(tokenHash, now),
+  ]);
+  if (Number(results[0]?.meta.changes ?? 0) !== 1) throw badRequest("That link is not valid");
 }
 
 async function consumeToken(
@@ -181,12 +196,11 @@ async function consumeToken(
   if (token.length < 20 || token.length > 200) throw badRequest("That link is not valid");
   const hash = await sha256Hex(token);
   const row = await env.DB.prepare(
-    "SELECT user_id, expires_at FROM local_tokens WHERE token_hash = ?1 AND purpose = ?2",
+    "DELETE FROM local_tokens WHERE token_hash = ?1 AND purpose = ?2 AND expires_at > ?3 RETURNING user_id",
   )
-    .bind(hash, purpose)
-    .first<{ user_id: string; expires_at: string }>();
-  await env.DB.prepare("DELETE FROM local_tokens WHERE token_hash = ?1").bind(hash).run();
-  if (!row || row.expires_at < new Date().toISOString()) throw badRequest("That link is not valid");
+    .bind(hash, purpose, new Date().toISOString())
+    .first<{ user_id: string }>();
+  if (!row) throw badRequest("That link is not valid");
   return row;
 }
 
@@ -201,7 +215,9 @@ export async function loginLocalUser(env: Env, emailAddress: string, password: s
   if (!user.email_verified_at) {
     throw unauthorized("EMAIL_UNVERIFIED", "Confirm your email before signing in");
   }
-  return { sub: `local:${user.id}`, email: user.email, name: user.name ?? undefined };
+  // Capture the version from the same row whose password was verified. A reset
+  // during verification must not turn an old password into a fresh session.
+  return { sub: `local:${user.id}`, email: user.email, name: user.name ?? undefined, sessionVersion: user.session_version };
 }
 
 export async function deleteLocalAccount(env: Env, sub: string): Promise<void> {

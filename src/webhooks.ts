@@ -65,48 +65,44 @@ export async function signWebhookBody(secret: string, body: string): Promise<str
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** https URLs only, except localhost. Blocks IP literals that are not public. */
+/** Public HTTPS destinations only. DNS safety also requires egress enforcement. */
 export function assertWebhookUrl(raw: string): string {
   assertPlainText(raw);
   if (raw.length > 300) throw badRequest("Webhook URL is too long");
   let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw badRequest("Webhook URL must be https");
+  try { url = new URL(raw); } catch { throw badRequest("Webhook URL must be https"); }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw badRequest("Webhook URL must be https without credentials, a query, or a hash");
   }
-  if (url.username || url.password || url.search || url.hash) {
-    throw badRequest("Webhook URL must not include credentials, a query, or a hash");
-  }
-  const host = url.hostname.toLowerCase();
-  const local = host === "localhost" || host === "127.0.0.1" || host === "::1";
-  if (url.protocol === "http:") {
-    if (!local) throw badRequest("Webhook URL must be https");
-  } else if (url.protocol !== "https:") {
-    throw badRequest("Webhook URL must be https");
-  }
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
   if (isBlockedHost(host)) throw badRequest("Webhook URL host is not allowed");
   return url.toString();
 }
 
 function isBlockedHost(host: string): boolean {
-  if (host.includes(":")) {
-    const v6 = host.toLowerCase();
-    if (v6 === "::1" || v6.startsWith("fe80:") || v6.startsWith("fc") || v6.startsWith("fd")) return true;
+  // URL canonicalizes IPv6, including embedded IPv4, and preserves brackets.
+  if (host.startsWith("[")) {
+    const words = host.slice(1, -1).split(":");
+    const first = parseInt(words[0] || "0", 16);
+    const second = parseInt(words[1] || "0", 16);
+    // Only global unicast; exclude special-use, documentation and transition ranges.
+    return first < 0x2000 || first > 0x3fff ||
+      (first === 0x2001 && (second < 0x200 || second === 0xdb8)) ||
+      first === 0x2002 || first === 0x3fff;
   }
-  if (host === "metadata.google.internal" || host.endsWith(".internal")) return true;
-  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (!ipv4) return false;
-  const n = ipv4.slice(1).map((part) => Number(part));
-  if (n.some((x) => x > 255)) return true;
-  const a = n[0] ?? 0;
-  const b = n[1] ?? 0;
-  if (a === 10 || a === 127 || a === 0) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
-  return false;
+  const ipv4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
+  if (ipv4) {
+    const n = ipv4.slice(1).map(Number);
+    const a = n[0] ?? 0, b = n[1] ?? 0, c = n[2] ?? 0;
+    return n.some((x) => x > 255) || a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 168 || b === 0 || (b === 88 && c === 99))) ||
+      (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+      (a === 203 && b === 0 && c === 113);
+  }
+  if (!host.includes(".") || host.endsWith(".localhost") || host.endsWith(".local") ||
+      host.endsWith(".internal") || host.endsWith(".home.arpa")) return true;
+  return !host.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label));
 }
 
 interface WebhookRow {
@@ -131,25 +127,22 @@ export async function createWebhook(
     throw badRequest("Webhook events must be vote.cast, poll.published, poll.closed, or poll.updated");
   }
   const quotas = await tenantQuotas(env, tenantId);
-  const count = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM webhooks WHERE tenant_id = ?1 AND disabled_at IS NULL",
-  )
-    .bind(tenantId)
-    .first<{ n: number }>();
-  if (Number(count?.n ?? 0) >= quotas.webhooks) {
-    throw badRequest(`A workspace can have at most ${quotas.webhooks} webhooks`);
-  }
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
   const secret = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
   const id = randomId();
-  await env.DB.prepare(
+  const inserted = await env.DB.prepare(
     `INSERT INTO webhooks (id, tenant_id, url, secret_enc, events, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6
+     WHERE (SELECT COUNT(*) FROM webhooks WHERE tenant_id = ?2 AND disabled_at IS NULL)
+       < (SELECT quota_webhooks FROM tenants WHERE id = ?2)`,
   )
     .bind(id, tenantId, url, await encryptSecret(env, secret), JSON.stringify(unique), new Date().toISOString())
     .run();
+  if (Number(inserted.meta.changes ?? 0) !== 1) {
+    throw badRequest(`A workspace can have at most ${quotas.webhooks} webhooks`);
+  }
   return { id, secret, url };
 }
 
@@ -200,7 +193,7 @@ export async function sendSignedWebhook(
   event: string,
 ): Promise<number> {
   const signature = await signWebhookBody(secret, payload);
-  return transport.post(url, payload, {
+  return transport.post(assertWebhookUrl(url), payload, {
     "content-type": "application/json",
     "x-headless-vote-event": event,
     "x-headless-vote-signature": `v1=${signature}`,

@@ -4,6 +4,12 @@ import type { ObjectStore, StoredObject } from "./ports";
 export function createR2ObjectStore(env: Env): ObjectStore {
   return {
     id: "r2",
+    async deletePrefix(prefix, cursor) {
+      assertTenantPrefix(prefix);
+      const page = await env.IMAGES.list({ prefix, cursor, limit: 100 });
+      if (page.objects.length) await env.IMAGES.delete(page.objects.map((object) => object.key));
+      return page.truncated ? page.cursor : null;
+    },
     async put(key, body, contentType) {
       const bytes = body instanceof Uint8Array ? body : new Uint8Array(body);
       await env.IMAGES.put(key, bytes, { httpMetadata: { contentType } });
@@ -23,6 +29,18 @@ export function createR2ObjectStore(env: Env): ObjectStore {
 export class MemoryObjectStore implements ObjectStore {
   readonly id = "memory";
   private readonly files = new Map<string, { body: Uint8Array; contentType: string }>();
+
+  async deletePrefix(prefix: string, _cursor?: string): Promise<string | null> {
+    assertTenantPrefix(prefix);
+    let deleted = 0;
+    for (const key of this.files.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      if (deleted === 100) return "more";
+      this.files.delete(key);
+      deleted++;
+    }
+    return null;
+  }
 
   async put(key: string, body: ArrayBuffer | Uint8Array, contentType: string): Promise<void> {
     this.files.set(key, { body: body instanceof Uint8Array ? body : new Uint8Array(body), contentType });
@@ -53,4 +71,10 @@ export function createObjectStore(env: Env): ObjectStore {
     return sharedMemoryObjects;
   }
   throw new Error(`Unknown OBJECT_STORE "${name}"`);
+}
+
+function assertTenantPrefix(prefix: string): void {
+  if (!/^t\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/$/.test(prefix)) {
+    throw new Error("Object deletion requires an exact tenant prefix");
+  }
 }

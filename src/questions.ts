@@ -139,54 +139,42 @@ export function legacyQuestion(
   };
 }
 
-export async function replaceQuestions(
-  env: Env,
-  pollId: string,
-  questions: QuestionInput[],
-): Promise<void> {
+/** Statements run in the same batch as the guarded poll revision write. */
+export function replaceQuestionStatements(
+  env: Env, pollId: string, questions: QuestionInput[], revision: string,
+): D1PreparedStatement[] {
+  const guard = "EXISTS (SELECT 1 FROM polls WHERE id = ?1 AND revision = ?2)";
+  const statements = [
+    // Upgraded databases lack the fresh-schema question_id foreign key.
+    env.DB.prepare(`DELETE FROM options WHERE poll_id = ?1 AND ${guard}`).bind(pollId, revision),
+    env.DB.prepare(`DELETE FROM questions WHERE poll_id = ?1 AND ${guard}`).bind(pollId, revision),
+  ];
   const now = new Date().toISOString();
-  await env.DB.prepare("DELETE FROM questions WHERE poll_id = ?1").bind(pollId).run();
-  for (let i = 0; i < questions.length; i++) {
-    const q = questions[i];
-    if (!q) continue;
-    const questionId = randomId();
-    await env.DB.prepare(
-      `INSERT INTO questions (id, poll_id, prompt, description, image_key, kind, required, position, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
-    )
-      .bind(
-        questionId,
-        pollId,
-        q.prompt,
-        q.description,
-        q.image_key,
-        q.kind,
-        q.required ? 1 : 0,
-        i,
-        now,
-      )
-      .run();
-    if (q.options.length > 0) {
-      await env.DB.batch(
-        q.options.map((o, position) =>
-          env.DB.prepare(
-            `INSERT INTO options (id, poll_id, question_id, label, image_key, position, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-          ).bind(randomId(), pollId, questionId, o.label, o.image_key, position, now),
-        ),
-      );
-    }
-  }
+  questions.forEach((q, position) => {
+    const id = randomId();
+    statements.push(env.DB.prepare(`INSERT INTO questions
+      (id, poll_id, prompt, description, image_key, kind, required, position, created_at)
+      SELECT ?3, ?1, ?4, ?5, ?6, ?7, ?8, ?9, ?10 WHERE ${guard}`)
+      .bind(pollId, revision, id, q.prompt, q.description, q.image_key, q.kind, q.required ? 1 : 0, position, now));
+    q.options.forEach((o, index) => {
+      statements.push(env.DB.prepare(`INSERT INTO options
+        (id, poll_id, question_id, label, image_key, position, created_at)
+        SELECT ?3, ?1, ?4, ?5, ?6, ?7, ?8 WHERE ${guard}`)
+        .bind(pollId, revision, randomId(), id, o.label, o.image_key, index, now));
+    });
+  });
+  return statements;
 }
 
 /** Prompt and label edits, including reorder, when option and question ids stay the same. */
-export async function updateQuestionText(
+export function questionTextStatements(
   env: Env,
   pollId: string,
   questions: QuestionInput[],
   existingQuestions: QuestionRow[],
   existingOptions: OptionRow[],
-): Promise<void> {
+  revision: string,
+): D1PreparedStatement[] {
   if (!sameStructure(questions, existingQuestions, existingOptions)) {
     throw conflict(
       "OPTIONS_LOCKED",
@@ -200,19 +188,20 @@ export async function updateQuestionText(
     stmts.push(
       env.DB.prepare(
         `UPDATE questions SET prompt = ?1, description = ?2, required = ?3, position = ?4
-         WHERE id = ?5 AND poll_id = ?6`,
-      ).bind(q.prompt, q.description, q.required ? 1 : 0, i, q.id, pollId),
+         WHERE id = ?5 AND poll_id = ?6
+         AND EXISTS (SELECT 1 FROM polls WHERE id = ?6 AND revision = ?7)`,
+      ).bind(q.prompt, q.description, q.required ? 1 : 0, i, q.id, pollId, revision),
     );
     q.options.forEach((o, position) => {
       if (!o.id) return;
       stmts.push(
         env.DB.prepare(
-          "UPDATE options SET label = ?1, image_key = ?2, position = ?3 WHERE id = ?4 AND question_id = ?5",
-        ).bind(o.label, o.image_key, position, o.id, q.id),
+          "UPDATE options SET label = ?1, image_key = ?2, position = ?3 WHERE id = ?4 AND question_id = ?5 AND EXISTS (SELECT 1 FROM polls WHERE id = ?6 AND revision = ?7)",
+        ).bind(o.label, o.image_key, position, o.id, q.id, pollId, revision),
       );
     });
   }
-  if (stmts.length > 0) await env.DB.batch(stmts);
+  return stmts;
 }
 
 export function sameStructure(

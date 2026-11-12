@@ -34,15 +34,6 @@ function parseRole(raw: unknown): "owner" | "member" {
   return raw;
 }
 
-async function ownerCount(env: Env, tenantId: string): Promise<number> {
-  const row = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM tenant_members WHERE tenant_id = ?1 AND role = 'owner'",
-  )
-    .bind(tenantId)
-    .first<{ n: number }>();
-  return Number(row?.n ?? 0);
-}
-
 export async function addMember(
   env: Env,
   tenantId: string,
@@ -89,14 +80,17 @@ export async function setMemberRole(
     .bind(tenantId, sub)
     .first<{ role: string }>();
   if (!current) throw notFound("Member not found");
-  if (current.role === "owner" && role !== "owner" && (await ownerCount(env, tenantId)) <= 1) {
-    throw conflict("LAST_OWNER", "The last owner cannot be demoted");
-  }
-  await env.DB.prepare(
-    "UPDATE tenant_members SET role = ?1 WHERE tenant_id = ?2 AND user_sub = ?3",
+  const updated = await env.DB.prepare(
+    `UPDATE tenant_members SET role = ?1
+     WHERE tenant_id = ?2 AND user_sub = ?3 AND role = ?4
+       AND (role <> 'owner' OR ?1 = 'owner' OR
+         (SELECT COUNT(*) FROM tenant_members WHERE tenant_id = ?2 AND role = 'owner') > 1)`,
   )
-    .bind(role, tenantId, sub)
+    .bind(role, tenantId, sub, current.role)
     .run();
+  if (updated.meta.changes !== 1) {
+    throw conflict("LAST_OWNER", "Member changed or the last owner cannot be demoted");
+  }
   await recordAudit(env, {
     tenantId,
     actor: actorLabel(actor),
@@ -119,12 +113,17 @@ export async function removeMember(
     .bind(tenantId, sub)
     .first<{ role: string }>();
   if (!current) throw notFound("Member not found");
-  if (current.role === "owner" && (await ownerCount(env, tenantId)) <= 1) {
-    throw conflict("LAST_OWNER", "The last owner cannot be removed");
-  }
-  await env.DB.prepare("DELETE FROM tenant_members WHERE tenant_id = ?1 AND user_sub = ?2")
-    .bind(tenantId, sub)
+  const removed = await env.DB.prepare(
+    `DELETE FROM tenant_members
+     WHERE tenant_id = ?1 AND user_sub = ?2 AND role = ?3
+       AND (role <> 'owner' OR
+         (SELECT COUNT(*) FROM tenant_members WHERE tenant_id = ?1 AND role = 'owner') > 1)`,
+  )
+    .bind(tenantId, sub, current.role)
     .run();
+  if (removed.meta.changes !== 1) {
+    throw conflict("LAST_OWNER", "Member changed or the last owner cannot be removed");
+  }
   await recordAudit(env, {
     tenantId,
     actor: actorLabel(actor),

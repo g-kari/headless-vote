@@ -162,6 +162,7 @@ CREATE TABLE IF NOT EXISTS local_users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
+  session_version INTEGER NOT NULL DEFAULT 0,
   name TEXT,
   email_verified_at TEXT,
   created_at TEXT NOT NULL
@@ -172,6 +173,12 @@ CREATE TABLE IF NOT EXISTS local_tokens (
   user_id TEXT NOT NULL,
   purpose TEXT NOT NULL,
   expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS object_cleanup (
+  tenant_id TEXT PRIMARY KEY,
+  generation TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS email_outbox (

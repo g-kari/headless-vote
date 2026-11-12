@@ -82,7 +82,7 @@ describe("webhook signing and delivery", () => {
     expect(() => assertWebhookUrl("https://169.254.169.254/latest")).toThrow();
     expect(() => assertWebhookUrl("https://user:pass@example.com/hook")).toThrow();
     expect(assertWebhookUrl("https://example.com/hook")).toBe("https://example.com/hook");
-    expect(assertWebhookUrl("http://localhost:8787/hook")).toBe("http://localhost:8787/hook");
+    expect(() => assertWebhookUrl("http://localhost:8787/hook")).toThrow();
   });
 
   it("signs the raw body and records a delivery without the voter token", async () => {

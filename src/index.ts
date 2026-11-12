@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { drainObjectCleanup } from "./object-cleanup";
 import { allowsCrossSiteEmbed, applyPublicCors, isPublicEmbedPath } from "./cors";
 import { ApiError } from "./errors";
 import { serveImage } from "./routes/api";
@@ -95,4 +96,9 @@ app.notFound((c) => {
   return c.html("<!doctype html><meta charset=utf-8><title>404</title><p>Not found.</p>", 404);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    await drainObjectCleanup(env);
+  },
+};

@@ -156,7 +156,7 @@ authRoutes.post("/auth/local/login", async (c) => {
   await rateLimitByIp(c, "login", 30, 3600);
   const form = await readUrlEncodedForm(c);
   const identity = await loginLocalUser(c.env, String(form.get("email") ?? ""), String(form.get("password") ?? ""));
-  c.header("Set-Cookie", await newSessionCookieForToken(c.env, { email: identity.email, name: identity.name }, identity.sub, c.req.url));
+  c.header("Set-Cookie", await newSessionCookieForToken(c.env, { email: identity.email, name: identity.name }, identity.sub, c.req.url, identity.sessionVersion));
   c.header("Cache-Control", "no-store");
   return c.redirect("/admin", 302);
 });
@@ -240,6 +240,7 @@ authRoutes.get("/auth/local/reset", (c) => {
 authRoutes.post("/auth/local/reset", async (c) => {
   requireLocalProvider(c.env);
   assertSameOriginMutation(c);
+  await rateLimitByIp(c, "login", 30, 3600);
   const form = await readUrlEncodedForm(c);
   await resetLocalPassword(c.env, String(form.get("token") ?? ""), String(form.get("password") ?? ""));
   const body = `<h1>パスワードを更新しました</h1><p><a href="/admin/login">ログイン</a></p>`;

@@ -4,7 +4,7 @@ import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
 import { bearerToken, getSessionUser, optionalVoterSub, requireAdmin } from "../auth";
 import { ballotCount, upsertBallot } from "../ballots";
-import { addTenantOrigin, listTenantOrigins, removeTenantOrigin } from "../cors";
+import { addTenantOrigin, listTenantOrigins, isAllowedTenantOrigin, removeTenantOrigin } from "../cors";
 import { randomId } from "../crypto";
 import { resultsToCsv } from "../export";
 import {
@@ -25,15 +25,15 @@ import {
 import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from "../errors";
 import { findActiveApiKey, issueApiKey, listApiKeys, provisionTenant, publicKey, revokeApiKey, rotatePresentedKey } from "../keys";
 import { addMember, listMembers, removeMember, setMemberRole } from "../members";
-import { assertDailyVoteQuota, recordVoteEvent, tenantQuotas } from "../quotas";
+import { assertDailyVoteQuota, tenantQuotas } from "../quotas";
 import {
   ballotDocument,
   legacyQuestion,
   listQuestionRows,
   parseQuestions,
-  replaceQuestions,
+  replaceQuestionStatements,
   resolveAnswers,
-  updateQuestionText,
+  questionTextStatements,
   type QuestionInput,
 } from "../questions";
 import { createObjectStore } from "../platform/objects";
@@ -208,9 +208,12 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
   const pollId = randomId();
   const now = nowIso();
-  await c.env.DB.prepare(
+  const revision = randomId();
+  const insertPoll = c.env.DB.prepare(
     `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, created_at, updated_at, revision)
-     VALUES (?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?10, ?10, ?11)`,
+     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?10, ?10, ?11
+     WHERE (SELECT COUNT(*) FROM polls WHERE tenant_id = ?2) <
+       (SELECT quota_polls FROM tenants WHERE id = ?2)`,
   )
     .bind(
       pollId,
@@ -223,10 +226,10 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       opensAt,
       closesAt,
       now,
-      randomId(),
-    )
-    .run();
-  await replaceQuestions(c.env, pollId, questions);
+      revision,
+    );
+  const [created] = await c.env.DB.batch([insertPoll, ...replaceQuestionStatements(c.env, pollId, questions, revision)]);
+  if (Number(created?.meta.changes ?? 0) !== 1) throw conflict("QUOTA_EXCEEDED", "Poll quota exceeded");
   await recordAudit(c.env, {
     tenantId,
     actor: actorLabel(admin),
@@ -304,6 +307,8 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
   }
 
   let replacement: QuestionInput[] | null = null;
+  let textEdits: D1PreparedStatement[] = [];
+  const newRevision = randomId();
   if (body["questions"] !== undefined || body["options"] !== undefined) {
     const existingQuestions = await listQuestionRows(c.env, poll.id);
     const existingOptions = await listOptionRows(c.env, poll.id);
@@ -326,7 +331,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
           "Options cannot be replaced after votes have been cast",
         );
       }
-      await updateQuestionText(c.env, poll.id, replacement, existingQuestions, existingOptions);
+      textEdits = questionTextStatements(c.env, poll.id, replacement, existingQuestions, existingOptions, newRevision);
       replacement = null;
     }
   }
@@ -338,12 +343,12 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
 
   // revision always changes, so a matching WHERE is a real write even when
   // the other columns stay the same. Concurrent editors lose the compare.
-  const newRevision = randomId();
   const updatePoll = c.env.DB.prepare(
     `UPDATE polls SET question = ?1, description = ?2, image_key = ?3,
      allow_multiple = ?4, require_login = ?5, opens_at = ?6, closes_at = ?7, updated_at = ?8,
      revision = ?9
-     WHERE id = ?10 AND revision = ?11`,
+     WHERE id = ?10 AND revision = ?11 AND status != 'closed'
+       AND (?12 = 0 OR NOT EXISTS (SELECT 1 FROM vote_ballots WHERE poll_id = ?10))`,
   ).bind(
     question,
     description,
@@ -356,43 +361,15 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     newRevision,
     poll.id,
     poll.revision,
+    replacement || allowMultiple !== (poll.allow_multiple === 1) || requireLogin !== (poll.require_login === 1) ? 1 : 0,
   );
 
-  if (!replacement) {
-    const updatedPoll = await updatePoll.run();
-    if (Number(updatedPoll.meta.changes ?? 0) !== 1) {
-      throw conflict(
-        "CONCURRENT_UPDATE",
-        "The poll was updated at the same time. Reload and try again.",
-      );
-    }
-  } else {
-    const existing = await listOptionRows(c.env, poll.id);
-    const deleteOptions = c.env.DB.prepare(
-      `DELETE FROM options WHERE poll_id = ?1
-       AND NOT EXISTS (SELECT 1 FROM vote_ballots WHERE poll_id = ?1)
-       AND (SELECT revision FROM polls WHERE id = ?1) = ?2`,
-    ).bind(poll.id, newRevision);
-    const [updatedPoll, deleted] = await c.env.DB.batch([updatePoll, deleteOptions]);
-    if (!updatedPoll || !deleted || Number(updatedPoll.meta.changes ?? 0) !== 1) {
-      throw conflict(
-        "CONCURRENT_UPDATE",
-        "The poll was updated at the same time. Reload and try again.",
-      );
-    }
-    if (Number(deleted?.meta.changes ?? 0) !== existing.length) {
-      if ((await ballotCount(c.env, poll.id)) > 0) {
-        throw conflict(
-          "OPTIONS_LOCKED",
-          "Options cannot be replaced after votes have been cast",
-        );
-      }
-      throw conflict(
-        "CONCURRENT_UPDATE",
-        "The poll was updated at the same time. Reload and try again.",
-      );
-    }
-    await replaceQuestions(c.env, poll.id, replacement);
+  const [updatedPoll] = await c.env.DB.batch([
+    updatePoll,
+    ...(replacement ? replaceQuestionStatements(c.env, poll.id, replacement, newRevision) : textEdits),
+  ]);
+  if (Number(updatedPoll?.meta.changes ?? 0) !== 1) {
+    throw conflict("CONCURRENT_UPDATE", "The poll changed or received votes. Reload and try again.");
   }
 
   const updated = await getPollRow(c.env, poll.id);
@@ -420,9 +397,10 @@ api.post("/tenants/:tenantId/polls/:pollId/status", async (c) => {
       `Cannot move a ${poll.status} poll to ${status}`,
     );
   }
-  await c.env.DB.prepare("UPDATE polls SET status = ?1, updated_at = ?2 WHERE id = ?3")
-    .bind(status, nowIso(), poll.id)
+  const changed = await c.env.DB.prepare("UPDATE polls SET status = ?1, updated_at = ?2, revision = ?4 WHERE id = ?3 AND status = ?5 AND revision = ?6")
+    .bind(status, nowIso(), poll.id, randomId(), poll.status, poll.revision)
     .run();
+  if (Number(changed.meta.changes ?? 0) !== 1) throw conflict("CONCURRENT_UPDATE", "Poll status changed. Reload and try again.");
   await recordAudit(c.env, {
     tenantId,
     actor: actorLabel(admin),
@@ -461,6 +439,12 @@ api.post("/tenants/:tenantId/images", async (c) => {
   if (!sniffed) throw badRequest("File contents do not match the declared image type");
   const key = `t/${tenantId}/${randomId()}.${sniffed.ext}`;
   await createObjectStore(c.env).put(key, bytes, sniffed.contentType);
+  const stillExists = await c.env.DB.prepare("SELECT id FROM tenants WHERE id = ?1").bind(tenantId).first();
+  if (!stillExists) {
+    await c.env.DB.prepare("INSERT INTO object_cleanup (tenant_id, created_at, generation) VALUES (?1, ?2, lower(hex(randomblob(16)))) ON CONFLICT(tenant_id) DO UPDATE SET generation = excluded.generation")
+      .bind(tenantId, nowIso()).run();
+    throw notFound("Workspace not found");
+  }
   return c.json({ key, url: `${originOf(c)}/images/${key}` }, 201);
 });
 
@@ -496,6 +480,17 @@ api.post("/polls/:pollId/vote", async (c) => {
 
   // Voter identity: a verified login wins over an anonymous voter token.
   const sub = await optionalVoterSub(c);
+  if (sub && !bearerToken(c)) {
+    const origin = c.req.header("origin");
+    const site = c.req.header("sec-fetch-site");
+    if (origin) {
+      if (origin === "null" || (origin !== originOf(c) && !(await isAllowedTenantOrigin(c.env, poll.tenant_id, origin)))) {
+        throw forbidden("Untrusted voting origin");
+      }
+    } else if (site === "cross-site" || site === "same-site") {
+      throw forbidden("Voting origin required");
+    }
+  }
   const body = await jsonBody(c);
 
   let voterKey: string;
@@ -528,8 +523,7 @@ api.post("/polls/:pollId/vote", async (c) => {
   const questions = await listQuestionRows(c.env, poll.id);
   const options = await listOptionRows(c.env, poll.id);
   const answers = resolveAnswers(body, questions, options);
-  await upsertBallot(c.env, poll.id, voterKey, ballotDocument(answers));
-  await recordVoteEvent(c.env, poll.id);
+  await upsertBallot(c.env, poll, voterKey, ballotDocument(answers), sub !== null);
   await dispatchWebhooks(c.env, poll.tenant_id, "vote.cast", {
     poll_id: poll.id,
     voter: sub ? "user" : "anonymous",
@@ -580,6 +574,8 @@ export async function serveImage(env: Env, key: string): Promise<Response> {
       { status: 404 },
     );
   }
+  const tenant = await env.DB.prepare("SELECT id FROM tenants WHERE id = ?1").bind(match[1]).first();
+  if (!tenant) return Response.json({ error: { code: "NOT_FOUND", message: "Image not found" } }, { status: 404 });
   const obj = await createObjectStore(env).get(key.toLowerCase());
   if (!obj) {
     return Response.json(
@@ -591,7 +587,7 @@ export async function serveImage(env: Env, key: string): Promise<Response> {
   headers.set("content-type", contentType);
   headers.set("x-content-type-options", "nosniff");
   headers.set("content-disposition", `inline; filename="image.${ext}"`);
-  headers.set("cache-control", "public, max-age=86400, immutable");
+  headers.set("cache-control", "no-store");
   headers.set("etag", obj.httpEtag);
   return new Response(obj.body, { headers });
 }

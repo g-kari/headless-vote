@@ -108,6 +108,8 @@ export type AdminPrincipal =
 /** A signed-in user (admin UI session). The subject comes from the configured auth provider. */
 export interface SessionUser {
   kind: "session";
+  sessionVersion?: number;
+  authProvider?: "local" | "oidc";
   sub: string;
   name?: string;
   email?: string;
