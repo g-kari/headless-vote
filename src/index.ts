@@ -7,6 +7,52 @@ import type { Env, Variables } from "./types";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
+/**
+ * Security headers set by the Worker itself (not left to zone config).
+ * The CSP allows the admin UI's own inline <style>/<script> blocks
+ * (script-src/style-src 'unsafe-inline') while blocking external
+ * origins, objects, framing and base-tag hijacking.
+ */
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+function setSecurityHeaders(h: Headers): void {
+  h.set("content-security-policy", CONTENT_SECURITY_POLICY);
+  h.set("x-content-type-options", "nosniff");
+  h.set("x-frame-options", "DENY");
+  h.set("referrer-policy", "same-origin");
+  h.set("strict-transport-security", "max-age=31536000; includeSubDomains");
+  h.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
+  h.set("cross-origin-opener-policy", "same-origin");
+}
+
+export function applySecurityHeaders(res: Response): Response {
+  try {
+    setSecurityHeaders(res.headers);
+    return res;
+  } catch {
+    // Responses from the ASSETS binding have immutable headers: clone.
+    const clone = new Response(res.body, res);
+    setSecurityHeaders(clone.headers);
+    return clone;
+  }
+}
+
+app.use(async (c, next) => {
+  await next();
+  c.res = applySecurityHeaders(c.res);
+});
+
 app.get("/api/v1/health", (c) => c.json({ ok: true, service: "headless-vote" }));
 
 // Brand assets live in public/ and are served by the platform's asset
@@ -39,31 +85,42 @@ app.get("/images/t/:tenantId/:file", async (c) => {
 
 app.onError((err, c) => {
   if (err instanceof ApiError) {
-    return c.json(
-      { error: { code: err.code, message: err.message } },
-      err.status as 400,
+    return applySecurityHeaders(
+      c.json(
+        { error: { code: err.code, message: err.message } },
+        err.status as 400,
+        err.headers,
+      ),
     );
   }
   console.error("unhandled error", err);
   const wantsHtml = (c.req.header("accept") ?? "").includes("text/html") &&
     !c.req.path.startsWith("/api/");
   if (wantsHtml) {
-    return c.html(
-      "<!doctype html><meta charset=utf-8><title>Error</title><p>Something went wrong. Please try again.</p>",
-      500,
+    return applySecurityHeaders(
+      c.html(
+        "<!doctype html><meta charset=utf-8><title>Error</title><p>Something went wrong. Please try again.</p>",
+        500,
+      ),
     );
   }
-  return c.json(
-    { error: { code: "INTERNAL", message: "Internal server error" } },
-    500,
+  return applySecurityHeaders(
+    c.json(
+      { error: { code: "INTERNAL", message: "Internal server error" } },
+      500,
+    ),
   );
 });
 
 app.notFound((c) => {
   if (c.req.path.startsWith("/api/")) {
-    return c.json({ error: { code: "NOT_FOUND", message: "Not found" } }, 404);
+    return applySecurityHeaders(
+      c.json({ error: { code: "NOT_FOUND", message: "Not found" } }, 404),
+    );
   }
-  return c.html("<!doctype html><meta charset=utf-8><title>404</title><p>Not found.</p>", 404);
+  return applySecurityHeaders(
+    c.html("<!doctype html><meta charset=utf-8><title>404</title><p>Not found.</p>", 404),
+  );
 });
 
 export default app;

@@ -62,7 +62,7 @@ async function loginAs(sub: string, email: string): Promise<string> {
   );
   expect(callbackRes.status).toBe(302);
   expect(callbackRes.headers.get("location")).toBe("/admin");
-  const session = getCookie(callbackRes, "hv_session");
+  const session = getCookie(callbackRes, "__Host-hv_session");
   expect(session).toBeTruthy();
   return session as string;
 }
@@ -72,19 +72,21 @@ describe("0g0-id login flow for the admin UI", () => {
     const session = await loginAs("ui-user-1", "one@example.com");
 
     const adminRes = await SELF.fetch(`${BASE}/admin`, {
-      headers: { cookie: `hv_session=${session}` },
+      headers: { cookie: `__Host-hv_session=${session}` },
     });
     expect(adminRes.status).toBe(200);
     const adminHtml = await adminRes.text();
     expect(adminHtml).toContain("ワークスペース");
+    const csrf = /name="csrf_token" value="([0-9a-f]{64})"/.exec(adminHtml)?.[1];
+    expect(csrf).toBeTruthy();
 
     const createRes = await SELF.fetch(`${BASE}/admin/workspaces`, {
       method: "POST",
       headers: {
-        cookie: `hv_session=${session}`,
+        cookie: `__Host-hv_session=${session}`,
         "content-type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({ name: "私の投票所" }).toString(),
+      body: new URLSearchParams({ name: "私の投票所", csrf_token: csrf as string }).toString(),
     });
     expect(createRes.status).toBe(200);
     const createdHtml = await createRes.text();
@@ -94,7 +96,7 @@ describe("0g0-id login flow for the admin UI", () => {
 
     // The owner can open the workspace dashboard.
     const dashRes = await SELF.fetch(`${BASE}/admin/workspaces/${tenantId}`, {
-      headers: { cookie: `hv_session=${session}` },
+      headers: { cookie: `__Host-hv_session=${session}` },
     });
     expect(dashRes.status).toBe(200);
     expect(await dashRes.text()).toContain("私の投票所");
@@ -102,12 +104,12 @@ describe("0g0-id login flow for the admin UI", () => {
     // Another logged-in user is not a member and cannot open it.
     const otherSession = await loginAs("ui-user-2", "two@example.com");
     const otherRes = await SELF.fetch(`${BASE}/admin/workspaces/${tenantId}`, {
-      headers: { cookie: `hv_session=${otherSession}` },
+      headers: { cookie: `__Host-hv_session=${otherSession}` },
       redirect: "manual",
     });
     expect(otherRes.status).toBe(302);
     const otherAdmin = await SELF.fetch(`${BASE}/admin`, {
-      headers: { cookie: `hv_session=${otherSession}` },
+      headers: { cookie: `__Host-hv_session=${otherSession}` },
     });
     expect(await otherAdmin.text()).not.toContain("私の投票所");
   });

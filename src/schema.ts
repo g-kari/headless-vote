@@ -1,6 +1,7 @@
 /**
- * Database schema. Kept in sync with migrations/0001_init.sql (the SQL text is
- * identical; tests apply SCHEMA_SQL directly to a fresh D1 database).
+ * Database schema: the union of migrations/0001_init.sql and
+ * migrations/0002_security.sql. Tests apply SCHEMA_SQL directly to a
+ * fresh D1 database.
  */
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS tenants (
@@ -53,6 +54,36 @@ CREATE TABLE IF NOT EXISTS votes (
   UNIQUE (poll_id, voter_key, option_id)
 );
 CREATE INDEX IF NOT EXISTS idx_votes_poll ON votes(poll_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id_hash TEXT PRIMARY KEY,
+  user_sub TEXT NOT NULL,
+  name TEXT,
+  email TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_sub);
+
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+  bucket TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  count INTEGER NOT NULL,
+  PRIMARY KEY (bucket, window_start)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_image_usage (
+  tenant_id TEXT PRIMARY KEY,
+  image_count INTEGER NOT NULL,
+  total_bytes INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_migrations (
+  name TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
+);
 `;
 
 /** Split a multi-statement SQL script into individual statements. */
