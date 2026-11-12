@@ -51,7 +51,7 @@ async function loginAs(sub: string, email: string): Promise<string> {
     { redirect: "manual", headers: { cookie: `hv_oidc_flow=${flowCookie}` } },
   );
   expect(callbackRes.status).toBe(302);
-  const session = getCookie(callbackRes, "hv_session");
+  const session = getCookie(callbackRes, "__Host-hv_session");
   expect(session).toBeTruthy();
   return session as string;
 }
@@ -64,7 +64,7 @@ function csrfFrom(html: string): string {
 
 async function getCsrf(session: string): Promise<string> {
   const res = await SELF.fetch(`${BASE}/admin`, {
-    headers: { cookie: `hv_session=${session}` },
+    headers: { cookie: `__Host-hv_session=${session}` },
   });
   expect(res.status).toBe(200);
   return csrfFrom(await res.text());
@@ -79,7 +79,7 @@ async function createWorkspaceViaUi(
   const res = await SELF.fetch(`${BASE}/admin/workspaces`, {
     method: "POST",
     headers: {
-      cookie: `hv_session=${session}`,
+      cookie: `__Host-hv_session=${session}`,
       "content-type": "application/x-www-form-urlencoded",
     },
     body: new URLSearchParams({ name, csrf_token: csrf }).toString(),
@@ -209,7 +209,7 @@ describe("poll edit page option embedding", () => {
 
     const pageRes = await SELF.fetch(
       `${BASE}/admin/workspaces/${tenantId}/polls/${p.poll.id}`,
-      { headers: { cookie: `hv_session=${session}` } },
+      { headers: { cookie: `__Host-hv_session=${session}` } },
     );
     expect(pageRes.status).toBe(200);
     const html = await pageRes.text();
@@ -313,6 +313,31 @@ describe("rate limits", () => {
     expect(Number(over.headers.get("retry-after"))).toBeGreaterThan(0);
   });
 
+  it("caps tenant creation globally per day as well", async () => {
+    const bucket = await sha256Hex("rl:tenant-create-global:all");
+    const dayStart = Math.floor(Math.floor(Date.now() / 1000) / 86400) * 86400;
+    await env.DB.prepare(
+      "INSERT INTO rate_limit_buckets (bucket, window_start, count) VALUES (?1, ?2, 1000) ON CONFLICT (bucket, window_start) DO UPDATE SET count = 1000",
+    )
+      .bind(bucket, dayStart)
+      .run();
+    const res = await SELF.fetch(`${BASE}/api/v1/tenants`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "cf-connecting-ip": "203.0.113.200",
+      },
+      body: JSON.stringify({ name: "global-cap" }),
+    });
+    expect(res.status).toBe(429);
+    // Clean up so later tests in this file are unaffected.
+    await env.DB.prepare(
+      "DELETE FROM rate_limit_buckets WHERE bucket = ?1",
+    )
+      .bind(bucket)
+      .run();
+  });
+
   it("limits votes per poll and IP", async () => {
     const tenant = await createTenant();
     const { pollId, optionIds } = await createPublishedPoll(tenant, [
@@ -411,7 +436,7 @@ describe("CSRF protection", () => {
     const res = await SELF.fetch(`${BASE}/admin/workspaces`, {
       method: "POST",
       headers: {
-        cookie: `hv_session=${session}`,
+        cookie: `__Host-hv_session=${session}`,
         "content-type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams({ name: "CSRFなし" }).toString(),
@@ -430,7 +455,7 @@ describe("CSRF protection", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        cookie: `hv_session=${session}`,
+        cookie: `__Host-hv_session=${session}`,
       },
       body: payload,
     });
@@ -441,7 +466,7 @@ describe("CSRF protection", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        cookie: `hv_session=${session}`,
+        cookie: `__Host-hv_session=${session}`,
         "x-csrf-token": csrf,
       },
       body: payload,
@@ -455,7 +480,7 @@ describe("logout and session revocation", () => {
     const session = await loginAs("sec-logout-user", "logout@example.com");
     const getLogout = await SELF.fetch(`${BASE}/admin/logout`, {
       redirect: "manual",
-      headers: { cookie: `hv_session=${session}` },
+      headers: { cookie: `__Host-hv_session=${session}` },
     });
     expect(getLogout.status).toBe(404);
 
@@ -463,7 +488,7 @@ describe("logout and session revocation", () => {
       method: "POST",
       redirect: "manual",
       headers: {
-        cookie: `hv_session=${session}`,
+        cookie: `__Host-hv_session=${session}`,
         "content-type": "application/x-www-form-urlencoded",
       },
       body: "",
@@ -475,7 +500,7 @@ describe("logout and session revocation", () => {
       method: "POST",
       redirect: "manual",
       headers: {
-        cookie: `hv_session=${session}`,
+        cookie: `__Host-hv_session=${session}`,
         "content-type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams({ csrf_token: csrf }).toString(),
@@ -484,7 +509,7 @@ describe("logout and session revocation", () => {
 
     // The same cookie value must no longer authenticate.
     const admin = await SELF.fetch(`${BASE}/admin`, {
-      headers: { cookie: `hv_session=${session}` },
+      headers: { cookie: `__Host-hv_session=${session}` },
     });
     expect(await admin.text()).toContain("0g0-id でログイン");
   });
@@ -498,14 +523,14 @@ describe("logout and session revocation", () => {
       method: "POST",
       redirect: "manual",
       headers: {
-        cookie: `hv_session=${s1}`,
+        cookie: `__Host-hv_session=${s1}`,
         "content-type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams({ csrf_token: csrf }).toString(),
     });
     expect(res.status).toBe(302);
     const admin2 = await SELF.fetch(`${BASE}/admin`, {
-      headers: { cookie: `hv_session=${s2}` },
+      headers: { cookie: `__Host-hv_session=${s2}` },
     });
     expect(await admin2.text()).toContain("0g0-id でログイン");
   });

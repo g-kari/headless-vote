@@ -41,6 +41,15 @@ export async function consumeRateLimit(
     .bind(bucket, windowStart)
     .first<{ count: number }>();
   const count = row?.count ?? 1;
+  if (count === 1) {
+    // First hit in a fresh window: drop this bucket's expired windows
+    // so the table does not grow without bound.
+    await env.DB.prepare(
+      "DELETE FROM rate_limit_buckets WHERE bucket = ?1 AND window_start < ?2",
+    )
+      .bind(bucket, windowStart)
+      .run();
+  }
   return {
     allowed: count <= limit,
     retryAfterSeconds: windowStart + windowSeconds - now,
@@ -69,6 +78,7 @@ export const HOUR = 3600;
 /** Agreed limits (see PR description for the rationale). */
 export const LIMITS = {
   tenantCreatePerIpPerHour: 30,
+  tenantCreateGlobalPerDay: 1000,
   workspaceCreatePerUserPerHour: 30,
   loginStartPerIpPerHour: 60,
   votePerPollIpPerHour: 600,

@@ -38,7 +38,9 @@ export function bearerToken(c: Ctx): string | null {
 /* the session record itself lives in D1 so it can be revoked.        */
 /* ------------------------------------------------------------------ */
 
-export const SESSION_COOKIE = "hv_session";
+// __Host- prefix: Secure + Path=/ + no Domain (see cookieHeader), so a
+// sibling subdomain cannot plant a session cookie for this origin.
+export const SESSION_COOKIE = "__Host-hv_session";
 export const FLOW_COOKIE = "hv_oidc_flow";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const FLOW_TTL_SECONDS = 60 * 10; // 10 minutes
@@ -77,6 +79,10 @@ export async function makeSessionCookie(
   const rawId = randomToken("ses");
   const idHash = await sha256Hex(rawId);
   const now = Math.floor(Date.now() / 1000);
+  // Opportunistic cleanup so expired sessions do not accumulate.
+  await env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?1")
+    .bind(now)
+    .run();
   await env.DB.prepare(
     `INSERT INTO sessions (id_hash, user_sub, name, email, created_at, expires_at, revoked_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)`,

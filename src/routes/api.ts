@@ -47,13 +47,21 @@ function originOf(c: { req: { url: string } }): string {
 
 /** Self-serve tenant creation (SaaS onboarding). The API key is shown once. */
 api.post("/tenants", async (c) => {
-  // Unauthenticated endpoint: bound tenant minting per source IP.
+  // Unauthenticated endpoint: bound tenant minting per source IP, and
+  // with a global daily ceiling so distributed sources stay bounded.
   await enforceRateLimit(
     c.env,
     "tenant-create",
     clientIp(c),
     LIMITS.tenantCreatePerIpPerHour,
     HOUR,
+  );
+  await enforceRateLimit(
+    c.env,
+    "tenant-create-global",
+    "all",
+    LIMITS.tenantCreateGlobalPerDay,
+    24 * HOUR,
   );
   const body = await jsonBody(c);
   const name = reqString(body, "name", { max: 120 });
