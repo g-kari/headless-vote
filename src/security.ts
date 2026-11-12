@@ -1,7 +1,8 @@
 /** Request hardening: headers, fetch metadata, rate limits, bounded bodies. */
 
 import { hmacSha256Base64Url, timingSafeEqual } from "./crypto";
-import { badRequest, forbidden, payloadTooLarge, tooManyRequests } from "./errors";
+import { badRequest, forbidden, payloadTooLarge } from "./errors";
+import { createD1RateLimitStore, createRateLimitStore } from "./platform/ratelimit";
 import type { AppContext, Env } from "./types";
 
 export const ASSET_PATHS = new Set([
@@ -220,7 +221,7 @@ export function assertSameOriginMutation(c: AppContext): void {
 
 /**
  * Origin of this request when it is allowed to start OAuth.
- * Production sets APP_ORIGIN (https://vote.0g0.xyz). Localhost http is
+ * Production sets APP_ORIGIN to this deployment's origin. Localhost http is
  * allowed in addition so `wrangler dev` still works.
  */
 export function requireRequestOrigin(env: Env, requestUrl: string): string {
@@ -256,29 +257,7 @@ export async function rateLimit(
   limit: number,
   windowSec: number,
 ): Promise<void> {
-  const now = Math.floor(Date.now() / 1000);
-  const resetAt = now + windowSec;
-  await env.DB.prepare("DELETE FROM rate_limits WHERE reset_at < ?1")
-    .bind(now - 86_400)
-    .run();
-  await env.DB.prepare(
-    `INSERT INTO rate_limits (bucket, hits, reset_at) VALUES (?1, 1, ?2)
-     ON CONFLICT(bucket) DO UPDATE SET
-       hits = CASE WHEN rate_limits.reset_at <= ?3 THEN 1 ELSE rate_limits.hits + 1 END,
-       reset_at = CASE WHEN rate_limits.reset_at <= ?3 THEN ?2 ELSE rate_limits.reset_at END`,
-  )
-    .bind(bucket, resetAt, now)
-    .run();
-  const row = await env.DB.prepare(
-    "SELECT hits, reset_at FROM rate_limits WHERE bucket = ?1",
-  )
-    .bind(bucket)
-    .first<{ hits: number; reset_at: number }>();
-  const hits = Number(row?.hits ?? 0);
-  if (hits > limit) {
-    const retry = Math.max(1, Number(row?.reset_at ?? resetAt) - now);
-    throw tooManyRequests(retry);
-  }
+  await createD1RateLimitStore(env).hit(bucket, limit, windowSec);
 }
 
 export async function rateLimitByIp(
@@ -290,7 +269,7 @@ export async function rateLimitByIp(
   const ip = c.req.header("cf-connecting-ip") ?? "";
   const pepper = c.env.VOTER_KEY_SECRET || c.env.SESSION_SECRET || "rate-limit";
   const hashed = await hmacSha256Base64Url(pepper, `rate/${action}/${ip}`);
-  await rateLimit(c.env, `${action}:${hashed}`, limit, windowSec);
+  await createRateLimitStore(c.env).hit(`${action}:${hashed}`, limit, windowSec);
 }
 
 export function newCspNonce(): string {

@@ -5,7 +5,7 @@ import { assertWebhookUrl, signWebhookBody } from "../src/webhooks";
 import { applySchema } from "./fixtures";
 
 const BASE = "https://vote.test";
-const ISSUER = "https://id.0g0.xyz";
+const ISSUER = "https://idp.example.test";
 
 beforeAll(async () => {
   await applySchema(env.DB);
@@ -239,7 +239,7 @@ describe("roles, quotas, and account data", () => {
     });
     const accountHtml = await account.text();
     expect(accountHtml).toContain("owner@example.com");
-    expect(accountHtml).toContain("0g0-id");
+    expect(accountHtml).toContain("OpenID Connect");
     expect(accountHtml).toContain("パスワード");
 
     const exported = await SELF.fetch(`${BASE}/api/v1/me/export`, {

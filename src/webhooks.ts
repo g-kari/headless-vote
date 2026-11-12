@@ -2,6 +2,8 @@
 
 import { randomId } from "./crypto";
 import { badRequest } from "./errors";
+import { createWebhookTransport } from "./platform/webhook-transport";
+import type { WebhookTransport } from "./platform/ports";
 import { tenantQuotas } from "./quotas";
 import { assertPlainText } from "./security";
 import type { Env } from "./types";
@@ -186,7 +188,23 @@ export async function dispatchWebhooks(
   )
     .bind(tenantId)
     .all<WebhookRow>();
-  await Promise.all(hooks.results.map((hook) => deliver(env, hook, event, data)));
+  const transport = createWebhookTransport(env);
+  await Promise.all(hooks.results.map((hook) => deliver(env, hook, event, data, transport)));
+}
+
+export async function sendSignedWebhook(
+  transport: WebhookTransport,
+  url: string,
+  secret: string,
+  payload: string,
+  event: string,
+): Promise<number> {
+  const signature = await signWebhookBody(secret, payload);
+  return transport.post(url, payload, {
+    "content-type": "application/json",
+    "x-headless-vote-event": event,
+    "x-headless-vote-signature": `v1=${signature}`,
+  });
 }
 
 async function deliver(
@@ -194,6 +212,7 @@ async function deliver(
   hook: WebhookRow,
   event: WebhookEvent,
   data: Record<string, unknown>,
+  transport: WebhookTransport,
 ): Promise<void> {
   let subscribed: string[] = [];
   try {
@@ -212,20 +231,7 @@ async function deliver(
   let status = 0;
   try {
     const secret = await decryptSecret(env, hook.secret_enc);
-    const signature = await signWebhookBody(secret, payload);
-    const res = await fetch(hook.url, {
-      method: "POST",
-      redirect: "manual",
-      signal: AbortSignal.timeout(3000),
-      headers: {
-        "content-type": "application/json",
-        "x-headless-vote-event": event,
-        "x-headless-vote-signature": `v1=${signature}`,
-      },
-      body: payload,
-    });
-    status = res.status;
-    await res.body?.cancel();
+    status = await sendSignedWebhook(transport, hook.url, secret, payload, event);
   } catch {
     status = 0;
   }

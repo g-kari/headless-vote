@@ -1,7 +1,8 @@
 /**
- * Minimal OIDC client/verifier for 0g0-id (issuer https://id.0g0.xyz).
+ * Generic OIDC client.
  * - Admin UI login: authorization code flow + PKCE S256.
- * - Logged-in voting: verifies JWTs (id_token) issued by 0g0-id via JWKS (ES256).
+ * - Logged-in voting: verifies JWTs from the configured issuer via JWKS (ES256).
+ * The issuer, client id, and endpoints come from the environment, not from this file.
  */
 import { base64UrlDecode, timingSafeEqual } from "./crypto";
 import { readBodyLimited } from "./security";

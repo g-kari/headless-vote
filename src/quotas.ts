@@ -1,4 +1,5 @@
 import { tooManyRequests } from "./errors";
+import { createAnalyticsStore } from "./platform/analytics-store";
 import type { Env } from "./types";
 
 export interface Quotas {
@@ -52,9 +53,5 @@ export async function assertDailyVoteQuota(env: Env, tenantId: string): Promise<
 }
 
 export async function recordVoteEvent(env: Env, pollId: string): Promise<void> {
-  await env.DB.prepare(
-    "INSERT INTO vote_events (id, poll_id, created_at) VALUES (?1, ?2, ?3)",
-  )
-    .bind(crypto.randomUUID(), pollId, new Date().toISOString())
-    .run();
+  await createAnalyticsStore(env).record(pollId, new Date().toISOString());
 }

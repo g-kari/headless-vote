@@ -36,6 +36,8 @@ import {
   updateQuestionText,
   type QuestionInput,
 } from "../questions";
+import { createObjectStore } from "../platform/objects";
+import { selectAuthProvider } from "../platform";
 import { assertPlainText, assertSameOriginMutation, isSafeImageKey, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
 import { createWebhook, disableWebhook, dispatchWebhooks, listWebhooks, WEBHOOK_EVENTS, type WebhookEvent } from "../webhooks";
 import type { Env, OptionRow, PollRow, TenantRow, Variables } from "../types";
@@ -143,7 +145,7 @@ async function assertImageKeyBelongsToTenant(
   if (!isSafeImageKey(imageKey, tenantId)) {
     throw badRequest("image_key does not belong to this tenant");
   }
-  const obj = await env.IMAGES.head(imageKey);
+  const obj = await createObjectStore(env).head(imageKey);
   if (!obj) throw badRequest("image_key does not reference an uploaded image");
 }
 
@@ -458,7 +460,7 @@ api.post("/tenants/:tenantId/images", async (c) => {
   const sniffed = sniffImage(bytes, contentType);
   if (!sniffed) throw badRequest("File contents do not match the declared image type");
   const key = `t/${tenantId}/${randomId()}.${sniffed.ext}`;
-  await c.env.IMAGES.put(key, bytes, { httpMetadata: { contentType: sniffed.contentType } });
+  await createObjectStore(c.env).put(key, bytes, sniffed.contentType);
   return c.json({ key, url: `${originOf(c)}/images/${key}` }, 201);
 });
 
@@ -492,7 +494,7 @@ api.post("/polls/:pollId/vote", async (c) => {
     throw conflict("POLL_CLOSED", "This poll is closed for voting");
   }
 
-  // Voter identity: logged-in (0g0-id sub) wins over anonymous voter token.
+  // Voter identity: a verified login wins over an anonymous voter token.
   const sub = await optionalVoterSub(c);
   const body = await jsonBody(c);
 
@@ -503,7 +505,7 @@ api.post("/polls/:pollId/vote", async (c) => {
     if (poll.require_login === 1) {
       throw unauthorized(
         "LOGIN_REQUIRED",
-        "This poll requires voters to log in with 0g0-id",
+        "This poll requires voters to log in",
       );
     }
     const voterToken = body["voter_token"];
@@ -578,7 +580,7 @@ export async function serveImage(env: Env, key: string): Promise<Response> {
       { status: 404 },
     );
   }
-  const obj = await env.IMAGES.get(key.toLowerCase());
+  const obj = await createObjectStore(env).get(key.toLowerCase());
   if (!obj) {
     return Response.json(
       { error: { code: "NOT_FOUND", message: "Image not found" } },
@@ -834,7 +836,9 @@ api.get("/me", async (c) => {
     profile: { sub: user.sub, email: user.email, name: user.name },
     auth: "oidc",
     password: null,
-    note: "Sign-in, email verification, and password reset are handled by 0g0-id. This app stores no password.",
+    note: selectAuthProvider(c.env.AUTH_PROVIDER).capabilities.localPasswords
+      ? "This deployment stores passwords. Email confirmation and password reset use the configured email adapter."
+      : "Sign-in is delegated to the configured identity provider. This app stores no password.",
     workspaces: await listMemberships(c.env, user.sub),
   });
 });

@@ -139,7 +139,7 @@ export function layout(opts: {
     ? `<span class="user">${escapeHtml(opts.userEmail)}</span>
        <a class="btn small" href="/admin/account">アカウント</a>
        <form method="post" action="/admin/logout" style="margin:0"><button class="btn small" type="submit">ログアウト</button></form>`
-    : `<a class="btn small primary" href="/admin/login">0g0-id でログイン</a>`;
+    : `<a class="btn small primary" href="/admin/login">ログイン</a>`;
   return `<!doctype html>
 <html lang="ja">
 <head>

@@ -1,7 +1,7 @@
 import { signValue, verifySignedValue } from "./crypto";
 import { forbidden, unauthorized } from "./errors";
 import { findActiveApiKey, touchApiKey } from "./keys";
-import { verifyJwt } from "./oidc";
+import { selectAuthProvider } from "./platform";
 import { assertSameOriginMutation } from "./security";
 import type { AdminPrincipal, ApiScope, AppContext, Env, SessionUser, TenantRow } from "./types";
 
@@ -231,24 +231,18 @@ export async function requireAdmin(
 
 /**
  * Optional voter identity for the voting API.
- * Returns the 0g0-id `sub` when a valid JWT is presented, null when no
- * Authorization header is present. Throws 401 when a token is presented
- * but invalid (never silently downgrades to anonymous).
+ * A bearer token is checked by the configured auth provider. When no token
+ * is present, a valid session cookie is used. Throws 401 when a token is
+ * presented but invalid (never silently downgrades to anonymous).
  */
 export async function optionalVoterSub(c: Ctx): Promise<string | null> {
   const token = bearerToken(c);
-  if (!token) return null;
-  if (!c.env.OIDC_CLIENT_ID) {
-    throw unauthorized("INVALID_TOKEN", "Presented login token is not valid");
-  }
-  try {
-    const verified = await verifyJwt(c.env, token, {
-      audience: c.env.OIDC_CLIENT_ID,
-    });
+  if (token) {
+    const verified = await selectAuthProvider(c.env.AUTH_PROVIDER).verifyAccessToken(c.env, token);
     return verified.sub;
-  } catch {
-    throw unauthorized("INVALID_TOKEN", "Presented login token is not valid");
   }
+  const session = await getSessionUser(c);
+  return session?.sub ?? null;
 }
 
 function cleanClaim(value: unknown, max: number): string | undefined {

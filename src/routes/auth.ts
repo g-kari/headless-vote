@@ -8,18 +8,58 @@ import {
   type FlowState,
 } from "../auth";
 import { pkceChallenge, randomToken, sha256Hex, timingSafeEqual } from "../crypto";
-import { badRequest } from "../errors";
+import { badRequest, notFound } from "../errors";
 import { exchangeCode, getDiscovery, verifyJwt } from "../oidc";
-import { assertSameOriginMutation, rateLimitByIp, requireRequestOrigin } from "../security";
-import { layout } from "../views";
+import {
+  loginLocalUser,
+  registerLocalUser,
+  requestPasswordReset,
+  resetLocalPassword,
+  verifyLocalEmail,
+} from "../platform/auth-local";
+import { createEmailSender } from "../platform/email";
+import { selectAuthProvider } from "../platform";
+import { assertSameOriginMutation, rateLimitByIp, readUrlEncodedForm, requireRequestOrigin } from "../security";
+import { escapeHtml, layout } from "../views";
 import type { Env, Variables } from "../types";
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 const OIDC_ERROR = /^[A-Za-z0-9_]{1,64}$/;
 
-/** Start the 0g0-id login (authorization code flow + PKCE S256). */
+function localPage(c: { req: { url: string }; get: (key: "cspNonce") => string | undefined }, title: string, body: string, status = 200) {
+  return c instanceof Object
+    ? layout({
+        title,
+        userEmail: null,
+        body,
+        origin: new URL(c.req.url).origin,
+        nonce: c.get("cspNonce") ?? "",
+      })
+    : "";
+}
+
+function requireLocalProvider(env: Env) {
+  const provider = selectAuthProvider(env.AUTH_PROVIDER);
+  if (provider.id !== "local") throw notFound("Not found");
+  return provider;
+}
+
+/** Start login with the configured auth provider. */
 authRoutes.get("/admin/login", async (c) => {
+  if (selectAuthProvider(c.env.AUTH_PROVIDER).id === "local") {
+    const body = `
+      <h1>ログイン</h1>
+      <form method="post" action="/auth/local/login">
+        <label for="email">メールアドレス</label>
+        <input id="email" name="email" type="email" required maxlength="200" autocomplete="username">
+        <label for="password">パスワード</label>
+        <input id="password" name="password" type="password" required minlength="10" maxlength="200" autocomplete="current-password">
+        <div class="actions"><button class="btn primary" type="submit">ログイン</button></div>
+      </form>
+      <p class="muted"><a href="/auth/local/register">アカウントを作成</a> · <a href="/auth/local/forgot">パスワードを再設定</a></p>`;
+    return c.html(localPage(c, "ログイン", body));
+  }
   if (!c.env.OIDC_CLIENT_ID) {
     return c.html(
       "<!doctype html><meta charset=utf-8><title>Login not configured</title>" +
@@ -108,6 +148,102 @@ authRoutes.get("/auth/callback", async (c) => {
   c.header("Set-Cookie", clearFlowCookie(c.req.url), { append: true });
   c.header("Cache-Control", "no-store");
   return c.redirect("/admin", 302);
+});
+
+authRoutes.post("/auth/local/login", async (c) => {
+  requireLocalProvider(c.env);
+  assertSameOriginMutation(c);
+  await rateLimitByIp(c, "login", 30, 3600);
+  const form = await readUrlEncodedForm(c);
+  const identity = await loginLocalUser(c.env, String(form.get("email") ?? ""), String(form.get("password") ?? ""));
+  c.header("Set-Cookie", await newSessionCookieForToken(c.env, { email: identity.email, name: identity.name }, identity.sub, c.req.url));
+  c.header("Cache-Control", "no-store");
+  return c.redirect("/admin", 302);
+});
+
+authRoutes.get("/auth/local/register", (c) => {
+  requireLocalProvider(c.env);
+  const body = `
+    <h1>アカウント作成</h1>
+    <form method="post" action="/auth/local/register">
+      <label for="name">名前</label>
+      <input id="name" name="name" type="text" maxlength="120" autocomplete="name">
+      <label for="email">メールアドレス</label>
+      <input id="email" name="email" type="email" required maxlength="200" autocomplete="username">
+      <label for="password">パスワード <span class="hint">10 文字以上。</span></label>
+      <input id="password" name="password" type="password" required minlength="10" maxlength="200" autocomplete="new-password">
+      <div class="actions"><button class="btn primary" type="submit">作成する</button></div>
+    </form>`;
+  return c.html(localPage(c, "アカウント作成", body));
+});
+
+authRoutes.post("/auth/local/register", async (c) => {
+  requireLocalProvider(c.env);
+  assertSameOriginMutation(c);
+  await rateLimitByIp(c, "login", 30, 3600);
+  const origin = requireRequestOrigin(c.env, c.req.url);
+  const form = await readUrlEncodedForm(c);
+  await registerLocalUser(c.env, {
+    email: String(form.get("email") ?? ""),
+    password: String(form.get("password") ?? ""),
+    name: String(form.get("name") ?? ""),
+    origin,
+  }, createEmailSender(c.env));
+  const body = `<h1>確認メールを送りました</h1><p>メールのリンクを開くとログインできます。送信先は設定したメールアダプタです。</p>`;
+  return c.html(localPage(c, "確認メール", body));
+});
+
+authRoutes.get("/auth/local/verify", async (c) => {
+  requireLocalProvider(c.env);
+  await verifyLocalEmail(c.env, c.req.query("token") ?? "");
+  const body = `<h1>メールを確認しました</h1><p><a href="/admin/login">ログイン</a></p>`;
+  return c.html(localPage(c, "メールを確認しました", body));
+});
+
+authRoutes.get("/auth/local/forgot", (c) => {
+  requireLocalProvider(c.env);
+  const body = `
+    <h1>パスワード再設定</h1>
+    <form method="post" action="/auth/local/forgot">
+      <label for="email">メールアドレス</label>
+      <input id="email" name="email" type="email" required maxlength="200" autocomplete="username">
+      <div class="actions"><button class="btn primary" type="submit">再設定リンクを送る</button></div>
+    </form>`;
+  return c.html(localPage(c, "パスワード再設定", body));
+});
+
+authRoutes.post("/auth/local/forgot", async (c) => {
+  requireLocalProvider(c.env);
+  assertSameOriginMutation(c);
+  await rateLimitByIp(c, "login", 30, 3600);
+  const origin = requireRequestOrigin(c.env, c.req.url);
+  const form = await readUrlEncodedForm(c);
+  await requestPasswordReset(c.env, String(form.get("email") ?? ""), origin, createEmailSender(c.env));
+  const body = `<h1>送信しました</h1><p>そのメールのアカウントがある場合、再設定リンクを送りました。</p>`;
+  return c.html(localPage(c, "パスワード再設定", body));
+});
+
+authRoutes.get("/auth/local/reset", (c) => {
+  requireLocalProvider(c.env);
+  const token = c.req.query("token") ?? "";
+  const body = `
+    <h1>新しいパスワード</h1>
+    <form method="post" action="/auth/local/reset">
+      <input type="hidden" name="token" value="${escapeHtml(token)}">
+      <label for="password">パスワード</label>
+      <input id="password" name="password" type="password" required minlength="10" maxlength="200" autocomplete="new-password">
+      <div class="actions"><button class="btn primary" type="submit">保存する</button></div>
+    </form>`;
+  return c.html(localPage(c, "新しいパスワード", body));
+});
+
+authRoutes.post("/auth/local/reset", async (c) => {
+  requireLocalProvider(c.env);
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  await resetLocalPassword(c.env, String(form.get("token") ?? ""), String(form.get("password") ?? ""));
+  const body = `<h1>パスワードを更新しました</h1><p><a href="/admin/login">ログイン</a></p>`;
+  return c.html(localPage(c, "パスワードを更新しました", body));
 });
 
 authRoutes.post("/admin/logout", (c) => {

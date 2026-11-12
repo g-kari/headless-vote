@@ -340,7 +340,7 @@ describe("admin settings screen", () => {
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain("許可しているオリジン");
-    expect(html).toContain("https://vote.0g0.xyz");
+    expect(html).toContain("同じオリジン");
     expect(html).toContain('name="origin"');
 
     const forged = await SELF.fetch(`${BASE}/admin/workspaces/${tenantId}/origins`, {

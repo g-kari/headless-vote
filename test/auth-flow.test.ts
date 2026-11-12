@@ -4,7 +4,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 
 const BASE = "https://vote.test";
-const ISSUER = "https://id.0g0.xyz";
+const ISSUER = "https://idp.example.test";
 
 beforeAll(async () => {
   await applySchema(env.DB);
@@ -74,7 +74,7 @@ async function loginAs(sub: string, email: string): Promise<string> {
   return session as string;
 }
 
-describe("0g0-id login flow for the admin UI", () => {
+describe("OIDC login flow for the admin UI", () => {
   it("logs in, creates a workspace, and isolates it from other users", async () => {
     const session = await loginAs("ui-user-1", "one@example.com");
 
@@ -138,7 +138,7 @@ describe("0g0-id login flow for the admin UI", () => {
     const res = await SELF.fetch(`${BASE}/admin`);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("0g0-id でログイン");
+    expect(html).toContain("OpenID Connect でログイン");
     expect(html).toContain('href="/favicon.svg"');
   });
 });

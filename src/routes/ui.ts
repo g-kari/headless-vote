@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import { deleteAccountData, deleteWorkspace, listMemberships } from "../account";
+import { selectAuthProvider } from "../platform";
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { getSessionUser, isTenantMember, listTenantsForUser, memberRole } from "../auth";
 import {
@@ -104,8 +105,8 @@ ui.get("/admin", async (c) => {
   if (!user) {
     const body = `
       <h1>管理画面</h1>
-      <p class="lead">管理画面のログインは 0g0-id を使います。ログインすると、自分のワークスペース（投票の運用単位）を作成し、設問・選択肢・画像の設定や結果の確認ができます。</p>
-      <div class="actions"><a class="btn primary" href="/admin/login">0g0-id でログイン</a></div>
+      <p class="lead">管理画面のログインは ${escapeHtml(selectAuthProvider(c.env.AUTH_PROVIDER).label(c.env))} を使います。ログインすると、自分のワークスペース（投票の運用単位）を作成し、設問・選択肢・画像の設定や結果の確認ができます。</p>
+      <div class="actions"><a class="btn primary" href="/admin/login">${escapeHtml(selectAuthProvider(c.env.AUTH_PROVIDER).label(c.env))} でログイン</a></div>
       <h2>API キーで使う場合</h2>
       <p class="muted">画面を使わない運用では、テナント作成時に発行される API キーで管理 API を呼び出せます。API キーの発行は <code>POST /api/v1/tenants</code> から行えます（README 参照）。</p>`;
     return c.html(layout({ title: "管理画面", userEmail: null, body, origin: originOf(c), nonce: c.get("cspNonce") ?? "" }));
@@ -421,7 +422,7 @@ function settingsBody(
     ${extras.members}
     ${extras.webhooks}
     <p class="lead">${escapeHtml(workspaceName)} の投票を、別のサイトのブラウザから呼ぶときに許可するオリジンです。
-    <code>https://vote.0g0.xyz</code> と同じサイトから使う場合は追加不要です。ワイルドカードやパスは使えません。</p>
+    この管理画面と同じオリジンから使う場合は追加不要です。ワイルドカードやパスは使えません。</p>
     ${error ? `<div class="notice bad" role="alert">${escapeHtml(error)}</div>` : ""}
     <h2>許可しているオリジン</h2>
     <section class="card">
@@ -473,7 +474,7 @@ async function settingsExtras(env: Env, tenantId: string, owner: boolean) {
     quotas: `<h2>利用上限</h2><section class="card"><p>プラン <strong>${escapeHtml(quotas.plan)}</strong>。投票 ${quotas.polls} 件、有効な API キー ${quotas.keys} 個、Webhook ${quotas.webhooks} 件、1 日の投票送信 ${quotas.votesPerDay} 件まで。上限はワークスペースに保存され、自分では引き上げられません。</p></section>`,
     members: `<h2>メンバー</h2><section class="card">${memberItems ? `<ul>${memberItems}</ul>` : `<p class="muted">メンバーはいません。</p>`}
       ${owner ? `<form method="post" action="/admin/workspaces/${tid}/members" aria-labelledby="member-heading">
-        <h3 id="member-heading">0g0-id の sub で追加</h3>
+        <h3 id="member-heading">利用者 ID（sub）で追加</h3>
         <label for="member-sub">sub</label>
         <input id="member-sub" name="user_sub" type="text" required maxlength="256" autocomplete="off" spellcheck="false">
         <label for="member-role">役割</label>
@@ -795,7 +796,9 @@ ui.get("/admin/account", async (c) => {
       <p>名前: ${escapeHtml(user.name ?? "未設定")}</p>
       <p>メール: ${escapeHtml(user.email ?? "未設定")}</p>
       <p>sub: <code>${escapeHtml(user.sub)}</code></p>
-      <p class="muted">ログインは 0g0-id（OIDC）です。このアプリはパスワードを保存しないため、メール確認とパスワード再設定は 0g0-id 側の機能です。ここにはコピーした表示名とメールだけがあります。</p>
+      <p class="muted">${selectAuthProvider(c.env.AUTH_PROVIDER).capabilities.localPasswords
+        ? "このデプロイはメールとパスワードを保存します。確認と再設定のリンクは、設定したメール送信アダプタから届きます。"
+        : `${escapeHtml(selectAuthProvider(c.env.AUTH_PROVIDER).label(c.env))} でログインしています。このアプリはパスワードを保存しないため、メール確認とパスワード再設定は認証プロバイダ側の機能です。`}</p>
     </section>
     <h2>参加しているワークスペース</h2>
     <section class="card">
@@ -804,7 +807,7 @@ ui.get("/admin/account", async (c) => {
     </section>
     <h2>このアプリ上のデータを削除</h2>
     <section class="card">
-      <p class="muted">あなたが唯一のオーナーであるワークスペースは削除されます。他にオーナーがいるワークスペースでは、あなたの参加だけが外れます。0g0-id のアカウント自体は削除されません。</p>
+      <p class="muted">あなたが唯一のオーナーであるワークスペースは削除されます。他にオーナーがいるワークスペースでは、あなたの参加だけが外れます。外部の認証プロバイダのアカウント自体は削除されません。ローカル認証の場合は、このアプリのパスワードも削除されます。</p>
       <form method="post" action="/admin/account/delete">
         <label for="confirm-delete">確認のため <code>delete my data</code> と入力</label>
         <input id="confirm-delete" name="confirm" type="text" required maxlength="40" autocomplete="off">
@@ -1092,7 +1095,7 @@ function pollFormBody(opts: {
       <div class="check">
         <input id="require-login" type="checkbox" ${p?.require_login === 1 ? "checked" : ""}>
         <label for="require-login" style="margin:0"><span>ログイン必須にする</span>
-        <small>オンにすると 0g0-id でログインした人だけが投票できます。オフ（既定）なら誰でも投票できます。</small></label>
+        <small>オンにするとログインした人だけが投票できます。オフ（既定）なら誰でも投票できます。</small></label>
       </div>
       <h2>設問</h2>
       <p class="muted small">各設問は単一選択、複数選択、または自由記述です。並び順は上から下です。最大 20 問。</p>

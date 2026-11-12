@@ -1,3 +1,4 @@
+import { deleteLocalAccount } from "./platform/auth-local";
 import type { Env } from "./types";
 
 export async function listMemberships(env: Env, sub: string) {
@@ -29,7 +30,7 @@ export async function deleteWorkspace(env: Env, tenantId: string): Promise<void>
 /**
  * Removes this app's copy of the person's memberships.
  * A workspace is deleted only when they are its sole owner.
- * The 0g0-id account itself is not deleted.
+ * An external identity-provider account is not deleted. A local account is.
  */
 export async function deleteAccountData(env: Env, sub: string): Promise<{ deleted_workspaces: string[] }> {
   const memberships = await listMemberships(env, sub);
@@ -51,5 +52,6 @@ export async function deleteAccountData(env: Env, sub: string): Promise<{ delete
       .bind(membership.id, sub)
       .run();
   }
+  await deleteLocalAccount(env, sub);
   return { deleted_workspaces: deleted };
 }

@@ -14,8 +14,8 @@ Headless な投票 SaaS です。
 - Cloudflare Workers（Hono / TypeScript）
 - D1（テナント・投票・票のデータ）
 - R2（設問・選択肢の画像）
-- 管理画面のログインは 0g0-id（OIDC、認可コード + PKCE）
-- 本番ドメインは https://vote.0g0.xyz
+- ログインは差し替え可能な認証アダプタ（既定は汎用 OIDC。ローカルのメールとパスワードも同梱）
+- ホスト名、発行者、クライアント ID は設定で与えます。リポジトリには本番の値を含めません
 
 ## 概念
 
@@ -27,7 +27,7 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 
 管理操作の認証は 2 通りです。
 
-- 管理画面: 0g0-id でログインし、セッション Cookie で認証します。
+- 管理画面: 設定した認証プロバイダでログインし、セッション Cookie で認証します。
   ログインしたユーザー（sub）がメンバーであるテナントだけを操作できます。
 - 管理 API: `Authorization: Bearer <API キー>` で認証します。
 
@@ -35,7 +35,7 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 
 投票はログインしてもしなくてもできます。
 
-- ログイン時: 0g0-id の ID トークン（`Authorization: Bearer <ID トークン>`）を送ります。
+- ログイン時: 認証プロバイダの ID トークン（`Authorization: Bearer <ID トークン>`）を送ります。ローカル認証ではセッション Cookie を使います。
   1 人 1 票の判定はユーザー（sub）単位です。
 - 未ログイン時: 投票者トークン（任意の不透明な文字列）を送ります。
   判定はトークン単位です。
@@ -43,8 +43,8 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 再投票すると上書きされます。締切後は投票できません。
 投票ごとに「ログイン必須」か「誰でも投票可」かを選べます。既定は「誰でも投票可」です。
 
-注意: 0g0-id の sub はクライアントごとに変わります（pairwise）。
-このアプリの ID トークンで投票した票は、このアプリの sub に紐付きます。
+注意: OIDC の sub はクライアントごとに変わることがあります（pairwise）。
+このアプリの ID トークンで投票した票は、そのクライアントの sub に紐付きます。
 
 ## API 仕様
 
@@ -162,7 +162,7 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 公開 API（投票の取得・投票・結果）と画像を、別サイトのブラウザから読むには、そのサイトのオリジンをワークスペースの許可リストに入れます。リストはワークスペースごとで、管理画面の設定（`/admin/workspaces/<tenantId>/settings`）から追加・削除します。書き込み API キーでも同じ操作ができます。読み取りキーとメンバー権限のセッションでは変更できません。
 
 - 例: `https://www.example.com`
-- `https://vote.0g0.xyz` 自身からの利用は同一オリジンなので、リストへの追加は不要です
+- このデプロイ自身からの利用は同一オリジンなので、リストへの追加は不要です
 - `https` のみ。例外は `http://localhost`、`http://127.0.0.1`、`http://[::1]`（ポート付き可）
 - パス、クエリ、ユーザー情報、ワイルドカード（`*`）は拒否します。保存時に `https://Example.COM:443/` のような入力は `https://example.com` に正規化します
 - 1 ワークスペースあたり 20 件まで
@@ -175,12 +175,12 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 ## ワークスペースの運用機能
 
 - **API キー**: ワークスペースごとに複数持てます。権限は `read`（参照と書き出し）か `write`（作成・更新に加え、メンバー・Webhook・許可オリジン・削除も可）。平文は発行時に一度だけ返り、保存するのは SHA-256 と先頭のプレフィックスです。`POST /api/v1/tenants/:id/api-keys`、失効は `POST .../api-keys/:keyId/revoke`。従来の `POST .../rotate-key` は、そのリクエストのキーを失効して書き込みキーを 1 つ発行します。有効なキーの上限はワークスペースの `quota_keys`（初期値 10）です。読み取りキーでは発行・失効できません。
-- **役割**: セッションの利用者は `owner` か `member` です。オーナーはメンバー、API キー、Webhook、許可オリジン、ワークスペース削除を操作できます。メンバーは投票・結果・書き出し・推移・操作履歴の閲覧ができます。最後のオーナーは外せません。追加は 0g0-id の `sub` 指定で、招待メールは送りません。
+- **役割**: セッションの利用者は `owner` か `member` です。オーナーはメンバー、API キー、Webhook、許可オリジン、ワークスペース削除を操作できます。メンバーは投票・結果・書き出し・推移・操作履歴の閲覧ができます。最後のオーナーは外せません。追加は認証プロバイダの `sub` 指定で、招待メールは送りません。
 - **複数設問**: 1 つの投票に単一選択・複数選択・自由記述を混在できます。投票は全設問を 1 回で送ります。
 - **開始日時**: `opens_at` を付けると、その時刻より前の投票は `POLL_NOT_OPEN`（409）です。`closes_at` より前である必要があります。
 - **結果の書き出し**: `GET /api/v1/tenants/:id/polls/:pollId/export?format=csv` または `format=json`。集計だけで、投票者トークンは含みません。CSV はスプレッドシートの式として解釈されないようセルを中和します。
 - **ワークスペースの書き出しと削除**: `GET /api/v1/tenants/:id/export`。削除は `DELETE /api/v1/tenants/:id` に `{ "confirm_name": "ワークスペース名" }`。管理画面の設定からも行えます。オーナー（または書き込みキー）だけが削除できます。
-- **アカウント**: `/admin/account` に、セッションの名前・メール・sub を表示します。パスワードとメール確認はこのアプリにありません。ログインは 0g0-id です。`GET /api/v1/me/export` で参加ワークスペースの一覧を書き出します。`DELETE /api/v1/me` は `{ "confirm": "delete my data" }` で、唯一のオーナーであるワークスペースを削除し、それ以外では参加だけを外します。0g0-id のアカウント自体は削除しません。
+- **アカウント**: `/admin/account` に、セッションの名前・メール・sub を表示します。OIDC ではパスワードを保存せず、メール確認と再設定は認証プロバイダ側です。`AUTH_PROVIDER=local` のときはこのアプリがパスワードをハッシュ保存し、確認と再設定のリンクをメールアダプタへ渡します。`GET /api/v1/me/export` で参加ワークスペースの一覧を書き出します。`DELETE /api/v1/me` は `{ "confirm": "delete my data" }` で、唯一のオーナーであるワークスペースを削除し、それ以外では参加だけを外します。外部の認証アカウント自体は削除しません。
 - **操作履歴**: `GET /api/v1/tenants/:id/audit` と管理画面の「操作履歴」。キーの秘密は記録しません。
 - **埋め込みスニペット**: 公開中の投票の管理画面に、取得と投票の例を出します。
 - **推移**: `GET /api/v1/tenants/:id/analytics` と投票ごとの `.../polls/:pollId/analytics`。直近 14 日の送信件数です。同じ人の再投票は別の送信として数えます。
@@ -189,30 +189,33 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 
 ## 管理画面
 
-- `/admin` から 0g0-id でログインします。ログアウトは POST のみです（`/admin/logout` を開いただけではセッションは消えません）。
+- `/admin` から、設定した認証プロバイダでログインします。ログアウトは POST のみです（`/admin/logout` を開いただけではセッションは消えません）。
 - `/admin/account` でプロフィール、参加ワークスペース、自分のデータの書き出しと削除ができます。
 - ワークスペースの作成、投票の作成・編集・公開・締切ができます。
 - 設定画面で許可オリジン、メンバー、Webhook、利用上限を扱います。
 - 設問と選択肢に画像を付けられます（R2 にアップロード）。
 - 結果はバーと集計表で確認できます。推移は日ごとの送信件数です。
 
-### 0g0-id のクライアント登録
+### 認証プロバイダ
 
-認可コードフロー（PKCE S256、パブリッククライアント）を使います。
-クライアントは DCR（RFC 7591）で登録できます。
+既定は汎用 OIDC（認可コード + PKCE S256）です。発行者とクライアント ID は環境変数で与えます。DCR（RFC 7591）に対応した発行者なら、次で公開クライアントを登録できます。発行者とリダイレクト URI は必須です。
 
 ```bash
+OIDC_ISSUER=https://idp.example.com \
+REDIRECT_URI=https://vote.example.com/auth/callback \
 node scripts/register-oidc-client.mjs
-# 既定のリダイレクト URI: https://vote.0g0.xyz/auth/callback
 ```
 
-表示された `client_id` を `wrangler.toml` の `OIDC_CLIENT_ID` に設定して再デプロイします。
-ローカル開発では `REDIRECT_URI=http://localhost:8787/auth/callback` を付けて登録します。
+ローカル開発では `REDIRECT_URI=http://localhost:8787/auth/callback` を付けます。表示された `client_id` を `OIDC_CLIENT_ID` に設定します。
+
+`AUTH_PROVIDER=local` にすると、メールとパスワードをこのアプリのデータベースに保存します。確認と再設定のメールは `EMAIL_PROVIDER`（`outbox`、`http`、`noop`）が送ります。
+
+セルフホストの手順、アダプタの差し替え、設定例は [docs/self-hosting.md](docs/self-hosting.md)、[docs/adapters.md](docs/adapters.md)、[docs/architecture.md](docs/architecture.md) と [config/example.env](config/example.env) にあります。
 
 必要な設定:
 
-- 変数: `OIDC_ISSUER`（既定 `https://id.0g0.xyz`）、`OIDC_CLIENT_ID`、`OIDC_SCOPES`（既定 `openid profile email`）、`APP_ORIGIN`（本番は `https://vote.0g0.xyz`。管理ログインをこのオリジンに限定します）
-- シークレット: `SESSION_SECRET`（セッション Cookie の署名用。`wrangler secret put SESSION_SECRET`）。任意で `VOTER_KEY_SECRET`（投票者識別子の HMAC。未設定時は `SESSION_SECRET` を使います。セッション秘密だけをローテーションしたいときに分けてください）
+- 変数: `AUTH_PROVIDER`、`OIDC_ISSUER`、`OIDC_CLIENT_ID`、`OIDC_SCOPES`（例 `openid profile email`）、`APP_ORIGIN`（管理ログインをこのオリジンに限定します）、`EMAIL_PROVIDER`
+- シークレット: `SESSION_SECRET`（セッション Cookie の署名用。`wrangler secret put SESSION_SECRET`）。任意で `VOTER_KEY_SECRET`（投票者識別子の HMAC。未設定時は `SESSION_SECRET` を使います。セッション秘密だけをローテーションしたいときに分けてください）。値はコミットしません。
 
 ## ローカル開発
 
@@ -236,7 +239,7 @@ npx wrangler r2 bucket create headless-vote-images
 npx wrangler secret put SESSION_SECRET
 npx wrangler d1 migrations apply headless-vote --remote
 node scripts/register-oidc-client.mjs          # client_id を wrangler.toml に記入
-npx wrangler deploy                            # vote.0g0.xyz のカスタムドメインが付きます。workers.dev のホスト名は出しません
+npx wrangler deploy                            # ホスト名は wrangler.toml の routes で付けます。workers.dev は出しません
 ```
 
 ### GitHub 連携の自動デプロイ（Workers Builds）

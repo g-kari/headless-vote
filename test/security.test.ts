@@ -56,16 +56,16 @@ async function login(): Promise<string> {
 describe("OIDC endpoint pinning", () => {
   it("rejects token endpoints that leave the issuer origin", () => {
     expect(() =>
-      assertPinnedOidcUrl("https://id.0g0.xyz", "https://id.0g0.xyz/api/token"),
+      assertPinnedOidcUrl("https://idp.example.test", "https://idp.example.test/api/token"),
     ).not.toThrow();
     expect(() =>
-      assertPinnedOidcUrl("https://id.0g0.xyz", "https://evil.example/api/token"),
+      assertPinnedOidcUrl("https://idp.example.test", "https://evil.example/api/token"),
     ).toThrow();
     expect(() =>
-      assertPinnedOidcUrl("https://id.0g0.xyz", "http://id.0g0.xyz/api/token"),
+      assertPinnedOidcUrl("https://idp.example.test", "http://idp.example.test/api/token"),
     ).toThrow();
     expect(() =>
-      assertPinnedOidcUrl("http://id.0g0.xyz", "http://id.0g0.xyz/api/token"),
+      assertPinnedOidcUrl("http://idp.example.test", "http://idp.example.test/api/token"),
     ).toThrow();
   });
 });

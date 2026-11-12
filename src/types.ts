@@ -3,10 +3,26 @@ export interface Env {
   IMAGES: R2Bucket;
   /** Static assets (public/). Present when the [assets] binding is set. */
   ASSETS?: Fetcher;
-  /** OIDC issuer, e.g. "https://id.0g0.xyz" */
+  /** OIDC issuer origin, configured per deployment. Required when AUTH_PROVIDER=oidc. */
   OIDC_ISSUER: string;
-  /** Registered client_id at the issuer (set after registration). */
+  /** Registered public or confidential client_id at the issuer. */
   OIDC_CLIENT_ID: string;
+  /** Which AuthProvider to use: "oidc" (default) or "local". */
+  AUTH_PROVIDER?: string;
+  /** Name shown on the login button. Defaults to the provider's own label. */
+  AUTH_LABEL?: string;
+  /** "outbox" (default, stores mail in D1), "http", or "noop". */
+  EMAIL_PROVIDER?: string;
+  /** HTTPS endpoint used when EMAIL_PROVIDER=http. No credentials in the URL. */
+  EMAIL_HTTP_URL?: string;
+  /** "d1" (default) or "memory". Memory does not span isolates. */
+  RATE_LIMIT_STORE?: string;
+  /** "fetch" (default). */
+  WEBHOOK_TRANSPORT?: string;
+  /** "d1" (default) or "memory". */
+  ANALYTICS_STORE?: string;
+  /** "r2" (default) or "memory". */
+  OBJECT_STORE?: string;
   /** Optional client secret (confidential client). Leave empty for public client + PKCE. */
   OIDC_CLIENT_SECRET?: string;
   /** Space-separated scopes for the admin login. */
@@ -20,7 +36,7 @@ export interface Env {
    */
   VOTER_KEY_SECRET?: string;
   /**
-   * Canonical origin of this deployment, e.g. "https://vote.0g0.xyz".
+   * Canonical origin of this deployment, for example "https://vote.example.com".
    * Login is rejected on any other host (http localhost is still allowed).
    */
   APP_ORIGIN?: string;
@@ -89,7 +105,7 @@ export type AdminPrincipal =
   | { kind: "api_key"; tenantId: string; keyId: string; prefix: string; scope: ApiScope }
   | { kind: "session"; tenantId: string; sub: string; role: "owner" | "member" };
 
-/** A signed-in 0g0-id user (admin UI session). */
+/** A signed-in user (admin UI session). The subject comes from the configured auth provider. */
 export interface SessionUser {
   kind: "session";
   sub: string;
