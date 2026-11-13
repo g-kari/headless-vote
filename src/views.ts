@@ -79,12 +79,16 @@ p.lead{color:var(--muted);max-width:65ch}
 .badge.closed{background:var(--danger);color:#fff}
 label{display:block;font-weight:600;margin:.85rem 0 .3rem}
 label .hint{display:block;font-weight:400;color:var(--muted);font-size:.87rem}
-input[type=text],input[type=datetime-local],textarea,select{width:100%;padding:.6rem .7rem;border:1.5px solid var(--border);
+input[type=text],input[type=email],input[type=password],input[type=url],input[type=number],input[type=search],
+input[type=date],input[type=time],input[type=datetime-local],textarea,select{width:100%;padding:.6rem .7rem;border:1.5px solid var(--border);
   background:var(--bg);color:var(--text);font:inherit}
 input[aria-invalid="true"]{border-color:var(--danger);outline:2px solid var(--danger);outline-offset:1px}
 textarea{min-height:5.5rem;resize:vertical}
+input[type=checkbox],input[type=radio]{width:1.15rem;height:1.15rem;accent-color:var(--accent);flex:none}
+input[type=color]{width:4.5rem;height:2.6rem;padding:.2rem;border:1.5px solid var(--border);background:var(--bg);color:var(--text)}
+input[type=file]{font:inherit;color:var(--text);max-width:100%}
 .check{display:flex;gap:.55rem;align-items:flex-start;margin-top:.8rem}
-.check input{width:1.15rem;height:1.15rem;margin-top:.3rem;accent-color:var(--accent)}
+.check input{margin-top:.3rem}
 .check span{font-weight:600}
 .check small{display:block;color:var(--muted);font-weight:400}
 .option-row{display:flex;gap:.6rem;align-items:center;margin-top:.55rem}
@@ -170,6 +174,7 @@ input:user-invalid,textarea:user-invalid,select:user-invalid{border-color:var(--
   @view-transition{ navigation:auto }
   main{animation:page-in .3s ease-out}
   .bar-fill,.stack-seg{animation:grow-x .7s ease-out both;animation-delay:var(--d,0s)}
+  .bar-fill,.stack-seg{transition:width .6s ease}
   dialog[open]{animation:dialog-in .18s ease-out}
   dialog[open]::backdrop{animation:fade-in .18s ease-out}
   .step.current .dot{animation:pulse 1.6s ease-in-out infinite}
@@ -186,6 +191,13 @@ input:user-invalid,textarea:user-invalid,select:user-invalid{border-color:var(--
 .copy{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
 .tip{color:var(--muted);font-size:.85rem}
 .field-error{color:var(--danger);font-size:.88rem;font-weight:600}
+/* Question editor (built by the poll form script; flat separators, no card boxes). */
+.question-card{border-top:2px solid var(--text);padding-top:1rem;margin-top:1.6rem}
+.question-card .q-prompt{margin-bottom:.6rem}
+.q-showif{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin:.7rem 0}
+.q-showif select{width:auto;max-width:100%}
+.q-options{margin-top:.4rem}
+.opt-preview{max-width:120px;border:1px solid var(--border)}
 `;
 
 export function layout(opts: {
