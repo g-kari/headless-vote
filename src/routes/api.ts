@@ -234,6 +234,18 @@ function parseResultsVisibility(raw: unknown): string {
   throw badRequest('"results_visibility" must be public, after_close, or admin_only');
 }
 
+/** Reminder lead time in hours (1-720); falls back when not provided. */
+function readLeadHours(body: Record<string, unknown>, fallback: number): number {
+  const raw = body["reminder_lead_hours"];
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > 720) {
+    throw badRequest('"reminder_lead_hours" must be an integer between 1 and 720', {
+      field: "reminder_lead_hours",
+    });
+  }
+  return raw;
+}
+
 /** Optional voting passphrase from a create/patch body (null = not provided). */
 function readPassphrase(body: Record<string, unknown>): string | null {
   const raw = body["passphrase"];
@@ -262,6 +274,8 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const ipSingleVote = optBool(body, "ip_single_vote");
   const confirmRequired = optBool(body, "confirm_required");
   const passphrase = readPassphrase(body);
+  const reminderEnabled = optBool(body, "reminder_enabled");
+  const reminderLeadHours = readLeadHours(body, 24);
   const questions = await questionInputsFromBody(c, tenantId, body, question, allowMultiple);
   const poll = await createPollRecord(
     c,
@@ -275,6 +289,8 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       ip_single_vote: ipSingleVote,
       confirm_required: confirmRequired,
       passphrase_hash: passphrase ? await hashPassphrase(c.env, passphrase) : null,
+      reminder_enabled: reminderEnabled,
+      reminder_lead_hours: reminderLeadHours,
       opens_at: opensAt,
       closes_at: closesAt,
       allow_multiple_fallback: allowMultiple,
@@ -295,6 +311,8 @@ interface PollSpec {
   ip_single_vote: boolean;
   confirm_required: boolean;
   passphrase_hash: string | null;
+  reminder_enabled: boolean;
+  reminder_lead_hours: number;
   opens_at: string | null;
   closes_at: string | null;
   allow_multiple_fallback: boolean;
@@ -327,8 +345,8 @@ async function createPollRecord(
   const now = nowIso();
   const revision = randomId();
   const insertPoll = c.env.DB.prepare(
-    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, results_visibility, ip_single_vote, confirm_required, passphrase_hash, created_at, updated_at, revision)
-     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?12, ?13, ?14, ?15, ?10, ?10, ?11
+    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, results_visibility, ip_single_vote, confirm_required, passphrase_hash, reminder_enabled, reminder_lead_hours, created_at, updated_at, revision)
+     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?12, ?13, ?14, ?15, ?16, ?17, ?10, ?10, ?11
      WHERE (SELECT COUNT(*) FROM polls WHERE tenant_id = ?2) <
        (SELECT quota_polls FROM tenants WHERE id = ?2)`,
   ).bind(
@@ -347,6 +365,8 @@ async function createPollRecord(
     spec.ip_single_vote ? 1 : 0,
     spec.confirm_required ? 1 : 0,
     spec.passphrase_hash,
+    spec.reminder_enabled ? 1 : 0,
+    spec.reminder_lead_hours,
   );
   const [created] = await c.env.DB.batch([
     insertPoll,
@@ -391,6 +411,8 @@ async function specFromPoll(c: { env: Env }, source: PollRow): Promise<PollSpec>
     // A passphrase is a shared secret for voters: a duplicate or template
     // copy starts without one and the admin sets a fresh passphrase.
     passphrase_hash: null,
+    reminder_enabled: source.reminder_enabled === 1,
+    reminder_lead_hours: source.reminder_lead_hours,
     opens_at: null,
     closes_at: null,
     allow_multiple_fallback: source.allow_multiple === 1,
@@ -440,6 +462,8 @@ api.post("/tenants/:tenantId/templates", async (c) => {
     results_visibility: spec.results_visibility,
     ip_single_vote: spec.ip_single_vote,
     confirm_required: spec.confirm_required,
+    reminder_enabled: spec.reminder_enabled,
+    reminder_lead_hours: spec.reminder_lead_hours,
     allow_multiple_fallback: spec.allow_multiple_fallback,
     questions: rawQuestionsFromRows(
       await listQuestionRows(c.env, source.id),
@@ -484,6 +508,8 @@ api.post("/tenants/:tenantId/templates/:templateId/polls", async (c) => {
     results_visibility: string;
     ip_single_vote: boolean;
     confirm_required: boolean;
+    reminder_enabled?: boolean;
+    reminder_lead_hours?: number;
     allow_multiple_fallback: boolean;
     questions: unknown[];
   };
@@ -500,6 +526,8 @@ api.post("/tenants/:tenantId/templates/:templateId/polls", async (c) => {
     ip_single_vote: stored.ip_single_vote,
     confirm_required: stored.confirm_required,
     passphrase_hash: null,
+    reminder_enabled: stored.reminder_enabled ?? false,
+    reminder_lead_hours: stored.reminder_lead_hours ?? 24,
     opens_at: null,
     closes_at: null,
     allow_multiple_fallback: stored.allow_multiple_fallback,
@@ -630,6 +658,11 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     : body["clear_passphrase"] === true
       ? null
       : poll.passphrase_hash;
+  const reminderEnabled =
+    body["reminder_enabled"] !== undefined
+      ? optBool(body, "reminder_enabled")
+      : poll.reminder_enabled === 1;
+  const reminderLeadHours = readLeadHours(body, poll.reminder_lead_hours);
 
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
 
@@ -684,7 +717,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     `UPDATE polls SET question = ?1, description = ?2, image_key = ?3,
      allow_multiple = ?4, require_login = ?5, opens_at = ?6, closes_at = ?7, updated_at = ?8,
      revision = ?9, results_visibility = ?13, ip_single_vote = ?14, confirm_required = ?15,
-     passphrase_hash = ?16
+     passphrase_hash = ?16, reminder_enabled = ?17, reminder_lead_hours = ?18
      WHERE id = ?10 AND revision = ?11 AND status != 'closed'
        AND (?12 = 0 OR NOT EXISTS (SELECT 1 FROM vote_ballots WHERE poll_id = ?10))`,
   ).bind(
@@ -704,6 +737,8 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     ipSingleVote ? 1 : 0,
     confirmRequired ? 1 : 0,
     passphraseHash,
+    reminderEnabled ? 1 : 0,
+    reminderLeadHours,
   );
 
   const [updatedPoll] = await c.env.DB.batch([

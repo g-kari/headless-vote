@@ -8,7 +8,7 @@ import { tenantQuotas } from "./quotas";
 import { assertPlainText } from "./security";
 import type { Env } from "./types";
 
-export const WEBHOOK_EVENTS = ["vote.cast", "poll.published", "poll.closed", "poll.updated", "poll.closing_soon"] as const;
+export const WEBHOOK_EVENTS = ["vote.cast", "poll.published", "poll.closed", "poll.updated", "poll.closing_soon", "poll.deadline_reminder"] as const;
 export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number];
 
 const encoder = new TextEncoder();

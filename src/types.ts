@@ -81,6 +81,8 @@ export interface PollRow {
   ip_single_vote: number;
   confirm_required: number;
   passphrase_hash: string | null;
+  reminder_enabled: number;
+  reminder_lead_hours: number;
   created_at: string;
   updated_at: string;
   /** Optimistic concurrency token. Changes on every successful edit. */

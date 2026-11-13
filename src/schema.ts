@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS polls (
   ip_single_vote INTEGER NOT NULL DEFAULT 0,
   confirm_required INTEGER NOT NULL DEFAULT 0,
   passphrase_hash TEXT,
+  reminder_enabled INTEGER NOT NULL DEFAULT 0,
+  reminder_lead_hours INTEGER NOT NULL DEFAULT 24,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   revision TEXT NOT NULL DEFAULT ''
