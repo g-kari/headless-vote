@@ -107,6 +107,10 @@ export function pollToJson(
     kind: q.kind,
     required: q.required === 1,
     position: q.position,
+    show_if:
+      q.show_if_question_id && q.show_if_option_id
+        ? { question_id: q.show_if_question_id, option_id: q.show_if_option_id }
+        : null,
     options: options.filter((o) => o.question_id === q.id).map((o) => optionToJson(origin, o)),
   }));
   const firstChoice = questions.find((q) => q.kind !== "text");
@@ -120,6 +124,9 @@ export function pollToJson(
     require_login: poll.require_login === 1,
     opens_at: poll.opens_at,
     closes_at: poll.closes_at,
+    results_visibility: poll.results_visibility,
+    ip_single_vote: poll.ip_single_vote === 1,
+    confirm_required: poll.confirm_required === 1,
     created_at: poll.created_at,
     updated_at: poll.updated_at,
     options: questionJson.flatMap((q) => q.options),
@@ -169,7 +176,15 @@ export interface QuestionResult {
   required: boolean;
   position: number;
   response_count: number;
-  options: { id: string; label: string; image_url: string | null; votes: number }[];
+  options: {
+    id: string;
+    label: string;
+    image_url: string | null;
+    votes: number;
+    points?: number;
+    average_rank?: number | null;
+    average_score?: number | null;
+  }[];
   texts?: string[];
 }
 
@@ -180,7 +195,7 @@ export interface PollResults {
   closes_at: string | null;
   total_voters: number;
   total_votes: number;
-  options: { id: string; label: string; image_url: string | null; votes: number }[];
+  options: QuestionResult["options"];
   questions: QuestionResult[];
 }
 
@@ -199,13 +214,41 @@ export async function computeResults(
     .bind(poll.id)
     .all<{ option_ids: string }>();
   const defaultQuestionId = questions[0]?.id ?? poll.id;
+  const kindByQuestion = new Map(questions.map((q) => [q.id, q.kind]));
+  const optionCountByQuestion = new Map<string, number>();
+  for (const o of options) {
+    optionCountByQuestion.set(o.question_id, (optionCountByQuestion.get(o.question_id) ?? 0) + 1);
+  }
   const optionVotes = new Map<string, number>();
   const textAnswers = new Map<string, string[]>();
   const answered = new Map<string, number>();
+  const rankStats = new Map<string, { points: number; rankSum: number; count: number; first: number }>();
+  const scoreStats = new Map<string, { sum: number; count: number }>();
   for (const ballot of ballots.results) {
     for (const answer of parseBallotDocument(ballot.option_ids, defaultQuestionId)) {
       answered.set(answer.question_id, (answered.get(answer.question_id) ?? 0) + 1);
-      for (const id of answer.option_ids) optionVotes.set(id, (optionVotes.get(id) ?? 0) + 1);
+      const kind = kindByQuestion.get(answer.question_id);
+      if (kind === "ranking") {
+        const total = optionCountByQuestion.get(answer.question_id) ?? answer.option_ids.length;
+        answer.option_ids.forEach((id, index) => {
+          const stat = rankStats.get(id) ?? { points: 0, rankSum: 0, count: 0, first: 0 };
+          stat.points += Math.max(0, total - index);
+          stat.rankSum += index + 1;
+          stat.count += 1;
+          if (index === 0) stat.first += 1;
+          rankStats.set(id, stat);
+        });
+      } else if (kind !== "score") {
+        for (const id of answer.option_ids) optionVotes.set(id, (optionVotes.get(id) ?? 0) + 1);
+      }
+      if (answer.scores) {
+        for (const [id, value] of Object.entries(answer.scores)) {
+          const stat = scoreStats.get(id) ?? { sum: 0, count: 0 };
+          stat.sum += value;
+          stat.count += 1;
+          scoreStats.set(id, stat);
+        }
+      }
       if (answer.text) {
         const list = textAnswers.get(answer.question_id) ?? [];
         list.push(answer.text);
@@ -213,13 +256,36 @@ export async function computeResults(
       }
     }
   }
+  const round2 = (n: number) => Math.round(n * 100) / 100;
   const questionResults: QuestionResult[] = questions.map((q) => {
-    const qOptions = options.filter((o) => o.question_id === q.id).map((o) => ({
-      id: o.id,
-      label: o.label,
-      image_url: imageUrl(origin, o.image_key),
-      votes: optionVotes.get(o.id) ?? 0,
-    }));
+    const qOptions = options
+      .filter((o) => o.question_id === q.id)
+      .map((o) => {
+        const base = {
+          id: o.id,
+          label: o.label,
+          image_url: imageUrl(origin, o.image_key),
+          votes: optionVotes.get(o.id) ?? 0,
+        };
+        if (q.kind === "ranking") {
+          const stat = rankStats.get(o.id);
+          return {
+            ...base,
+            votes: stat?.first ?? 0,
+            points: stat?.points ?? 0,
+            average_rank: stat && stat.count > 0 ? round2(stat.rankSum / stat.count) : null,
+          };
+        }
+        if (q.kind === "score") {
+          const stat = scoreStats.get(o.id);
+          return {
+            ...base,
+            votes: stat?.count ?? 0,
+            average_score: stat && stat.count > 0 ? round2(stat.sum / stat.count) : null,
+          };
+        }
+        return base;
+      });
     const result: QuestionResult = {
       id: q.id,
       prompt: q.prompt,

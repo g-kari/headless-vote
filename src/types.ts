@@ -68,13 +68,16 @@ export interface PollRow {
   require_login: number;
   opens_at: string | null;
   closes_at: string | null;
+  results_visibility: string;
+  ip_single_vote: number;
+  confirm_required: number;
   created_at: string;
   updated_at: string;
   /** Optimistic concurrency token. Changes on every successful edit. */
   revision: string;
 }
 
-export type QuestionKind = "single" | "multiple" | "text";
+export type QuestionKind = "single" | "multiple" | "text" | "ranking" | "score";
 
 export interface QuestionRow {
   id: string;
@@ -85,6 +88,8 @@ export interface QuestionRow {
   kind: QuestionKind;
   required: number;
   position: number;
+  show_if_question_id: string | null;
+  show_if_option_id: string | null;
   created_at: string;
 }
 
