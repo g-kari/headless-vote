@@ -2337,14 +2337,19 @@ ui.get("/polls/:pollId/results-page", async (c) => {
 })();
 `,
   );
+  const printScript = scriptTag(
+    nonce,
+    `document.getElementById("print-results")?.addEventListener("click", () => window.print());`,
+  );
   const body = `
     ${brand?.brand_logo_key ? `<p><img src="/images/${escapeHtml(brand.brand_logo_key)}" alt="ワークスペースのロゴ" style="max-height:64px"></p>` : ""}
     <h1>${escapeHtml(poll.question)}</h1>
     <p class="muted small">投票者数 <span id="total-voters">${results.total_voters}</span> 人 ／ 総票数 <span id="total-votes">${results.total_votes}</span> 票${poll.closes_at ? ` ／ 締切 ${escapeHtml(poll.closes_at)}` : ""} ／ 10秒ごとに自動更新</p>
+    <div class="actions no-print"><button class="btn" type="button" id="print-results">印刷／PDFに保存</button></div>
     <section class="section">
       ${sections || '<p class="muted">設問がありません。</p>'}
     </section>
-    ${refreshScript}`;
+    ${refreshScript}${printScript}`;
   return c.html(
     layout({
       title: `結果: ${poll.question}`,
@@ -2369,9 +2374,10 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
   const results = await computeResults(c.env, originOf(c), poll, { includeText: true });
   const sections = resultsSections(results, poll);
   const body = `
-    <p class="muted small"><a href="/admin/workspaces/${tenantId}/polls/${pollId}">投票に戻る</a></p>
+    <p class="muted small no-print"><a href="/admin/workspaces/${tenantId}/polls/${pollId}">投票に戻る</a></p>
     <h1>結果</h1>
-    <div class="actions">
+    <div class="actions no-print">
+      <button class="btn" type="button" id="print-results">印刷／PDFに保存</button>
       <a class="btn" href="/api/v1/tenants/${escapeHtml(tenantId)}/polls/${escapeHtml(pollId)}/export?format=csv">CSV で書き出す</a>
       <a class="btn" href="/api/v1/tenants/${escapeHtml(tenantId)}/polls/${escapeHtml(pollId)}/export?format=json">JSON で書き出す</a>
     </div>
@@ -2385,7 +2391,8 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
       </div>
       ${sections || '<p class="muted">設問がありません。</p>'}
       <p class="muted small">割合は、その設問の選択票に対する割合です。複数選択では合計が100%を超えることがあります。自由記述は管理画面と書き出しにだけ全文が出ます。</p>
-    </section>`;
+    </section>
+    ${scriptTag(c.get("cspNonce") ?? "", `document.getElementById("print-results")?.addEventListener("click", () => window.print());`)}`;
   return c.html(
     layout({
       title: `結果: ${poll.question}`,

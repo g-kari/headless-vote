@@ -206,6 +206,17 @@ input:user-invalid,textarea:user-invalid,select:user-invalid{border-color:var(--
 .q-options{margin-top:.4rem}
 .question-card .actions{margin-top:1.1rem}
 .opt-preview{max-width:120px;border:1px solid var(--border)}
+/* Print: results pages become a clean report. Navigation and controls are
+   hidden, animations are settled, and chart colors are forced to print. */
+@media print{
+  @page{margin:12mm}
+  header.site,.skip,.no-print{display:none!important}
+  body{background:#fff}
+  main{max-width:none;padding:0;animation:none}
+  .bar-fill,.stack-seg{-webkit-print-color-adjust:exact;print-color-adjust:exact;animation:none;transform:none}
+  .stack{border-color:#000}
+  a{color:inherit;text-decoration:none}
+}
 `;
 
 export function layout(opts: {
