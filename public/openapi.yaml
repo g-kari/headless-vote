@@ -1316,6 +1316,7 @@ components:
         results_visibility: { type: string, enum: [public, after_close, admin_only] }
         ip_single_vote: { type: boolean, description: 同一接続元からの匿名投票を 1 回までに制限 }
         confirm_required: { type: boolean, description: 投票前に確認ステップを必須にする }
+        passphrase_required: { type: boolean, description: 合言葉が設定されていて、投票時に passphrase が必要かどうか。合言葉そのものやハッシュは返しません }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         options:
@@ -1337,6 +1338,7 @@ components:
         results_visibility: { type: string, enum: [public, after_close, admin_only] }
         ip_single_vote: { type: boolean }
         confirm_required: { type: boolean }
+        passphrase: { type: string, minLength: 4, maxLength: 128, writeOnly: true, description: 投票の合言葉。サーバーにはハッシュ化して保存され、読み取りでは返しません }
     PollCreate:
       allOf:
         - $ref: "#/components/schemas/PollSettings"
@@ -1364,6 +1366,7 @@ components:
               type: array
               maxItems: 20
               items: { $ref: "#/components/schemas/QuestionInput" }
+            clear_passphrase: { type: boolean, description: true のとき合言葉を解除する（passphrase の指定とは同時には使えません） }
             expected_updated_at: { type: string, format: date-time, description: 楽観ロック用。現在の updated_at と一致しないと 409 }
     Answer:
       type: object
@@ -1391,6 +1394,7 @@ components:
           items: { type: string, format: uuid }
           description: 旧形式（単一設問の投票）向けの簡易指定
         confirm: { type: boolean, description: 確認ステップ必須の投票で必要 }
+        passphrase: { type: string, description: 合言葉つき投票（passphrase_required が true）で必要。不一致は 403 PASSPHRASE_INVALID、未指定は 403 PASSPHRASE_REQUIRED }
     Ballot:
       type: object
       properties:

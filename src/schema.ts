@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS polls (
   results_visibility TEXT NOT NULL DEFAULT 'public',
   ip_single_vote INTEGER NOT NULL DEFAULT 0,
   confirm_required INTEGER NOT NULL DEFAULT 0,
+  passphrase_hash TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   revision TEXT NOT NULL DEFAULT ''

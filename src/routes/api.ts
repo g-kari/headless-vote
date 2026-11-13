@@ -43,6 +43,7 @@ import { createObjectStore } from "../platform/objects";
 import { selectAuthProvider } from "../platform";
 import { assertPlainText, assertSameOriginMutation, isSafeImageKey, normalizeUuid, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
 import { createWebhook, disableWebhook, dispatchWebhooks, listWebhooks, WEBHOOK_EVENTS, type WebhookEvent } from "../webhooks";
+import { hashPassphrase, verifyPassphrase } from "../passphrase";
 import {
   clientIpOf,
   ipMatchesEntries,
@@ -233,6 +234,18 @@ function parseResultsVisibility(raw: unknown): string {
   throw badRequest('"results_visibility" must be public, after_close, or admin_only');
 }
 
+/** Optional voting passphrase from a create/patch body (null = not provided). */
+function readPassphrase(body: Record<string, unknown>): string | null {
+  const raw = body["passphrase"];
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "string") throw badRequest('"passphrase" must be a string');
+  const value = raw.trim();
+  if (value.length < 4 || value.length > 128) {
+    throw badRequest('"passphrase" must be 4 to 128 characters', { field: "passphrase" });
+  }
+  return value;
+}
+
 api.post("/tenants/:tenantId/polls", async (c) => {
   const tenantId = c.req.param("tenantId");
   const admin = await requireAdmin(c, tenantId);
@@ -248,6 +261,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const resultsVisibility = parseResultsVisibility(body["results_visibility"]);
   const ipSingleVote = optBool(body, "ip_single_vote");
   const confirmRequired = optBool(body, "confirm_required");
+  const passphrase = readPassphrase(body);
   const questions = await questionInputsFromBody(c, tenantId, body, question, allowMultiple);
   const poll = await createPollRecord(
     c,
@@ -260,6 +274,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       results_visibility: resultsVisibility,
       ip_single_vote: ipSingleVote,
       confirm_required: confirmRequired,
+      passphrase_hash: passphrase ? await hashPassphrase(c.env, passphrase) : null,
       opens_at: opensAt,
       closes_at: closesAt,
       allow_multiple_fallback: allowMultiple,
@@ -279,6 +294,7 @@ interface PollSpec {
   results_visibility: string;
   ip_single_vote: boolean;
   confirm_required: boolean;
+  passphrase_hash: string | null;
   opens_at: string | null;
   closes_at: string | null;
   allow_multiple_fallback: boolean;
@@ -311,8 +327,8 @@ async function createPollRecord(
   const now = nowIso();
   const revision = randomId();
   const insertPoll = c.env.DB.prepare(
-    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, results_visibility, ip_single_vote, confirm_required, created_at, updated_at, revision)
-     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?12, ?13, ?14, ?10, ?10, ?11
+    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, results_visibility, ip_single_vote, confirm_required, passphrase_hash, created_at, updated_at, revision)
+     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?12, ?13, ?14, ?15, ?10, ?10, ?11
      WHERE (SELECT COUNT(*) FROM polls WHERE tenant_id = ?2) <
        (SELECT quota_polls FROM tenants WHERE id = ?2)`,
   ).bind(
@@ -330,6 +346,7 @@ async function createPollRecord(
     spec.results_visibility,
     spec.ip_single_vote ? 1 : 0,
     spec.confirm_required ? 1 : 0,
+    spec.passphrase_hash,
   );
   const [created] = await c.env.DB.batch([
     insertPoll,
@@ -371,6 +388,9 @@ async function specFromPoll(c: { env: Env }, source: PollRow): Promise<PollSpec>
     results_visibility: source.results_visibility,
     ip_single_vote: source.ip_single_vote === 1,
     confirm_required: source.confirm_required === 1,
+    // A passphrase is a shared secret for voters: a duplicate or template
+    // copy starts without one and the admin sets a fresh passphrase.
+    passphrase_hash: null,
     opens_at: null,
     closes_at: null,
     allow_multiple_fallback: source.allow_multiple === 1,
@@ -479,6 +499,7 @@ api.post("/tenants/:tenantId/templates/:templateId/polls", async (c) => {
     results_visibility: stored.results_visibility,
     ip_single_vote: stored.ip_single_vote,
     confirm_required: stored.confirm_required,
+    passphrase_hash: null,
     opens_at: null,
     closes_at: null,
     allow_multiple_fallback: stored.allow_multiple_fallback,
@@ -596,6 +617,19 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     body["confirm_required"] !== undefined
       ? optBool(body, "confirm_required")
       : poll.confirm_required === 1;
+  // Passphrase: a new "passphrase" replaces the stored hash,
+  // "clear_passphrase": true removes it, and neither keeps it as is.
+  const newPassphrase = readPassphrase(body);
+  if (newPassphrase && body["clear_passphrase"] === true) {
+    throw badRequest('Pass either "passphrase" or "clear_passphrase", not both', {
+      field: "passphrase",
+    });
+  }
+  const passphraseHash = newPassphrase
+    ? await hashPassphrase(c.env, newPassphrase)
+    : body["clear_passphrase"] === true
+      ? null
+      : poll.passphrase_hash;
 
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
 
@@ -649,7 +683,8 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
   const updatePoll = c.env.DB.prepare(
     `UPDATE polls SET question = ?1, description = ?2, image_key = ?3,
      allow_multiple = ?4, require_login = ?5, opens_at = ?6, closes_at = ?7, updated_at = ?8,
-     revision = ?9, results_visibility = ?13, ip_single_vote = ?14, confirm_required = ?15
+     revision = ?9, results_visibility = ?13, ip_single_vote = ?14, confirm_required = ?15,
+     passphrase_hash = ?16
      WHERE id = ?10 AND revision = ?11 AND status != 'closed'
        AND (?12 = 0 OR NOT EXISTS (SELECT 1 FROM vote_ballots WHERE poll_id = ?10))`,
   ).bind(
@@ -668,6 +703,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     resultsVisibility,
     ipSingleVote ? 1 : 0,
     confirmRequired ? 1 : 0,
+    passphraseHash,
   );
 
   const [updatedPoll] = await c.env.DB.batch([
@@ -916,6 +952,24 @@ api.post("/polls/:pollId/vote", async (c) => {
     voterKey = `anon:${trimmedToken}`;
 
   }
+  if (poll.passphrase_hash) {
+    const provided = body["passphrase"];
+    if (typeof provided !== "string" || provided.length === 0) {
+      const err = new ApiError(403, "PASSPHRASE_REQUIRED", "This poll requires a passphrase to vote");
+      err.details = { field: "passphrase" };
+      throw err;
+    }
+    const matches = await verifyPassphrase(c.env, poll.passphrase_hash, provided);
+    if (!matches) {
+      // Failed attempts draw from a small per-IP budget for this poll, so
+      // guessing the passphrase is rate limited well below the vote limit.
+      await rateLimitByIp(c, `passphrase:${poll.id}`, 20, 600);
+      const err = new ApiError(403, "PASSPHRASE_INVALID", "The passphrase is incorrect");
+      err.details = { field: "passphrase" };
+      throw err;
+    }
+  }
+
   if (poll.confirm_required === 1 && body["confirm"] !== true) {
     throw conflict(
       "CONFIRM_REQUIRED",
