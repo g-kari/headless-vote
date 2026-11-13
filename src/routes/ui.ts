@@ -1592,6 +1592,17 @@ function validateForm() {
   if (opensEl.value && closesEl.value && new Date(opensEl.value) >= new Date(closesEl.value)) {
     problems.push([closesEl, '締切日時は開始日時より後にしてください']);
   }
+  const reminderEnabledEl = document.getElementById('reminder-enabled');
+  const reminderLeadEl = document.getElementById('reminder-lead');
+  if (reminderEnabledEl && reminderEnabledEl.checked && !closesEl.value) {
+    problems.push([closesEl, 'リマインドには締切日時の設定が必要です']);
+  }
+  if (reminderLeadEl && reminderLeadEl.value) {
+    const lead = Number(reminderLeadEl.value);
+    if (!Number.isInteger(lead) || lead < 1 || lead > 720) {
+      problems.push([reminderLeadEl, 'リマインドのタイミングは1〜720時間にしてください']);
+    }
+  }
   const passphraseEl = document.getElementById('passphrase');
   const passphraseValue = passphraseEl ? passphraseEl.value : '';
   const clearPassphraseEl = document.getElementById('clear-passphrase');
@@ -1702,6 +1713,14 @@ function validateForm() {
 
 /* Map an API validation message onto the field it belongs to. */
 function showServerError(message, details) {
+  if (details && details.field === 'reminder_lead_hours') {
+    const leadEl = document.getElementById('reminder-lead');
+    if (leadEl) {
+      showFieldError(leadEl, 'リマインドのタイミングは1〜720時間にしてください。');
+      leadEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+  }
   if ((details && details.field === 'passphrase') || (message || '').includes('passphrase')) {
     const passEl = document.getElementById('passphrase');
     if (passEl) {
@@ -1769,6 +1788,8 @@ async function submitPoll(ev) {
       closes_at: document.getElementById('closes-at').value ? new Date(document.getElementById('closes-at').value).toISOString() : null,
       questions,
     };
+    payload.reminder_enabled = document.getElementById('reminder-enabled').checked;
+    payload.reminder_lead_hours = Number(document.getElementById('reminder-lead').value) || 24;
     const passphraseValue = document.getElementById('passphrase').value;
     if (passphraseValue) payload.passphrase = passphraseValue;
     const clearPassphraseEl = document.getElementById('clear-passphrase');
@@ -1858,6 +1879,13 @@ function pollFormBody(opts: {
       <input id="opens-at" type="datetime-local" value="${p?.opens_at ? escapeHtml(p.opens_at.slice(0, 16)) : ""}">
       <label for="closes-at">締切日時 <span class="hint">任意。空欄なら手動で締め切るまで投票できます。</span></label>
       <input id="closes-at" type="datetime-local" value="${closesLocal}">
+      <div class="check">
+        <input id="reminder-enabled" type="checkbox" ${p?.reminder_enabled === 1 ? "checked" : ""}>
+        <label for="reminder-enabled" style="margin:0"><span>締切リマインドを受け取る</span>
+        <small>オンにすると、締切が近づいたときに管理者への通知と Webhook（poll.deadline_reminder）が届きます。メール送信はありません。締切日時の設定が必要です。</small></label>
+      </div>
+      <label for="reminder-lead">リマインドのタイミング <span class="hint">締切の何時間前に知らせるか。既定は24時間前です。</span></label>
+      <input id="reminder-lead" type="number" min="1" max="720" step="1" value="${p?.reminder_lead_hours ?? 24}">
       <div class="check">
         <input id="require-login" type="checkbox" ${p?.require_login === 1 ? "checked" : ""}>
         <label for="require-login" style="margin:0"><span>ログイン必須にする</span>

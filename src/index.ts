@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { drainObjectCleanup } from "./object-cleanup";
-import { notifyClosingSoon } from "./notifications";
+import { notifyClosingSoon, notifyDeadlineReminders } from "./notifications";
 import { allowsCrossSiteEmbed, applyPublicCors, isPublicEmbedPath } from "./cors";
 import { ApiError } from "./errors";
 import { serveImage } from "./routes/api";
@@ -108,5 +108,6 @@ export default {
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
     await drainObjectCleanup(env);
     await notifyClosingSoon(env);
+    await notifyDeadlineReminders(env);
   },
 };

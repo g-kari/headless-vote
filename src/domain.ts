@@ -131,6 +131,8 @@ export function pollToJson(
     // Only the fact that a passphrase is set is exposed; the stored hash
     // (and of course the passphrase itself) never leaves the server.
     passphrase_required: poll.passphrase_hash != null,
+    reminder_enabled: poll.reminder_enabled === 1,
+    reminder_lead_hours: poll.reminder_lead_hours,
     created_at: poll.created_at,
     updated_at: poll.updated_at,
     options: questionJson.flatMap((q) => q.options),

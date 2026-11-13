@@ -42,7 +42,7 @@ info:
 
     ## Webhook
 
-    イベントは `vote.cast`、`poll.published`、`poll.closed`、`poll.updated`、`poll.closing_soon`（締切 48 時間以内に 1 回）です。本文は JSON（`id`、`type`、`created_at`、`tenant_id`、`data`）で、ヘッダー `X-Headless-Vote-Event` と署名 `X-Headless-Vote-Signature: v1=<hex>`（本文全体の HMAC-SHA256）が付きます。本文の `id` がイベントごとの一意な ID なので、受け側での重複判定に使えます。URL は公開前に検証され、プライベートアドレス宛ては送られません。配送結果（HTTP ステータス）はサーバ側に記録されます。
+    イベントは `vote.cast`、`poll.published`、`poll.closed`、`poll.updated`、`poll.closing_soon`（締切 48 時間以内に 1 回）、`poll.deadline_reminder`（投票ごとに設定したリードタイムで締切前に 1 回。リマインドを有効にした投票だけ）です。本文は JSON（`id`、`type`、`created_at`、`tenant_id`、`data`）で、ヘッダー `X-Headless-Vote-Event` と署名 `X-Headless-Vote-Signature: v1=<hex>`（本文全体の HMAC-SHA256）が付きます。本文の `id` がイベントごとの一意な ID なので、受け側での重複判定に使えます。URL は公開前に検証され、プライベートアドレス宛ては送られません。配送結果（HTTP ステータス）はサーバ側に記録されます。
 
     署名の検証サンプル:
 
@@ -1073,7 +1073,7 @@ paths:
                   type: array
                   items:
                     type: string
-                    enum: [vote.cast, poll.published, poll.closed, poll.updated, poll.closing_soon]
+                    enum: [vote.cast, poll.published, poll.closed, poll.updated, poll.closing_soon, poll.deadline_reminder]
       responses:
         "201":
           description: 作成された Webhook と署名シークレット
@@ -1317,6 +1317,8 @@ components:
         ip_single_vote: { type: boolean, description: 同一接続元からの匿名投票を 1 回までに制限 }
         confirm_required: { type: boolean, description: 投票前に確認ステップを必須にする }
         passphrase_required: { type: boolean, description: 合言葉が設定されていて、投票時に passphrase が必要かどうか。合言葉そのものやハッシュは返しません }
+        reminder_enabled: { type: boolean, description: 締切リマインド（管理者通知＋Webhook）が有効か }
+        reminder_lead_hours: { type: integer, description: 締切の何時間前にリマインドするか（1〜720、既定24） }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         options:
@@ -1339,6 +1341,8 @@ components:
         ip_single_vote: { type: boolean }
         confirm_required: { type: boolean }
         passphrase: { type: string, minLength: 4, maxLength: 128, writeOnly: true, description: 投票の合言葉。サーバーにはハッシュ化して保存され、読み取りでは返しません }
+        reminder_enabled: { type: boolean, description: 締切リマインドを有効にする。closes_at の設定が必要 }
+        reminder_lead_hours: { type: integer, minimum: 1, maximum: 720, description: 締切の何時間前にリマインドするか（既定24） }
     PollCreate:
       allOf:
         - $ref: "#/components/schemas/PollSettings"
@@ -1495,7 +1499,7 @@ components:
           type: array
           items:
             type: string
-            enum: [vote.cast, poll.published, poll.closed, poll.updated, poll.closing_soon]
+            enum: [vote.cast, poll.published, poll.closed, poll.updated, poll.closing_soon, poll.deadline_reminder]
         disabled_at: { type: string, format: date-time, nullable: true }
         created_at: { type: string, format: date-time }
     Notification:

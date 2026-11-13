@@ -49,3 +49,62 @@ export async function notifyClosingSoon(env: Env): Promise<number> {
   }
   return sent;
 }
+
+/**
+ * Per-poll deadline reminders, run from the same scheduled job: a poll
+ * with reminder_enabled gets one in-app notification and one
+ * poll.deadline_reminder webhook once its deadline is within the poll's
+ * own lead time (reminder_lead_hours). Hyo has no mail transport and
+ * anonymous voters leave no contact address, so delivery is the admin
+ * notification plus the webhook — never email. The notification row
+ * doubles as the dedupe record, independent of the closing_soon kind.
+ */
+export async function notifyDeadlineReminders(env: Env): Promise<number> {
+  const now = new Date();
+  const res = await env.DB.prepare(
+    `SELECT id, tenant_id, question, closes_at, reminder_lead_hours FROM polls
+     WHERE status = 'published' AND reminder_enabled = 1 AND closes_at IS NOT NULL
+       AND closes_at > ?1
+       AND NOT EXISTS (
+         SELECT 1 FROM app_notifications
+         WHERE poll_id = polls.id AND kind = 'deadline_reminder'
+       )`,
+  )
+    .bind(now.toISOString())
+    .all<{
+      id: string;
+      tenant_id: string;
+      question: string;
+      closes_at: string;
+      reminder_lead_hours: number;
+    }>();
+  let sent = 0;
+  for (const poll of res.results) {
+    const closesAt = new Date(poll.closes_at).getTime();
+    const leadMs = Math.max(1, poll.reminder_lead_hours) * 3600 * 1000;
+    if (closesAt - now.getTime() > leadMs) continue;
+    const claimed = await env.DB.prepare(
+      `INSERT INTO app_notifications (id, tenant_id, poll_id, kind, message, created_at)
+       SELECT ?1, ?2, ?3, 'deadline_reminder', ?4, ?5
+       WHERE NOT EXISTS (
+         SELECT 1 FROM app_notifications WHERE poll_id = ?3 AND kind = 'deadline_reminder'
+       )`,
+    )
+      .bind(
+        randomId(),
+        poll.tenant_id,
+        poll.id,
+        `投票「${poll.question}」の締切リマインドです（締切: ${poll.closes_at}、${poll.reminder_lead_hours}時間前設定）`,
+        now.toISOString(),
+      )
+      .run();
+    if (Number(claimed.meta.changes ?? 0) !== 1) continue;
+    await dispatchWebhooks(env, poll.tenant_id, "poll.deadline_reminder", {
+      poll_id: poll.id,
+      closes_at: poll.closes_at,
+      lead_hours: poll.reminder_lead_hours,
+    });
+    sent++;
+  }
+  return sent;
+}
