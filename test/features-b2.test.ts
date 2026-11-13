@@ -237,8 +237,17 @@ describe("branding, share assets, docs", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("API 仕様書");
-    expect(html).toContain("poll.closing_soon");
-    expect(html).toContain("CONFIRM_REQUIRED");
+    // The docs page is a Redoc shell over the versioned OpenAPI spec.
+    expect(html).toContain('id="redoc"');
+    expect(html).toContain("/openapi.yaml");
+    expect(html).toContain("/redoc.standalone.js");
+    const spec = await SELF.fetch(`${BASE}/openapi.yaml`);
+    expect(spec.status).toBe(200);
+    const yaml = await spec.text();
+    expect(yaml).toContain("openapi: 3.0.3");
+    expect(yaml).toContain("poll.closing_soon");
+    expect(yaml).toContain("CONFIRM_REQUIRED");
+    expect(yaml).toContain("/api/v1/polls/{pollId}/vote:");
   });
 });
 
