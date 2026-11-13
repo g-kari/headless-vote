@@ -134,6 +134,33 @@ describe("OIDC login flow for the admin UI", () => {
     expect(res.status).toBe(400);
   });
 
+  it("returns a controlled 400 (not 500) when the code exchange fails after state matches", async () => {
+    const loginRes = await SELF.fetch(`${BASE}/admin/login`, {
+      redirect: "manual",
+    });
+    const flowCookie = getCookie(loginRes, "__Host-hv_oidc_flow");
+    expect(flowCookie).toBeTruthy();
+    const flow = decodeFlowPayload(flowCookie as string);
+    // The state matches the flow cookie, but the code is unknown to the IdP,
+    // so the token exchange fails. The user must see a login failure page
+    // with a way back to the login form, not the generic 500 page.
+    const res = await SELF.fetch(
+      `${BASE}/auth/callback?code=invalid-code&state=${encodeURIComponent(flow.state)}`,
+      {
+        redirect: "manual",
+        headers: {
+          cookie: `__Host-hv_oidc_flow=${flowCookie}`,
+          accept: "text/html",
+        },
+      },
+    );
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain("ログインに失敗しました");
+    expect(html).toContain('href="/admin/login"');
+    expect(html).not.toContain("Something went wrong");
+  });
+
   it("serves the admin landing with a login link when logged out", async () => {
     const res = await SELF.fetch(`${BASE}/admin`);
     expect(res.status).toBe(200);
