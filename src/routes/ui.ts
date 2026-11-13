@@ -2261,16 +2261,46 @@ ui.get("/docs", async (c) => {
   .docs-bar nav{margin-left:auto;display:flex;gap:.5rem}
   .docs-bar nav a{color:#1e4fd8;text-decoration:none;font-weight:600;border:1.5px solid #1e4fd8;padding:.3rem .8rem}
   .docs-bar nav a:hover{background:#1e4fd8;color:#fff}
+  .try{border-bottom:2px solid #111;padding:1rem;max-width:1080px;margin:0 auto}
+  .try h2{font-size:1.15rem;margin:.2rem 0 .6rem}
+  .try-note{color:#454f5c;font-size:.9rem;max-width:75ch}
+  .try label{display:block;font-weight:600;margin:.7rem 0 .3rem}
+  .try input[type=text],.try input[type=password],.try select,.try textarea{width:100%;padding:.55rem .7rem;border:1.5px solid #77808e;font:inherit;background:#fff;color:#12161c;box-sizing:border-box}
+  .try-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 1rem}
+  .try-actions{margin-top:.9rem;display:flex;gap:.8rem;align-items:center;flex-wrap:wrap}
+  .try-send{background:#1e4fd8;border:2px solid #1e4fd8;color:#fff;padding:.5rem 1.2rem;font-weight:700;cursor:pointer;font-size:.95rem}
+  .try-send:hover{background:#173ea8}
+  .try-status{font-weight:700}
+  .try-status.err{color:#b91c1c}
+  .try pre{background:#23272e;color:#eef2f7;padding:.9rem;overflow:auto;max-height:26rem;font-size:.85rem;line-height:1.5;white-space:pre-wrap;word-break:break-word}
 </style>
 </head>
 <body>
 <header class="docs-bar">
   <a class="brand" href="/">Hyo <span>API 仕様書</span></a>
   <nav>
+    <a href="#api-try">API を試す</a>
     <a href="/openapi.yaml">OpenAPI (YAML)</a>
     <a href="/admin">管理画面</a>
   </nav>
 </header>
+<section class="try" id="api-try">
+  <h2>API を試す</h2>
+  <p class="try-note">このページから実際の API を呼び出して、ステータスとレスポンスを確認できます。API キーはこのブラウザのメモリ内だけに保持し、サーバーへ保存しません（ページを離れると消えます）。管理系のエンドポイントには、ワークスペースの API キーが必要です。まず「投票を取得」で選択肢の ID を確認してから「投票する」を試すのがおすすめです。</p>
+  <div class="try-grid">
+    <label>エンドポイント <select id="try-endpoint"></select></label>
+    <label>テナント ID <input id="try-tenant" type="text" placeholder="管理系で必要"></label>
+    <label>投票 ID <input id="try-poll" type="text" placeholder="投票系で必要"></label>
+    <label>API キー <input id="try-key" type="password" autocomplete="off" placeholder="管理系で必要（保存されません）"></label>
+  </div>
+  <label>パス <input id="try-path" type="text"></label>
+  <label id="try-body-wrap">リクエスト本文（JSON） <textarea id="try-body" rows="7" spellcheck="false"></textarea></label>
+  <div class="try-actions">
+    <button class="try-send" id="try-send" type="button">送信</button>
+    <span class="try-status" id="try-status" role="status"></span>
+  </div>
+  <pre id="try-response">ここにレスポンスが表示されます。</pre>
+</section>
 <div id="redoc"></div>
 <script nonce="${escapeHtml(nonce)}" src="/redoc.standalone.js"></script>
 <script nonce="${escapeHtml(nonce)}">
@@ -2289,6 +2319,101 @@ ui.get("/docs", async (c) => {
       rightPanel: { backgroundColor: "#23272e" },
     },
   }, document.getElementById("redoc"));
+</script>
+<script nonce="${escapeHtml(nonce)}">
+(() => {
+  // The API key lives only in this page's memory: it is never written to
+  // storage and never sent anywhere except as the Authorization header of
+  // the request the user explicitly fires from this panel.
+  var ENDPOINTS = [
+    { id: "get-poll", label: "投票を取得（公開）", method: "GET", path: "/api/v1/polls/{pollId}" },
+    { id: "vote", label: "投票する（公開）", method: "POST", path: "/api/v1/polls/{pollId}/vote",
+      body: '{\\n  "voter_token": "preview-voter-1",\\n  "answers": []\\n}' },
+    { id: "get-results", label: "結果を取得（公開）", method: "GET", path: "/api/v1/polls/{pollId}/results" },
+    { id: "get-ballot", label: "自分の票を確認（公開）", method: "GET", path: "/api/v1/polls/{pollId}/ballot?voter_token=preview-voter-1" },
+    { id: "list-polls", label: "投票一覧（管理）", method: "GET", path: "/api/v1/tenants/{tenantId}/polls" },
+    { id: "create-poll", label: "投票を作成（管理）", method: "POST", path: "/api/v1/tenants/{tenantId}/polls",
+      body: '{\\n  "question": "プレビューで作成した投票",\\n  "options": [{ "label": "はい" }, { "label": "いいえ" }]\\n}' },
+    { id: "admin-results", label: "管理用結果を取得（管理）", method: "GET", path: "/api/v1/tenants/{tenantId}/polls/{pollId}/results" },
+    { id: "notifications", label: "通知一覧（管理）", method: "GET", path: "/api/v1/tenants/{tenantId}/notifications" }
+  ];
+  var sel = document.getElementById("try-endpoint");
+  var tenantEl = document.getElementById("try-tenant");
+  var pollEl = document.getElementById("try-poll");
+  var keyEl = document.getElementById("try-key");
+  var pathEl = document.getElementById("try-path");
+  var bodyWrap = document.getElementById("try-body-wrap");
+  var bodyEl = document.getElementById("try-body");
+  var statusEl = document.getElementById("try-status");
+  var respEl = document.getElementById("try-response");
+  for (var i = 0; i < ENDPOINTS.length; i++) {
+    var opt = document.createElement("option");
+    opt.value = ENDPOINTS[i].id;
+    opt.textContent = ENDPOINTS[i].method + " " + ENDPOINTS[i].path + " — " + ENDPOINTS[i].label;
+    sel.append(opt);
+  }
+  function current() {
+    for (var i = 0; i < ENDPOINTS.length; i++) if (ENDPOINTS[i].id === sel.value) return ENDPOINTS[i];
+    return ENDPOINTS[0];
+  }
+  function syncPath() {
+    var ep = current();
+    var p = ep.path;
+    var t = tenantEl.value.trim();
+    var v = pollEl.value.trim();
+    p = p.split("{tenantId}").join(t ? encodeURIComponent(t) : "{tenantId}");
+    p = p.split("{pollId}").join(v ? encodeURIComponent(v) : "{pollId}");
+    pathEl.value = p;
+    var hasBody = ep.method === "POST" || ep.method === "PATCH";
+    bodyWrap.hidden = !hasBody;
+    if (hasBody && bodyEl.getAttribute("data-ep") !== ep.id) {
+      bodyEl.value = ep.body || "";
+      bodyEl.setAttribute("data-ep", ep.id);
+    }
+  }
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = isError ? "try-status err" : "try-status";
+  }
+  sel.addEventListener("change", syncPath);
+  tenantEl.addEventListener("input", syncPath);
+  pollEl.addEventListener("input", syncPath);
+  document.getElementById("try-send").addEventListener("click", async () => {
+    var ep = current();
+    var path = pathEl.value.trim();
+    if (!path || path.indexOf("{") !== -1) {
+      setStatus("パスの {tenantId} / {pollId} が未入力です。ID を入力してください。", true);
+      return;
+    }
+    var init = { method: ep.method, headers: {} };
+    var key = keyEl.value.trim();
+    if (key) init.headers["authorization"] = "Bearer " + key;
+    if (!bodyWrap.hidden) {
+      var raw = bodyEl.value.trim();
+      if (raw) {
+        try {
+          init.body = JSON.stringify(JSON.parse(raw));
+        } catch (e) {
+          setStatus("リクエスト本文の JSON 形式が正しくありません。", true);
+          return;
+        }
+        init.headers["content-type"] = "application/json";
+      }
+    }
+    setStatus("送信中…", false);
+    try {
+      var res = await fetch(path, init);
+      var text = await res.text();
+      try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* keep raw text */ }
+      respEl.textContent = text || "(本文なし)";
+      setStatus("HTTP " + res.status + (res.statusText ? " " + res.statusText : ""), !res.ok);
+    } catch (e) {
+      respEl.textContent = "";
+      setStatus("通信エラー: " + (e && e.message ? e.message : String(e)), true);
+    }
+  });
+  syncPath();
+})();
 </script>
 </body>
 </html>`;
