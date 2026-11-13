@@ -92,6 +92,21 @@ describe("security headers and session cookies", () => {
     expect(html).toContain(`nonce="${nonce}"`);
   });
 
+  it("gives /docs a Redoc-compatible policy: style-src without a nonce", async () => {
+    const res = await SELF.fetch(`${BASE}/docs`);
+    expect(res.status).toBe(200);
+    const csp = res.headers.get("content-security-policy") ?? "";
+    // Scripts stay nonce-bound; only this page's style policy is relaxed.
+    expect(csp).toMatch(/script-src 'nonce-[A-Za-z0-9_-]+' 'strict-dynamic'/);
+    // A nonce in style-src would make browsers ignore 'unsafe-inline'
+    // (CSP3), blocking the runtime <style> elements styled-components
+    // creates for Redoc and breaking the page. It must not be there.
+    const styleSrc = /(?:^|; )style-src ([^;]*)/.exec(csp)?.[1] ?? "";
+    expect(styleSrc).toContain("'unsafe-inline'");
+    expect(styleSrc).not.toContain("nonce");
+    expect(csp).not.toContain("require-trusted-types-for");
+  });
+
   it("does not reflect an unsafe OIDC error query into the response", async () => {
     const res = await SELF.fetch(
       `${BASE}/auth/callback?error=${encodeURIComponent("</script><img src=x onerror=alert(1)>")}`,
