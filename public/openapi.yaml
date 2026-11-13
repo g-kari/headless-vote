@@ -40,6 +40,35 @@ info:
     }).then((r) => r.json());
     ```
 
+    ## CSV 取り込み
+
+    設問と選択肢は CSV から一括で取り込めます（`POST /api/v1/tenants/{tenantId}/polls/import-csv`）。検証だけなら `POST /api/v1/tenants/{tenantId}/polls/parse-csv` が、同じ `questions` の形に変換して返します。管理画面の投票作成・編集フォームにも同じ形式の取り込み機能があります。
+
+    形式は「1 行に 1 つの選択肢」で、先頭行が列名です。列は次の 9 つ（順不同、日本語名でも英語名でも可）:
+
+    | 列 | 内容 |
+    | --- | --- |
+    | 設問文（prompt） | 必須の列。同じ設問文が続く行は 1 つの設問にまとまります |
+    | 形式（kind） | 必須の列。`single`、`multiple`、`text`、`short_text`、`ranking`、`score`、`number`、`date`、`scale`、`slider`、`allocation`、または日本語名（単一選択、複数選択、自由記述、短いテキスト、順位付け、点数付け、数値入力、日付、段階評価、スライダー、配点） |
+    | 必須（required） | 必須／任意、はい／いいえ、true／false、1／0 など。空欄は必須 |
+    | 選択肢（option） | 選択式の設問で 1 行に 1 つ。2〜50 件。選択肢を持たない形式では空欄 |
+    | 最小値（min）／最大値（max） | 数値入力とスライダーのみ |
+    | 段階数（steps） | 段階評価のみ（2〜10） |
+    | 刻み（step） | スライダーのみ |
+    | 合計点（total） | 配点のみ |
+
+    同じ設問の行では、形式・必須・数値設定は同じ値を繰り返せます（異なる値を書くとエラーになります）。引用符で囲んだ文言、カンマや改行を含む文言、UTF-8 の BOM にも対応します。問題がある場合は行番号つきのエラー一覧を返し、取り込みは行いません（部分的な取り込みはしません）。上限は 256 KiB・2000 行・設問 20 件です。表示条件（`show_if`）と画像は CSV では指定できません。
+
+    サンプル:
+
+    ```csv
+    設問文,形式,必須,選択肢,最小値,最大値,段階数,刻み,合計点
+    好きな季節は？,単一選択,必須,春,,,,,
+    好きな季節は？,単一選択,必須,夏,,,,,
+    満足度,段階評価,必須,,,,5,,
+    感想,自由記述,任意,,,,,,,
+    ```
+
     ## Webhook
 
     イベントは `vote.cast`、`poll.published`、`poll.closed`、`poll.updated`、`poll.closing_soon`（締切 48 時間以内に 1 回）、`poll.deadline_reminder`（投票ごとに設定したリードタイムで締切前に 1 回。リマインドを有効にした投票だけ）です。本文は JSON（`id`、`type`、`created_at`、`tenant_id`、`data`）で、ヘッダー `X-Headless-Vote-Event` と署名 `X-Headless-Vote-Signature: v1=<hex>`（本文全体の HMAC-SHA256）が付きます。本文の `id` がイベントごとの一意な ID なので、受け側での重複判定に使えます。URL は公開前に検証され、プライベートアドレス宛ては送られません。配送結果（HTTP ステータス）はサーバ側に記録されます。
@@ -662,6 +691,75 @@ paths:
                   poll: { $ref: "#/components/schemas/Poll" }
         "400": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls/parse-csv:
+    post:
+      tags: [投票管理]
+      summary: CSV を設問データに変換（検証のみ）
+      description: |
+        設問 CSV を検証し、投票作成 API と同じ `questions` の形に変換して返します。何も保存しません。
+        問題がある場合は 400 で、`details.errors` に行番号（`line`、ヘッダーが 1 行目）と内容（`message`）の一覧を返し、変換は行いません。
+        本文は JSON（`{ "csv": "..." }`）でも、`Content-Type: text/csv` の生 CSV でも送れます。CSV の形式は情報セクションの「CSV 取り込み」を参照してください。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csv]
+              properties:
+                csv: { type: string, description: CSV 全文（最大 256 KiB） }
+          text/csv:
+            schema: { type: string }
+      responses:
+        "200":
+          description: 変換された設問
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  questions:
+                    type: array
+                    maxItems: 20
+                    items: { $ref: "#/components/schemas/QuestionInput" }
+        "400": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls/import-csv:
+    post:
+      tags: [投票管理]
+      summary: CSV から投票を作成
+      description: |
+        設問を CSV から取り込んで下書きの投票を作成します。投票の設定項目は投票作成と同じです（`question` が見出しになります）。
+        CSV に問題がある場合は 400 で `details.errors`（行番号つき）を返し、投票は作成されません。
+        既存の投票へ設問を追加したい場合は `parse-csv` で変換した `questions` を投票編集（PATCH）に渡してください。CSV の形式は情報セクションの「CSV 取り込み」を参照してください。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PollImportCsv" }
+            example:
+              question: CSV で作る投票
+              csv: |
+                設問文,形式,必須,選択肢,最小値,最大値,段階数,刻み,合計点
+                好きな季節は？,単一選択,必須,春,,,,,
+                好きな季節は？,単一選択,必須,夏,,,,,
+                感想,自由記述,任意,,,,,,
+      responses:
+        "201":
+          description: 作成された投票
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poll: { $ref: "#/components/schemas/Poll" }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
   /api/v1/tenants/{tenantId}/polls/{pollId}:
     get:
       tags: [投票管理]
@@ -1357,6 +1455,15 @@ components:
               type: array
               maxItems: 20
               items: { $ref: "#/components/schemas/QuestionInput" }
+    PollImportCsv:
+      allOf:
+        - $ref: "#/components/schemas/PollSettings"
+        - type: object
+          required: [csv]
+          properties:
+            csv:
+              type: string
+              description: 設問 CSV 全文（最大 256 KiB、最大 2000 行）。形式は情報セクションの「CSV 取り込み」を参照
     PollPatch:
       allOf:
         - $ref: "#/components/schemas/PollSettings"

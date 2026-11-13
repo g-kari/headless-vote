@@ -19,6 +19,7 @@ import {
   saveIpRestriction,
   validateIpEntries,
 } from "../ip-restriction";
+import { SAMPLE_QUESTIONS_CSV } from "../csv-import";
 import { listQuestionRows, questionConfig } from "../questions";
 import { computeResults, getPollRow, isClosedForVoting, listOptionRows, type PollResults } from "../domain";
 import { issueApiKey, limitKeyRotation, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
@@ -140,7 +141,7 @@ ui.get("/", async (c) => {
     </div>
     <h2>仕様</h2>
     <dl class="spec">
-      <dt>投票の設定</dt><dd>1つの投票に設問を最大20件まで追加できます。形式は単一選択・複数選択・自由記述・短いテキスト・順位付け・点数付け・数値入力・日付・段階評価・スライダー・配点。設問と選択肢に画像を添付できます。</dd>
+      <dt>投票の設定</dt><dd>1つの投票に設問を最大20件まで追加できます。形式は単一選択・複数選択・自由記述・短いテキスト・順位付け・点数付け・数値入力・日付・段階評価・スライダー・配点。設問と選択肢に画像を添付できます。設問と選択肢は CSV ファイルから一括で取り込むこともできます（管理画面のフォームと API の両方に対応）。</dd>
       <dt>投票ごとに選べる項目</dt><dd>ログイン必須か任意か、公開日時と締切日時。</dd>
       <dt>投票の数え方</dt><dd>1人1票。締切前なら投票の変更ができます。ログインした人はアカウント単位、匿名の人は投票者トークン単位で数えます。</dd>
       <dt>匿名投票の限界</dt><dd>トークンを変えた同一人物は別人として数えられます。厳密に1人1票が必要な投票では「ログイン必須」を選んでください。</dd>
@@ -1238,6 +1239,7 @@ const KIND_OPTIONS = [
   ['number', '数値入力'], ['date', '日付'], ['scale', '段階評価'], ['slider', 'スライダー'],
   ['allocation', '配点（合計を割り振る）'],
 ];
+const CSV_SAMPLE_TEXT = ${safeJsonForScript(SAMPLE_QUESTIONS_CSV)};
 
 /* ---- inline field errors -------------------------------------------- */
 let errorSeq = 0;
@@ -1463,7 +1465,7 @@ function addQuestionCard(data) {
   const bulkText = document.createElement('textarea');
   bulkText.className = 'q-bulk-text';
   bulkText.rows = 4;
-  bulkText.placeholder = '例：\nりんご\nみかん\nぶどう';
+  bulkText.placeholder = '例：\\nりんご\\nみかん\\nぶどう';
   bulkLabel.append(bulkText);
   const bulkActions = document.createElement('div');
   bulkActions.className = 'actions';
@@ -1477,7 +1479,7 @@ function addQuestionCard(data) {
   bulkReplace.textContent = '貼り付けで置き換え';
   function applyBulk(replace) {
     clearFieldError(bulkText);
-    const lines = bulkText.value.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0);
+    const lines = bulkText.value.split(/\\r?\\n/).map((s) => s.trim()).filter((s) => s.length > 0);
     if (lines.length === 0) {
       showFieldError(bulkText, '選択肢が入力されていません。1行に1つ入力してください。');
       bulkText.focus();
@@ -1559,6 +1561,304 @@ function addQuestionCard(data) {
   refreshShowIf();
 }
 document.getElementById('add-question').addEventListener('click', () => addQuestionCard(null));
+
+/* ---- CSV import -------------------------------------------------------
+ * Parse in the browser, preview with line-numbered errors, and append
+ * question cards only when the whole file is valid. The same rules run
+ * on the server when the form is saved, so a bad file never lands. */
+const CSV_KIND_ALIASES = {
+  single: 'single', '単一選択': 'single',
+  multiple: 'multiple', '複数選択': 'multiple',
+  text: 'text', '自由記述': 'text', '自由記述（長文）': 'text', '長文': 'text',
+  short_text: 'short_text', '短いテキスト': 'short_text', '短文': 'short_text', '短文テキスト': 'short_text',
+  ranking: 'ranking', '順位付け': 'ranking',
+  score: 'score', '点数付け': 'score',
+  number: 'number', '数値入力': 'number', '数値': 'number',
+  date: 'date', '日付': 'date',
+  scale: 'scale', '段階評価': 'scale',
+  slider: 'slider', 'スライダー': 'slider',
+  allocation: 'allocation', '配点': 'allocation',
+};
+const CSV_KIND_LABELS = {
+  single: '単一選択', multiple: '複数選択', text: '自由記述（長文）', short_text: '短いテキスト',
+  ranking: '順位付け', score: '点数付け', number: '数値入力', date: '日付',
+  scale: '段階評価', slider: 'スライダー', allocation: '配点',
+};
+const CSV_HEADER_ALIASES = {
+  '設問文': 'prompt', prompt: 'prompt', '形式': 'kind', kind: 'kind',
+  '必須': 'required', required: 'required', '選択肢': 'option', option: 'option',
+  '最小値': 'min', min: 'min', '最大値': 'max', max: 'max',
+  '段階数': 'steps', steps: 'steps', '刻み': 'step', step: 'step',
+  '合計点': 'total', total: 'total',
+};
+const CSV_CONFIG_COLUMNS = ['min', 'max', 'steps', 'step', 'total'];
+const CSV_CONFIG_LABELS = { min: '最小値', max: '最大値', steps: '段階数', step: '刻み', total: '合計点' };
+const CSV_KIND_CONFIG = { number: ['min', 'max'], scale: ['steps'], slider: ['min', 'max', 'step'], allocation: ['total'] };
+const CSV_REQUIRED_TRUE = ['必須', 'はい', 'yes', 'true', '1', '○', '要'];
+const CSV_REQUIRED_FALSE = ['任意', 'いいえ', 'no', 'false', '0', '×', '不要'];
+
+function parseCsvRecords(text) {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const records = [];
+  let cells = [];
+  let field = '';
+  let inQuotes = false;
+  let fieldQuoted = false;
+  let line = 1;
+  let recordLine = 1;
+  const endField = () => { cells.push(field); field = ''; fieldQuoted = false; };
+  const endRecord = () => { endField(); records.push({ line: recordLine, cells }); cells = []; };
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      }
+      if (ch === '\\n') line++;
+      field += ch; i++; continue;
+    }
+    if (ch === '"' && field === '' && !fieldQuoted) { inQuotes = true; fieldQuoted = true; i++; continue; }
+    if (ch === ',') { endField(); i++; continue; }
+    if (ch === '\\r' || ch === '\\n') {
+      endRecord();
+      if (ch === '\\r' && text[i + 1] === '\\n') i++;
+      i++; line++; recordLine = line; continue;
+    }
+    field += ch; i++;
+  }
+  if (inQuotes) return { records, error: { line: recordLine, message: '引用符（"）が閉じていません' } };
+  if (field !== '' || cells.length > 0) endRecord();
+  return { records, error: null };
+}
+
+function parseQuestionsCsv(text) {
+  const fail = (errors) => ({ questions: null, errors });
+  const parsed = parseCsvRecords(text);
+  if (parsed.error) return fail([parsed.error]);
+  const records = parsed.records;
+  if (records.length === 0) return fail([{ line: null, message: 'CSV が空です' }]);
+  const headerCells = records[0].cells.map((cell) => cell.trim());
+  let columnCount = headerCells.length;
+  while (columnCount > 0 && (headerCells[columnCount - 1] || '') === '') {
+    const idx = columnCount - 1;
+    if (!records.every((r) => ((r.cells[idx] || '').trim() === ''))) break;
+    columnCount--;
+  }
+  const headerErrors = [];
+  const columns = {};
+  for (let idx = 0; idx < columnCount; idx++) {
+    const name = headerCells[idx];
+    if (name === '') { headerErrors.push({ line: 1, message: (idx + 1) + ' 列目の列名が空です' }); continue; }
+    const canonical = CSV_HEADER_ALIASES[name.toLowerCase()] || CSV_HEADER_ALIASES[name];
+    if (!canonical) {
+      headerErrors.push({ line: 1, message: '列「' + name + '」は使えません。使える列は 設問文、形式、必須、選択肢、最小値、最大値、段階数、刻み、合計点 です' });
+      continue;
+    }
+    if (columns[canonical] !== undefined) { headerErrors.push({ line: 1, message: '列「' + name + '」が重複しています' }); continue; }
+    columns[canonical] = idx;
+  }
+  if (columns.prompt === undefined) headerErrors.push({ line: 1, message: '「設問文」の列が必要です' });
+  if (columns.kind === undefined) headerErrors.push({ line: 1, message: '「形式」の列が必要です' });
+  if (headerErrors.length > 0) return fail(headerErrors);
+  const cellOf = (record, canonical) => {
+    const idx = columns[canonical];
+    return idx === undefined ? '' : (record.cells[idx] || '');
+  };
+  const dataRecords = records.slice(1).filter((r) => r.cells.some((cell) => cell.trim() !== ''));
+  if (dataRecords.length === 0) {
+    return fail([{ line: null, message: '設問の行がありません。ヘッダー行の下に設問の行を追加してください' }]);
+  }
+  const errors = [];
+  const groups = [];
+  let current = null;
+  for (const record of dataRecords) {
+    const line = record.line;
+    if (record.cells.length > columnCount && record.cells.slice(columnCount).some((cell) => cell.trim() !== '')) {
+      errors.push({ line, message: '列数がヘッダーと一致しません' });
+    }
+    const prompt = cellOf(record, 'prompt').trim();
+    if (prompt === '') {
+      errors.push({ line, message: '設問文が入力されていません' });
+      current = null;
+      continue;
+    }
+    if (!current || current.prompt !== prompt) {
+      current = { prompt, firstLine: line, kind: null, required: null, config: {}, options: [] };
+      groups.push(current);
+    }
+    const group = current;
+    const kindCell = cellOf(record, 'kind');
+    if (kindCell.trim() !== '') {
+      const kind = CSV_KIND_ALIASES[kindCell.trim().toLowerCase()] || CSV_KIND_ALIASES[kindCell.trim()] || null;
+      if (!kind) {
+        errors.push({ line, message: '形式「' + kindCell.trim() + '」は使えません。単一選択、複数選択、自由記述（長文）、短いテキスト、順位付け、点数付け、数値入力、日付、段階評価、スライダー、配点 のいずれかを指定してください' });
+      } else if (group.kind === null) {
+        group.kind = kind;
+      } else if (group.kind !== kind) {
+        errors.push({ line, message: '同じ設問の行で形式が異なります' });
+      }
+    }
+    const requiredCell = cellOf(record, 'required');
+    if (requiredCell.trim() !== '') {
+      const value = requiredCell.trim().toLowerCase();
+      let required = null;
+      if (CSV_REQUIRED_TRUE.includes(value)) required = true;
+      else if (CSV_REQUIRED_FALSE.includes(value)) required = false;
+      if (required === null) {
+        errors.push({ line, message: '必須の指定「' + requiredCell.trim() + '」は使えません。必須／任意、はい／いいえ、true／false、1／0 のいずれかを指定してください' });
+      } else if (group.required === null) {
+        group.required = required;
+      } else if (group.required !== required) {
+        errors.push({ line, message: '同じ設問の行で必須の指定が異なります' });
+      }
+    }
+    const kind = group.kind || 'single';
+    for (const column of CSV_CONFIG_COLUMNS) {
+      const raw = cellOf(record, column).trim();
+      if (raw === '') continue;
+      const allowed = CSV_KIND_CONFIG[kind] || [];
+      if (!allowed.includes(column)) {
+        errors.push({ line, message: '「' + CSV_CONFIG_LABELS[column] + '」は' + CSV_KIND_LABELS[kind] + 'の設問では指定できません' });
+        continue;
+      }
+      const value = Number(raw);
+      if (!Number.isFinite(value)) {
+        errors.push({ line, message: '「' + CSV_CONFIG_LABELS[column] + '」には数値を入力してください' });
+        continue;
+      }
+      if (group.config[column] === undefined) group.config[column] = value;
+      else if (group.config[column] !== value) {
+        errors.push({ line, message: '同じ設問の行で「' + CSV_CONFIG_LABELS[column] + '」の値が異なります' });
+      }
+    }
+    const optionLabel = cellOf(record, 'option').trim();
+    if (OPTION_KINDS.includes(kind)) {
+      if (optionLabel === '') errors.push({ line, message: '選択肢が入力されていません' });
+      else group.options.push({ label: optionLabel, line });
+    } else if (optionLabel !== '') {
+      errors.push({ line, message: CSV_KIND_LABELS[kind] + 'の設問に選択肢は指定できません' });
+    }
+  }
+  groups.forEach((group, groupIndex) => {
+    if (groupIndex === 20) {
+      errors.push({ line: group.firstLine, message: '設問は最大 20 件までです' });
+    }
+    if (group.kind === null) {
+      errors.push({ line: group.firstLine, message: '形式が入力されていません' });
+    }
+    if (group.prompt.length > 300) {
+      errors.push({ line: group.firstLine, message: '設問文は 300 文字までです' });
+    }
+    const kind = group.kind || 'single';
+    if (OPTION_KINDS.includes(kind)) {
+      if (group.options.length < 2) {
+        errors.push({ line: group.firstLine, message: '選択肢が ' + group.options.length + ' 件です。選択式の設問には 2 件以上必要です' });
+      }
+      group.options.forEach((option, optionIndex) => {
+        if (optionIndex === 50) errors.push({ line: option.line, message: '選択肢は最大 50 件までです' });
+        if (option.label.length > 200) errors.push({ line: option.line, message: '選択肢の文言は 200 文字までです' });
+      });
+    }
+  });
+  if (errors.length > 0) return fail(errors);
+  const questions = groups.map((group) => ({
+    prompt: group.prompt,
+    kind: group.kind,
+    required: group.required !== false,
+    config: Object.keys(group.config).length > 0 ? group.config : null,
+    options: group.options.map((option) => ({ label: option.label, image_key: null })),
+  }));
+  return { questions, errors: [] };
+}
+
+const csvFileEl = document.getElementById('csv-file');
+const csvPreviewEl = document.getElementById('csv-preview');
+function clearCsvPreview() { csvPreviewEl.replaceChildren(); }
+function showCsvErrors(errors) {
+  clearCsvPreview();
+  const head = document.createElement('p');
+  head.className = 'field-error';
+  head.textContent = 'CSV に ' + errors.length + ' 件の問題があるため、取り込みは行いませんでした。';
+  csvPreviewEl.append(head);
+  const list = document.createElement('ul');
+  for (const e of errors) {
+    const li = document.createElement('li');
+    li.className = 'field-error';
+    li.textContent = (e.line ? e.line + ' 行目: ' : '') + e.message;
+    list.append(li);
+  }
+  csvPreviewEl.append(list);
+}
+function showCsvPreview(questions) {
+  clearCsvPreview();
+  const head = document.createElement('p');
+  head.className = 'small';
+  head.textContent = '取り込む内容（' + questions.length + ' 件の設問）:';
+  csvPreviewEl.append(head);
+  const list = document.createElement('ul');
+  questions.forEach((q, i) => {
+    const li = document.createElement('li');
+    li.className = 'small';
+    let text = '設問' + (i + 1) + '「' + q.prompt + '」（' + (CSV_KIND_LABELS[q.kind] || q.kind) + '・' + (q.required ? '必須' : '任意') + '）';
+    if (q.options.length > 0) text += ' 選択肢: ' + q.options.map((o) => o.label).join(' / ');
+    li.textContent = text;
+    list.append(li);
+  });
+  csvPreviewEl.append(list);
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const apply = document.createElement('button');
+  apply.type = 'button';
+  apply.className = 'btn primary';
+  apply.textContent = 'この内容を取り込む';
+  apply.addEventListener('click', () => applyCsvImport(questions));
+  actions.append(apply);
+  csvPreviewEl.append(actions);
+}
+function applyCsvImport(questions) {
+  // Drop untouched empty cards so a fresh form does not keep a blank
+  // question in front of the imported ones.
+  for (const card of [...questionsEl.querySelectorAll('.question-card')]) {
+    const prompt = card.querySelector('.q-prompt').value.trim();
+    const labels = [...card.querySelectorAll('.opt-label')].map((el) => el.value.trim()).filter((s) => s.length > 0);
+    if (!prompt && labels.length === 0) card.remove();
+  }
+  const existing = questionsEl.querySelectorAll('.question-card').length;
+  if (existing + questions.length > 20) {
+    showCsvErrors([{ line: null, message: '設問は最大 20 件までです。現在の ' + existing + ' 件と取り込む ' + questions.length + ' 件で上限を超えます。' }]);
+    return;
+  }
+  for (const q of questions) addQuestionCard(q);
+  clearCsvPreview();
+  const done = document.createElement('p');
+  done.className = 'small';
+  done.textContent = questions.length + ' 件の設問を取り込みました。内容を確認して保存してください。';
+  csvPreviewEl.append(done);
+}
+csvFileEl.addEventListener('change', async () => {
+  const file = csvFileEl.files && csvFileEl.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const result = parseQuestionsCsv(text);
+    if (result.errors.length > 0) showCsvErrors(result.errors);
+    else showCsvPreview(result.questions);
+  } catch (e) {
+    showCsvErrors([{ line: null, message: 'CSV ファイルを読み取れませんでした' }]);
+  }
+  csvFileEl.value = '';
+});
+document.getElementById('csv-sample').addEventListener('click', () => {
+  const blob = new Blob([CSV_SAMPLE_TEXT], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'hyo-questions-sample.csv';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 
 async function uploadImage(file) {
   const res = await fetch('/api/v1/tenants/' + TENANT + '/images', {
@@ -1916,6 +2216,16 @@ function pollFormBody(opts: {
       </div>` : ""}
       <h2>設問</h2>
       <p class="muted small">形式は単一選択、複数選択、自由記述（長文／短いテキスト）、順位付け、点数付け、数値入力、日付、段階評価、スライダー、配点です。単一・複数選択の回答を条件に、後ろの設問を表示する分岐も付けられます。並び順は上から下です。最大 20 問。</p>
+      <div class="csv-import">
+        <h3>CSV から取り込む</h3>
+        <p class="muted small">設問と選択肢を CSV ファイルからまとめて追加できます。1 行に 1 つの選択肢を書き、同じ設問文が続く行は 1 つの設問にまとまります。先頭行は列名で、列は「設問文,形式,必須,選択肢,最小値,最大値,段階数,刻み,合計点」です。形式には単一選択・複数選択・自由記述（長文）・短いテキスト・順位付け・点数付け・数値入力・日付・段階評価・スライダー・配点のいずれかを書きます。エラーがある場合は行番号つきで表示し、取り込みは行いません。</p>
+        <div class="actions">
+          <label class="btn" for="csv-file" style="margin:0">CSV ファイルを選ぶ</label>
+          <input id="csv-file" type="file" accept=".csv,text/csv" hidden>
+          <button type="button" class="btn" id="csv-sample">サンプル CSV をダウンロード</button>
+        </div>
+        <div id="csv-preview" class="csv-preview"></div>
+      </div>
       <div id="questions"></div>
       <div class="actions"><button type="button" class="btn" id="add-question">設問を追加</button></div>
       <div class="actions"><button class="btn primary" type="submit">${p ? "変更を保存" : "下書きとして作成"}</button></div>

@@ -39,6 +39,7 @@ import {
   questionTextStatements,
   type QuestionInput,
 } from "../questions";
+import { CSV_IMPORT_MAX_BYTES, parseQuestionsCsv } from "../csv-import";
 import { createObjectStore } from "../platform/objects";
 import { selectAuthProvider } from "../platform";
 import { assertPlainText, assertSameOriginMutation, isSafeImageKey, normalizeUuid, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
@@ -298,6 +299,108 @@ api.post("/tenants/:tenantId/polls", async (c) => {
     },
     admin,
     "poll.create",
+  );
+  return c.json({ poll: await renderPoll(c, poll) }, 201);
+});
+
+/* ------------------------------------------------------------------ */
+/* CSV import                                                          */
+/* ------------------------------------------------------------------ */
+
+/** JSON body reader with a caller-chosen cap (jsonBody is capped at 64 KiB). */
+async function jsonBodyWithLimit(
+  c: Context<{ Bindings: Env; Variables: Variables }>,
+  maxBytes: number,
+): Promise<Record<string, unknown>> {
+  let parsed: unknown;
+  try {
+    const bytes = await readBodyLimited(c.req.raw, maxBytes);
+    if (bytes.byteLength === 0) throw badRequest("Request body must be valid JSON");
+    parsed = JSON.parse(new TextDecoder().decode(bytes));
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    throw badRequest("Request body must be valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw badRequest("Request body must be a JSON object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/** The CSV text of a parse request: a raw text/csv body or { csv } JSON. */
+async function readCsvText(
+  c: Context<{ Bindings: Env; Variables: Variables }>,
+): Promise<string> {
+  const contentType = c.req.header("content-type") ?? "";
+  if (contentType.includes("text/csv")) {
+    const bytes = await readBodyLimited(c.req.raw, CSV_IMPORT_MAX_BYTES);
+    return new TextDecoder().decode(bytes);
+  }
+  const body = await jsonBodyWithLimit(c, CSV_IMPORT_MAX_BYTES + 16 * 1024);
+  const csv = body["csv"];
+  if (typeof csv !== "string") throw badRequest('"csv" must be a string');
+  return csv;
+}
+
+/**
+ * Validate CSV question data without storing anything. Returns the same
+ * questions payload shape that poll creation accepts.
+ */
+api.post("/tenants/:tenantId/polls/parse-csv", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId);
+  const result = parseQuestionsCsv(await readCsvText(c));
+  if (!result.questions) {
+    throw badRequest("CSV を取り込めませんでした", { errors: result.errors });
+  }
+  return c.json({ questions: result.questions });
+});
+
+/** Create a draft poll whose questions come from CSV data. */
+api.post("/tenants/:tenantId/polls/import-csv", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId);
+  const body = await jsonBodyWithLimit(c, CSV_IMPORT_MAX_BYTES + 16 * 1024);
+  const csv = body["csv"];
+  if (typeof csv !== "string") throw badRequest('"csv" must be a string');
+  const result = parseQuestionsCsv(csv);
+  if (!result.questions) {
+    throw badRequest("CSV を取り込めませんでした", { errors: result.errors });
+  }
+  const question = reqString(body, "question", { max: 300 });
+  const description = optString(body, "description", { max: 5000, newlines: true }) ?? "";
+  const imageKey = optString(body, "image_key", { max: 300 });
+  const requireLogin = optBool(body, "require_login");
+  const opensAt = optIsoDate(body, "opens_at");
+  const closesAt = optIsoDate(body, "closes_at");
+  assertSchedule(opensAt, closesAt);
+  const resultsVisibility = parseResultsVisibility(body["results_visibility"]);
+  const ipSingleVote = optBool(body, "ip_single_vote");
+  const confirmRequired = optBool(body, "confirm_required");
+  const passphrase = readPassphrase(body);
+  const reminderEnabled = optBool(body, "reminder_enabled");
+  const reminderLeadHours = readLeadHours(body, 24);
+  const poll = await createPollRecord(
+    c,
+    tenantId,
+    {
+      question,
+      description,
+      image_key: imageKey,
+      require_login: requireLogin,
+      results_visibility: resultsVisibility,
+      ip_single_vote: ipSingleVote,
+      confirm_required: confirmRequired,
+      passphrase_hash: passphrase ? await hashPassphrase(c.env, passphrase) : null,
+      reminder_enabled: reminderEnabled,
+      reminder_lead_hours: reminderLeadHours,
+      opens_at: opensAt,
+      closes_at: closesAt,
+      allow_multiple_fallback: false,
+      questions: result.questions,
+    },
+    admin,
+    "poll.import_csv",
   );
   return c.json({ poll: await renderPoll(c, poll) }, 201);
 });
