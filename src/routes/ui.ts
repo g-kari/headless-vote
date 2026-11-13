@@ -1453,6 +1453,65 @@ function addQuestionCard(data) {
   addOpt.className = 'btn small';
   addOpt.textContent = '選択肢を追加';
   addOpt.addEventListener('click', () => { addOptionRow(options, '', null, ''); refreshShowIf(); });
+  /* Bulk paste: newline-separated labels, added to or replacing the rows.
+     Blank lines are ignored; the 50-option server limit is enforced here. */
+  const bulk = document.createElement('div');
+  bulk.className = 'q-bulk';
+  const bulkLabel = document.createElement('label');
+  bulkLabel.className = 'small';
+  bulkLabel.textContent = '選択肢をまとめて入力（1行に1つ）';
+  const bulkText = document.createElement('textarea');
+  bulkText.className = 'q-bulk-text';
+  bulkText.rows = 4;
+  bulkText.placeholder = '例：\nりんご\nみかん\nぶどう';
+  bulkLabel.append(bulkText);
+  const bulkActions = document.createElement('div');
+  bulkActions.className = 'actions';
+  const bulkAdd = document.createElement('button');
+  bulkAdd.type = 'button';
+  bulkAdd.className = 'btn small';
+  bulkAdd.textContent = '貼り付けから追加';
+  const bulkReplace = document.createElement('button');
+  bulkReplace.type = 'button';
+  bulkReplace.className = 'btn small';
+  bulkReplace.textContent = '貼り付けで置き換え';
+  function applyBulk(replace) {
+    clearFieldError(bulkText);
+    const lines = bulkText.value.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0);
+    if (lines.length === 0) {
+      showFieldError(bulkText, '選択肢が入力されていません。1行に1つ入力してください。');
+      bulkText.focus();
+      return;
+    }
+    const rows = [...options.querySelectorAll('.option-row')];
+    if (replace) {
+      for (const row of rows) row.remove();
+    } else {
+      // Drop untouched empty rows first so pasted labels do not sit
+      // behind blanks that would fail validation at save time.
+      for (const row of rows) {
+        const label = row.querySelector('.opt-label').value.trim();
+        const key = row.querySelector('.opt-key').value;
+        if (!label && !key) row.remove();
+      }
+    }
+    const room = 50 - options.querySelectorAll('.option-row').length;
+    if (room <= 0) {
+      showFieldError(bulkText, '選択肢は最大50件までです。');
+      return;
+    }
+    const take = lines.slice(0, room);
+    for (const line of take) addOptionRow(options, line.slice(0, 200), null, '');
+    bulkText.value = '';
+    if (lines.length > take.length) {
+      showFieldError(bulkText, '選択肢は最大50件までのため、' + (lines.length - take.length) + '件は追加できませんでした。');
+    }
+    refreshShowIf();
+  }
+  bulkAdd.addEventListener('click', () => applyBulk(false));
+  bulkReplace.addEventListener('click', () => applyBulk(true));
+  bulkActions.append(bulkAdd, bulkReplace);
+  bulk.append(bulkLabel, bulkActions);
   const CONFIG_FIELDS = {
     number: ['min', 'max'],
     scale: ['steps'],
@@ -1463,6 +1522,7 @@ function addQuestionCard(data) {
     const noOptions = !OPTION_KINDS.includes(kind.value);
     options.hidden = noOptions;
     addOpt.hidden = noOptions;
+    bulk.hidden = noOptions;
     kindHint.textContent = KIND_HINTS[kind.value] || '';
     const fields = CONFIG_FIELDS[kind.value] || [];
     configWrap.hidden = fields.length === 0;
@@ -1487,7 +1547,7 @@ function addQuestionCard(data) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   actions.append(up, down, del);
-  card.append(prompt, kind, kindHint, configWrap, requiredLabel, qid, showIfWrap, options, addOpt, actions);
+  card.append(prompt, kind, kindHint, configWrap, requiredLabel, qid, showIfWrap, options, addOpt, bulk, actions);
   questionsEl.append(card);
   const seedOptions = (data && data.options) || [];
   if (seedOptions.length === 0 && (!data || OPTION_KINDS.includes(data.kind))) {

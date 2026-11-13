@@ -204,6 +204,9 @@ input:user-invalid,textarea:user-invalid,select:user-invalid{border-color:var(--
 .q-showif select{width:auto;max-width:100%}
 .q-showif-opt{display:inline-flex;align-items:center;gap:.5rem;flex-wrap:wrap}
 .q-options{margin-top:.4rem}
+.q-bulk{margin-top:.8rem}
+.q-bulk label{margin-top:0}
+.q-bulk textarea{margin-top:.3rem}
 .question-card .actions{margin-top:1.1rem}
 .opt-preview{max-width:120px;border:1px solid var(--border)}
 /* Print: results pages become a clean report. Navigation and controls are
