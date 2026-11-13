@@ -5,7 +5,7 @@ import { actorLabel, listAuditEvents, recordAudit } from "../audit";
 import { bearerToken, getSessionUser, optionalVoterSub, requireAdmin } from "../auth";
 import { ballotCount, deleteBallot, upsertBallot } from "../ballots";
 import { addTenantOrigin, listTenantOrigins, isAllowedTenantOrigin, removeTenantOrigin } from "../cors";
-import { randomId } from "../crypto";
+import { randomId, sha256Hex } from "../crypto";
 import { resultsToCsv } from "../export";
 import {
   assertSchedule,
@@ -181,6 +181,12 @@ async function loadPollForAdmin(
   return poll;
 }
 
+function parseResultsVisibility(raw: unknown): string {
+  if (raw === undefined || raw === null) return "public";
+  if (raw === "public" || raw === "after_close" || raw === "admin_only") return raw;
+  throw badRequest('"results_visibility" must be public, after_close, or admin_only');
+}
+
 api.post("/tenants/:tenantId/polls", async (c) => {
   const tenantId = c.req.param("tenantId");
   const admin = await requireAdmin(c, tenantId);
@@ -193,6 +199,9 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const opensAt = optIsoDate(body, "opens_at");
   const closesAt = optIsoDate(body, "closes_at");
   assertSchedule(opensAt, closesAt);
+  const resultsVisibility = parseResultsVisibility(body["results_visibility"]);
+  const ipSingleVote = optBool(body, "ip_single_vote");
+  const confirmRequired = optBool(body, "confirm_required");
   const questions = await questionInputsFromBody(c, tenantId, body, question, allowMultiple);
   const firstChoice = questions.find((q) => q.kind !== "text");
   const multiple = firstChoice ? firstChoice.kind === "multiple" : allowMultiple;
@@ -210,8 +219,8 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const now = nowIso();
   const revision = randomId();
   const insertPoll = c.env.DB.prepare(
-    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, created_at, updated_at, revision)
-     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?10, ?10, ?11
+    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, results_visibility, ip_single_vote, confirm_required, created_at, updated_at, revision)
+     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?12, ?13, ?14, ?10, ?10, ?11
      WHERE (SELECT COUNT(*) FROM polls WHERE tenant_id = ?2) <
        (SELECT quota_polls FROM tenants WHERE id = ?2)`,
   )
@@ -227,6 +236,9 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       closesAt,
       now,
       revision,
+      resultsVisibility,
+      ipSingleVote ? 1 : 0,
+      confirmRequired ? 1 : 0,
     );
   const [created] = await c.env.DB.batch([insertPoll, ...replaceQuestionStatements(c.env, pollId, questions, revision)]);
   if (Number(created?.meta.changes ?? 0) !== 1) throw conflict("QUOTA_EXCEEDED", "Poll quota exceeded");
@@ -293,6 +305,16 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
   const closesAt =
     body["closes_at"] !== undefined ? optIsoDate(body, "closes_at") : poll.closes_at;
   assertSchedule(opensAt, closesAt);
+  const resultsVisibility =
+    body["results_visibility"] !== undefined
+      ? parseResultsVisibility(body["results_visibility"])
+      : poll.results_visibility;
+  const ipSingleVote =
+    body["ip_single_vote"] !== undefined ? optBool(body, "ip_single_vote") : poll.ip_single_vote === 1;
+  const confirmRequired =
+    body["confirm_required"] !== undefined
+      ? optBool(body, "confirm_required")
+      : poll.confirm_required === 1;
 
   await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
 
@@ -346,7 +368,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
   const updatePoll = c.env.DB.prepare(
     `UPDATE polls SET question = ?1, description = ?2, image_key = ?3,
      allow_multiple = ?4, require_login = ?5, opens_at = ?6, closes_at = ?7, updated_at = ?8,
-     revision = ?9
+     revision = ?9, results_visibility = ?13, ip_single_vote = ?14, confirm_required = ?15
      WHERE id = ?10 AND revision = ?11 AND status != 'closed'
        AND (?12 = 0 OR NOT EXISTS (SELECT 1 FROM vote_ballots WHERE poll_id = ?10))`,
   ).bind(
@@ -362,6 +384,9 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     poll.id,
     poll.revision,
     replacement || allowMultiple !== (poll.allow_multiple === 1) || requireLogin !== (poll.require_login === 1) ? 1 : 0,
+    resultsVisibility,
+    ipSingleVote ? 1 : 0,
+    confirmRequired ? 1 : 0,
   );
 
   const [updatedPoll] = await c.env.DB.batch([
@@ -530,6 +555,18 @@ api.get("/polls/:pollId", async (c) => {
 });
 
 api.get("/polls/:pollId/results", async (c) => {
+  const visibilityPoll = await getPollRow(c.env, c.req.param("pollId"));
+  if (visibilityPoll) {
+    if (visibilityPoll.results_visibility === "admin_only") {
+      throw forbidden("Results for this poll are not public");
+    }
+    if (
+      visibilityPoll.results_visibility === "after_close" &&
+      !isClosedForVoting(visibilityPoll)
+    ) {
+      throw forbidden("Results are published after this poll closes");
+    }
+  }
   const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
   return c.json({ results: await computeResults(c.env, originOf(c), poll) });
 });
@@ -583,6 +620,18 @@ api.post("/polls/:pollId/vote", async (c) => {
     }
     assertPlainText(trimmedToken);
     voterKey = `anon:${trimmedToken}`;
+    if (poll.ip_single_vote === 1) {
+      // One ballot per connection: the key is derived from the client IP
+      // only, so changing the browser token does not mint another ballot.
+      const ip = c.req.header("cf-connecting-ip") ?? "";
+      voterKey = `ip:${await sha256Hex(ip || "unknown")}`;
+    }
+  }
+  if (poll.confirm_required === 1 && body["confirm"] !== true) {
+    throw conflict(
+      "CONFIRM_REQUIRED",
+      "This poll requires an explicit confirmation step before the vote is recorded",
+    );
   }
 
   await assertDailyVoteQuota(c.env, poll.tenant_id);

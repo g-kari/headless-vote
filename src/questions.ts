@@ -13,6 +13,11 @@ export interface OptionInput {
   image_key: string | null;
 }
 
+export interface ShowIfInput {
+  question_id: string;
+  option_id: string;
+}
+
 export interface QuestionInput {
   id?: string;
   prompt: string;
@@ -21,12 +26,15 @@ export interface QuestionInput {
   kind: QuestionKind;
   required: boolean;
   options: OptionInput[];
+  show_if?: ShowIfInput | null;
 }
 
 export interface AnswerInput {
   question_id: string;
   option_ids: string[];
   text: string | null;
+  /** Per-option scores for kind = "score" questions (option id -> 0..5). */
+  scores: Record<string, number> | null;
 }
 
 export async function listQuestionRows(env: Env, pollId: string): Promise<QuestionRow[]> {
@@ -93,14 +101,14 @@ export function parseQuestions(body: Record<string, unknown>): QuestionInput[] |
   if (!Array.isArray(raw) || raw.length < 1 || raw.length > MAX_QUESTIONS) {
     throw badRequest(`"questions" must be an array of 1 to ${MAX_QUESTIONS} items`);
   }
-  return raw.map((item, index) => {
+  const parsed: QuestionInput[] = raw.map((item, index) => {
     if (typeof item !== "object" || item === null) {
       throw badRequest(`questions[${index}] must be an object`);
     }
     const q = item as Record<string, unknown>;
     const kind = q["kind"];
-    if (kind !== "single" && kind !== "multiple" && kind !== "text") {
-      throw badRequest(`questions[${index}].kind must be single, multiple, or text`);
+    if (kind !== "single" && kind !== "multiple" && kind !== "text" && kind !== "ranking" && kind !== "score") {
+      throw badRequest(`questions[${index}].kind must be single, multiple, text, ranking, or score`);
     }
     const prompt = readString(q, "prompt", 300);
     const description = typeof q["description"] === "string" ? q["description"] : "";
@@ -112,6 +120,20 @@ export function parseQuestions(body: Record<string, unknown>): QuestionInput[] |
     if (kind === "text" && q["options"] !== undefined && Array.isArray(q["options"]) && q["options"].length > 0) {
       throw badRequest(`questions[${index}] is free text and cannot have options`);
     }
+    let showIf: ShowIfInput | null = null;
+    if (q["show_if"] !== undefined && q["show_if"] !== null) {
+      const raw = q["show_if"];
+      if (typeof raw !== "object" || Array.isArray(raw)) {
+        throw badRequest(`questions[${index}].show_if must be an object`);
+      }
+      const target = raw as Record<string, unknown>;
+      const targetQuestion = readOptionalId(target, "question_id");
+      const targetOption = readOptionalId(target, "option_id");
+      if (!targetQuestion || !targetOption) {
+        throw badRequest(`questions[${index}].show_if requires question_id and option_id`);
+      }
+      showIf = { question_id: targetQuestion, option_id: targetOption };
+    }
     return {
       id: readOptionalId(q, "id"),
       prompt,
@@ -120,8 +142,26 @@ export function parseQuestions(body: Record<string, unknown>): QuestionInput[] |
       kind,
       required,
       options,
+      show_if: showIf,
     };
   });
+  // Conditional display must reference an earlier single/multiple question
+  // in the same payload, by the client-supplied ids of that question.
+  parsed.forEach((question, index) => {
+    if (!question.show_if) return;
+    const targetIndex = parsed.findIndex((q) => q.id !== undefined && q.id === question.show_if?.question_id);
+    if (targetIndex < 0 || targetIndex >= index) {
+      throw badRequest(`questions[${index}].show_if must reference an earlier question`);
+    }
+    const target = parsed[targetIndex];
+    if (!target || (target.kind !== "single" && target.kind !== "multiple")) {
+      throw badRequest(`questions[${index}].show_if target must be a single or multiple question`);
+    }
+    if (!target.options.some((o) => o.id !== undefined && o.id === question.show_if?.option_id)) {
+      throw badRequest(`questions[${index}].show_if option does not belong to the target question`);
+    }
+  });
+  return parsed;
 }
 
 export function legacyQuestion(
@@ -136,6 +176,7 @@ export function legacyQuestion(
     kind: allowMultiple ? "multiple" : "single",
     required: true,
     options,
+    show_if: null,
   };
 }
 
@@ -150,17 +191,33 @@ export function replaceQuestionStatements(
     env.DB.prepare(`DELETE FROM questions WHERE poll_id = ?1 AND ${guard}`).bind(pollId, revision),
   ];
   const now = new Date().toISOString();
+  // Ids are regenerated on replace; client-supplied ids in show_if are
+  // remapped onto the generated ids so conditions survive the rewrite.
+  const questionIds = questions.map(() => randomId());
+  const questionIdMap = new Map<string, string>();
+  questions.forEach((q, i) => {
+    if (q.id) questionIdMap.set(q.id, questionIds[i] as string);
+  });
+  const optionIdMap = new Map<string, string>();
+  questions.forEach((q) => {
+    q.options.forEach((o) => {
+      if (o.id) optionIdMap.set(o.id, randomId());
+    });
+  });
   questions.forEach((q, position) => {
-    const id = randomId();
+    const id = questionIds[position] as string;
+    const showQ = q.show_if ? (questionIdMap.get(q.show_if.question_id) ?? null) : null;
+    const showO = q.show_if ? (optionIdMap.get(q.show_if.option_id) ?? null) : null;
     statements.push(env.DB.prepare(`INSERT INTO questions
-      (id, poll_id, prompt, description, image_key, kind, required, position, created_at)
-      SELECT ?3, ?1, ?4, ?5, ?6, ?7, ?8, ?9, ?10 WHERE ${guard}`)
-      .bind(pollId, revision, id, q.prompt, q.description, q.image_key, q.kind, q.required ? 1 : 0, position, now));
+      (id, poll_id, prompt, description, image_key, kind, required, position, show_if_question_id, show_if_option_id, created_at)
+      SELECT ?3, ?1, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 WHERE ${guard}`)
+      .bind(pollId, revision, id, q.prompt, q.description, q.image_key, q.kind, q.required ? 1 : 0, position, showQ, showO, now));
     q.options.forEach((o, index) => {
+      const optionId = o.id ? (optionIdMap.get(o.id) as string) : randomId();
       statements.push(env.DB.prepare(`INSERT INTO options
         (id, poll_id, question_id, label, image_key, position, created_at)
         SELECT ?3, ?1, ?4, ?5, ?6, ?7, ?8 WHERE ${guard}`)
-        .bind(pollId, revision, randomId(), id, o.label, o.image_key, index, now));
+        .bind(pollId, revision, optionId, id, o.label, o.image_key, index, now));
     });
   });
   return statements;
@@ -217,6 +274,10 @@ export function sameStructure(
     seen.add(q.id);
     const prev = byId.get(q.id);
     if (!prev || prev.kind !== q.kind) return false;
+    const prevShowQ = prev.show_if_question_id ?? null;
+    const prevShowO = prev.show_if_option_id ?? null;
+    if ((q.show_if?.question_id ?? null) !== prevShowQ) return false;
+    if ((q.show_if?.option_id ?? null) !== prevShowO) return false;
     const prevOptions = existingOptions.filter((o) => o.question_id === q.id);
     if (q.kind === "text") {
       if (q.options.length > 0 || prevOptions.length > 0) return false;
@@ -231,6 +292,14 @@ export function sameStructure(
     }
   }
   return seen.size === existingQuestions.length;
+}
+
+/** A question is hidden when its show_if trigger answer does not include the required option. */
+function isHidden(question: QuestionRow, resolved: Map<string, AnswerInput>): boolean {
+  if (!question.show_if_question_id || !question.show_if_option_id) return false;
+  const trigger = resolved.get(question.show_if_question_id);
+  if (!trigger) return true;
+  return !trigger.option_ids.includes(question.show_if_option_id);
 }
 
 export function resolveAnswers(
@@ -256,17 +325,27 @@ export function resolveAnswers(
   const raw = body["answers"];
   if (!Array.isArray(raw)) throw badRequest('"answers" must be an array');
   if (raw.length > MAX_QUESTIONS) throw badRequest('"answers" is too long');
-  const answers: AnswerInput[] = [];
-  const seen = new Set<string>();
+  const rawByQuestion = new Map<string, Record<string, unknown>>();
   for (const item of raw) {
     if (typeof item !== "object" || item === null) throw badRequest("Each answer must be an object");
     const row = item as Record<string, unknown>;
     const questionId = readOptionalId(row, "question_id");
     if (!questionId) throw badRequest('"question_id" is required');
-    if (seen.has(questionId)) throw badRequest("Duplicate answer for a question");
-    seen.add(questionId);
-    const question = questions.find((q) => q.id === questionId);
-    if (!question) throw badRequest("Unknown question id");
+    if (rawByQuestion.has(questionId)) throw badRequest("Duplicate answer for a question");
+    if (!questions.some((q) => q.id === questionId)) throw badRequest("Unknown question id");
+    rawByQuestion.set(questionId, row);
+  }
+  const resolved = new Map<string, AnswerInput>();
+  for (const question of questions) {
+    if (isHidden(question, resolved)) continue;
+    const row = rawByQuestion.get(question.id);
+    if (!row) {
+      if (question.required === 1) {
+        throw badRequest(`Missing answer for question ${question.id}`);
+      }
+      continue;
+    }
+    const qOptions = byQuestion.get(question.id) ?? [];
     if (question.kind === "text") {
       const text = row["text"];
       if (typeof text !== "string") throw badRequest('"text" must be a string');
@@ -275,17 +354,39 @@ export function resolveAnswers(
       assertPlainText(trimmed, { newlines: true });
       if (question.required === 1 && trimmed.length < 1) throw badRequest("A required text question is empty");
       if (trimmed.length === 0) continue;
-      answers.push({ question_id: questionId, option_ids: [], text: trimmed });
+      resolved.set(question.id, { question_id: question.id, option_ids: [], text: trimmed, scores: null });
+    } else if (question.kind === "score") {
+      resolved.set(question.id, validateScores(question, row["scores"], qOptions));
+    } else if (question.kind === "ranking") {
+      const optionIds = readOptionIds(row["option_ids"]);
+      const valid = new Set(qOptions.map((o) => o.id));
+      for (const id of optionIds) {
+        if (!valid.has(id)) throw badRequest("Unknown option id");
+      }
+      resolved.set(question.id, { question_id: question.id, option_ids: optionIds, text: null, scores: null });
     } else {
-      answers.push(validateChoice(question, readOptionIds(row["option_ids"]), byQuestion.get(questionId) ?? []));
+      resolved.set(question.id, validateChoice(question, readOptionIds(row["option_ids"]), qOptions));
     }
   }
-  for (const question of questions) {
-    if (question.required === 1 && !answers.some((a) => a.question_id === question.id)) {
-      throw badRequest(`Missing answer for question ${question.id}`);
-    }
+  return questions.filter((q) => resolved.has(q.id)).map((q) => resolved.get(q.id) as AnswerInput);
+}
+
+function validateScores(question: QuestionRow, raw: unknown, options: OptionRow[]): AnswerInput {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw badRequest('"scores" must be an object mapping option ids to scores');
   }
-  return answers;
+  const valid = new Set(options.map((o) => o.id));
+  const scores: Record<string, number> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const id = normalizeUuid(key);
+    if (!id || !valid.has(id)) throw badRequest("Unknown option id in scores");
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 5) {
+      throw badRequest('"scores" values must be integers between 0 and 5');
+    }
+    scores[id] = value;
+  }
+  if (Object.keys(scores).length === 0) throw badRequest('"scores" must not be empty');
+  return { question_id: question.id, option_ids: [], text: null, scores };
 }
 
 function readOptionIds(raw: unknown): string[] {
@@ -313,16 +414,18 @@ function validateChoice(question: QuestionRow, optionIds: string[], options: Opt
   if (question.kind === "multiple" && optionIds.length < 1) {
     throw badRequest("Select at least one option");
   }
-  return { question_id: question.id, option_ids: optionIds, text: null };
+  return { question_id: question.id, option_ids: optionIds, text: null, scores: null };
 }
 
 export function ballotDocument(answers: AnswerInput[]): string {
   return JSON.stringify({
     v: 2,
     answers: answers.map((a) =>
-      a.text !== null
-        ? { question_id: a.question_id, text: a.text }
-        : { question_id: a.question_id, option_ids: a.option_ids },
+      a.scores !== null
+        ? { question_id: a.question_id, scores: a.scores }
+        : a.text !== null
+          ? { question_id: a.question_id, text: a.text }
+          : { question_id: a.question_id, option_ids: a.option_ids },
     ),
   });
 }
@@ -339,6 +442,7 @@ export function parseBallotDocument(raw: string, defaultQuestionId: string): Ans
       question_id: defaultQuestionId,
       option_ids: parsed.filter((id): id is string => typeof id === "string"),
       text: null,
+      scores: null,
     }];
   }
   if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as { answers?: unknown }).answers)) {
@@ -353,7 +457,16 @@ export function parseBallotDocument(raw: string, defaultQuestionId: string): Ans
     const optionIds = Array.isArray(row["option_ids"])
       ? row["option_ids"].filter((id): id is string => typeof id === "string")
       : [];
-    answers.push({ question_id: row["question_id"], option_ids: optionIds, text });
+    let scores: Record<string, number> | null = null;
+    const rawScores = row["scores"];
+    if (typeof rawScores === "object" && rawScores !== null && !Array.isArray(rawScores)) {
+      scores = {};
+      for (const [key, value] of Object.entries(rawScores as Record<string, unknown>)) {
+        if (typeof value === "number" && Number.isFinite(value)) scores[key] = value;
+      }
+      if (Object.keys(scores).length === 0) scores = null;
+    }
+    answers.push({ question_id: row["question_id"], option_ids: optionIds, text, scores });
   }
   return answers;
 }

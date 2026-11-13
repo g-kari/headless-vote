@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS polls (
   require_login INTEGER NOT NULL DEFAULT 0,
   opens_at TEXT,
   closes_at TEXT,
+  results_visibility TEXT NOT NULL DEFAULT 'public',
+  ip_single_vote INTEGER NOT NULL DEFAULT 0,
+  confirm_required INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   revision TEXT NOT NULL DEFAULT ''
@@ -46,9 +49,11 @@ CREATE TABLE IF NOT EXISTS questions (
   prompt TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   image_key TEXT,
-  kind TEXT NOT NULL CHECK (kind IN ('single', 'multiple', 'text')),
+  kind TEXT NOT NULL CHECK (kind IN ('single', 'multiple', 'text', 'ranking', 'score')),
   required INTEGER NOT NULL DEFAULT 1,
   position INTEGER NOT NULL DEFAULT 0,
+  show_if_question_id TEXT,
+  show_if_option_id TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_questions_poll ON questions(poll_id);
