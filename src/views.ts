@@ -32,7 +32,7 @@ export function scriptTag(nonce: string, code: string): string {
   return `<script nonce="${escapeHtml(nonce)}">${code}</script>`;
 }
 
-export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="img" aria-label="Hyo logo"><rect width="64" height="64" rx="14" fill="#1e4fd8"/><path d="M19.2 30.1 L27.8 39.4 L45.4 20.2" fill="none" stroke="#ffffff" stroke-width="6.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="17.9" y="44.8" width="28.2" height="4.8" rx="2.4" fill="#ffffff" opacity="0.92"/></svg>`;
+export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="img" aria-label="Hyo logo"><rect width="64" height="64" rx="14" fill="#1e4fd8"/><g transform="translate(32 30.2) rotate(-14)"><g transform="translate(-18.75 -22.5)"><rect x="0.75" y="0.75" width="36" height="43.5" rx="3.5" fill="#ffffff"/><path d="M9.75 21 L17.25 29 L28.5 14.75" fill="none" stroke="#1e4fd8" stroke-width="3.75" stroke-linecap="round" stroke-linejoin="round"/><rect x="6.5" y="32.75" width="24.5" height="2.5" rx="1.25" fill="#b2c2eb"/><rect x="6.5" y="37.5" width="17.25" height="2.5" rx="1.25" fill="#b2c2eb"/></g></g><rect x="11.52" y="52.48" width="40.96" height="3.52" rx="1.76" fill="#ffffff"/></svg>`;
 
 const CSS = `
 :root{
