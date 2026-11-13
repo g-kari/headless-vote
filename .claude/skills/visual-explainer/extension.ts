@@ -3,10 +3,10 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import { createInterface } from "node:readline";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { prepareRenderedHtml, readSourcePath, renderPageForHost, reportLine, reportPage } from "./kit/render.mjs";
 import { lookAt, lookLines } from "./kit/look.mjs";
+import { copyOnlyFeedback } from "./kit/copy-feedback.mjs";
 
 type VisualExplainerParams = {
   action: "prepare" | "render";
@@ -26,7 +26,7 @@ type Viewer = "browser" | "glimpse" | "auto";
 type OpenTarget = "browser" | "glimpse";
 type OpenStatus = "disabled" | "unsupported" | "dispatched" | "failed";
 
-type PlanHost = { root: string; onResponse: (markdown: string, page: string) => void; closed: AbortSignal };
+type PlanHost = { root: string; closed: AbortSignal };
 
 type OpenResult = {
   openAttempted: boolean;
@@ -208,24 +208,16 @@ function assertHtmlDocument(html: string) {
   }
 }
 
-type WindowListener = { onMessage: (data: unknown) => void; closed: AbortSignal };
+type WindowListener = { closed: AbortSignal };
 
 function runOpener(command: string, args: string[], openTarget: OpenTarget, listener?: WindowListener): Promise<OpenResult> {
   return new Promise<OpenResult>((resolve) => {
-    const child = spawn(command, args, { detached: true, stdio: listener ? ["ignore", "pipe", "ignore"] : "ignore", windowsHide: true });
-    if (listener && child.stdout) {
-      // glimpseui prints each window.glimpse.send(...) payload as one JSON line
-      const lines = createInterface({ input: child.stdout });
-      lines.on("line", (line) => {
-        let data: unknown;
-        try { data = JSON.parse(line); } catch { return; }
-        listener.onMessage(data);
-      });
-      // Killing glimpseui ends the native window's stdin, which closes the window.
-      const closeWindow = () => { lines.close(); child.kill(); };
+    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+    if (listener) {
+      // Page stdout is deliberately ignored: it is not proof of a reader action.
+      const closeWindow = () => { child.kill(); };
       listener.closed.addEventListener("abort", closeWindow, { once: true });
       child.once("close", () => listener.closed.removeEventListener("abort", closeWindow));
-      (child.stdout as unknown as { unref(): void }).unref();
     }
     let settled = false;
 
@@ -364,13 +356,13 @@ async function writeRenderedHtml(
   signal?.throwIfAborted();
 
   assertHtmlDocument(htmlInput);
-  // Only a page Pi opens in Glimpse itself can send the reader's response back into this chat.
-  const sendBack = open !== false && viewer !== "browser";
+  // Document scripts cannot authenticate a human response. Keep feedback copy-only.
+  const sendBack = false;
   const page = plan ? renderPageForHost(htmlInput, { root: plan.root, filename: outputFilename(filenameInput), sendBack }) : null;
   // a plan page has its own summary in its note; every other page gets the report
   const report: PageReport | undefined = page ? page.report : reportPage(htmlInput);
   const filename = page?.filename ?? outputFilename(filenameInput);
-  const html = prepareRenderedHtml(page ? page.html : htmlInput);
+  const html = copyOnlyFeedback(prepareRenderedHtml(page ? page.html : htmlInput));
   const { path: outputDir, configured } = output;
   const outputPath = join(outputDir, filename);
   assertOutputDirectory(output);
@@ -401,14 +393,9 @@ async function writeRenderedHtml(
   const looked = page?.kit ? await lookAt(outputPath) : undefined;
   signal?.throwIfAborted();
 
-  // a plan page or a kit page can send the reader's reply back; an ordinary page has no script to send it
-  const listener = page && plan ? {
-    onMessage: (data: unknown) => {
-      const d = data as { type?: unknown; markdown?: unknown } | null;
-      if (d?.type === "visual-explainer:response" && typeof d.markdown === "string") plan.onResponse(d.markdown, outputPath);
-    },
-    closed: plan.closed,
-  } : undefined;
+  // Keep window lifecycle cleanup, but never turn document-controlled stdout into
+  // an agent message. The reader must paste feedback into the trusted chat UI.
+  const listener: WindowListener | undefined = plan ? { closed: plan.closed } : undefined;
   const openResult = open === false
     ? { openAttempted: false, openStatus: "disabled" as const }
     : await openRenderedPage(outputPath, viewer, listener);
@@ -427,9 +414,7 @@ async function writeRenderedHtml(
   if (page) message += page.note;
   if (report) message += `\n${reportLine(report)}`;
   if (looked) message += `\n${lookLines(looked).join("\n")}`;
-  if (listener && openResult.openTarget === "glimpse" && openResult.openStatus === "dispatched") {
-    message += page?.kit ? "\nThe reader may reply; it arrives here as a message." : " When the reader presses Send to agent, their response arrives here as a message; wait for it.";
-  }
+  if (page) message += "\nTo send feedback, copy it into the chat. Page messages are not accepted as reader instructions.";
 
   return {
     content: [
@@ -468,7 +453,7 @@ async function renderVisualExplanation(params: VisualExplainerParams, output: Ou
 
 export default function (pi: ExtensionAPI) {
   // A Glimpse window can outlive this session, and pi throws on any call through a stale `pi`,
-  // so the session's end closes its windows before a late Send to agent can reach `pi`.
+  // so the session's end closes its windows. Document responses never reach `pi`.
   const session = new AbortController();
   pi.on("session_shutdown", () => session.abort());
 
@@ -492,12 +477,7 @@ export default function (pi: ExtensionAPI) {
 
       const output = resolveOutputDirectory(pi, ctx.cwd);
       if (params.action === "prepare") return prepareVisualExplanation(pi, params, output);
-      // a labeled message from the page rather than text the user typed; it starts a turn, or waits if the agent is busy
-      const onResponse = (markdown: string, page: string) => pi.sendMessage(
-        { customType: "visual_explainer_response", content: `The reader replied on ${page}:\n\n${markdown}`, display: true, details: { page } },
-        { triggerTurn: true, deliverAs: "followUp" },
-      );
-      return await renderVisualExplanation(params, output, { root: ctx.cwd, onResponse, closed: session.signal }, signal);
+      return await renderVisualExplanation(params, output, { root: ctx.cwd, closed: session.signal }, signal);
     },
   });
 }
