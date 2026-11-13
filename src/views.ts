@@ -37,7 +37,7 @@ export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="i
 const CSS = `
 :root{
   --bg:light-dark(#ffffff,#0c1015); --surface-2:light-dark(#eceff3,#1a212b);
-  --text:light-dark(#12161c,#eef2f7); --muted:light-dark(#454f5c,#a7b2c0);
+  --text:light-dark(#12161c,#eef2f7); --muted:light-dark(#39424e,#a7b2c0);
   --border:light-dark(#77808e,#5b6a7d); --accent:light-dark(#1e4fd8,#5b8cff);
   --accent-strong:light-dark(#173ea8,#8fb0ff); --on-accent:light-dark(#ffffff,#0a1120);
   --ok:light-dark(#0c6b34,#3ecf8a); --warn:light-dark(#8a5a00,#f0a24a); --danger:light-dark(#b91c1c,#ff7a85);
@@ -83,6 +83,7 @@ input[type=text],input[type=email],input[type=password],input[type=url],input[ty
 input[type=date],input[type=time],input[type=datetime-local],textarea,select{width:100%;padding:.6rem .7rem;border:1.5px solid var(--border);
   background:var(--bg);color:var(--text);font:inherit}
 input[aria-invalid="true"],select[aria-invalid="true"],textarea[aria-invalid="true"]{border-color:var(--danger);outline:2px solid var(--danger);outline-offset:1px}
+::placeholder{color:var(--muted);opacity:1}
 .has-error{outline:2px solid var(--danger);outline-offset:3px}
 textarea{min-height:5.5rem;resize:vertical}
 input[type=checkbox],input[type=radio]{width:1.15rem;height:1.15rem;accent-color:var(--accent);flex:none}
