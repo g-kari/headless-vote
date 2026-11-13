@@ -49,12 +49,16 @@ export function flowCookieName(requestUrl: string): string {
 
 export function parseCookies(c: Ctx): Record<string, string> {
   const header = c.req.header("cookie");
-  const out: Record<string, string> = {};
+  const out: Record<string, string> = Object.create(null);
+  const seen = new Set<string>();
   if (!header) return out;
   for (const part of header.split(";")) {
     const eq = part.indexOf("=");
     if (eq > 0) {
-      out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+      const name = part.slice(0, eq).trim();
+      if (seen.has(name)) { delete out[name]; continue; }
+      seen.add(name);
+      try { out[name] = decodeURIComponent(part.slice(eq + 1).trim()); } catch { /* Ignore malformed cookies. */ }
     }
   }
   return out;

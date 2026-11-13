@@ -232,6 +232,11 @@ export async function revokeApiKey(
   });
 }
 
+/** Call only after proving ownership or authenticating a write key. */
+export async function limitKeyRotation(env: Env, tenantId: string): Promise<void> {
+  await rateLimit(env, await sha256Hex(`rl:rotate-key:${tenantId}`), 30, 3600);
+}
+
 /** Revoke the presented key and issue a replacement write key. */
 export async function rotatePresentedKey(
   env: Env,

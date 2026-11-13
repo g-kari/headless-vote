@@ -1,7 +1,7 @@
 /** One stored ballot per voter. The raw token or sub is HMAC'd at rest. */
 
-import { hmacSha256Base64Url, randomId } from "./crypto";
-import { conflict } from "./errors";
+import { hmacSha256Base64Url, randomId, sha256Hex } from "./crypto";
+import { badRequest, conflict } from "./errors";
 import { recordVoteEvent } from "./quotas";
 import type { Env, PollRow } from "./types";
 
@@ -85,9 +85,20 @@ export async function ballotCount(env: Env, pollId: string): Promise<number> {
 /** Replace this voter's selection in one statement (no delete/insert race). */
 export async function upsertBallot(
   env: Env, poll: PollRow, rawVoterKey: string, document: string, authenticated: boolean,
+  identity: { ip?: string; anonymousToken?: string } = {},
 ): Promise<void> {
   await ensureVoterKeysHashed(env);
   const stored = await hashVoterKey(env, rawVoterKey);
+  const mergeOwner = authenticated && identity.anonymousToken
+    ? await hashVoterKey(env, `anon:${identity.anonymousToken}`) : null;
+  const ip = identity.ip?.trim();
+  if (poll.ip_single_vote === 1 && !ip) {
+    throw badRequest("A trusted client IP is required for this poll");
+  }
+  // The IP is a uniqueness constraint, never an authorization credential.
+  const ipKey = ip ? await hashVoterKey(env, `poll-ip:${poll.id}:${ip}`) : null;
+  const legacyIpKey = ip ? await hashVoterKey(env, `ip:${await sha256Hex(ip)}`) : null;
+  const legacyUnknownKey = await hashVoterKey(env, `ip:${await sha256Hex("unknown")}`);
   const eventId = randomId();
   const now = new Date().toISOString();
   const start = `${now.slice(0, 10)}T00:00:00.000Z`;
@@ -98,14 +109,35 @@ export async function upsertBallot(
       AND (p.opens_at IS NULL OR p.opens_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       AND (p.closes_at IS NULL OR p.closes_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       AND (p.require_login = 0 OR ?5 = 1)
+      AND p.ip_single_vote = ?7
+      AND (p.ip_single_vote = 0 OR (
+        NOT EXISTS (SELECT 1 FROM vote_ballots WHERE poll_id = p.id AND voter_key IN (?8, ?9))
+        AND NOT EXISTS (SELECT 1 FROM poll_ip_ballot_owners
+          WHERE poll_id = p.id AND ip_key = ?10 AND owner_key != ?11
+          AND (?12 IS NULL OR owner_key != ?12))
+      ))
       AND (SELECT COUNT(*) FROM vote_events e JOIN polls ep ON ep.id = e.poll_id
         WHERE ep.tenant_id = p.tenant_id AND e.created_at >= ?6) < t.quota_votes_per_day`)
-      .bind(eventId, now, poll.id, poll.revision, authenticated ? 1 : 0, start),
+      .bind(eventId, now, poll.id, poll.revision, authenticated ? 1 : 0, start,
+        poll.ip_single_vote, legacyIpKey, legacyUnknownKey, ipKey, stored, mergeOwner),
+    // D1 batch is transactional: a contender observes the winning owner before
+    // it can reserve an event. All mutations below require that reservation.
+    env.DB.prepare(`UPDATE poll_ip_ballot_owners SET owner_key = ?1
+      WHERE poll_id = ?2 AND owner_key = ?3
+      AND EXISTS (SELECT 1 FROM vote_events WHERE id = ?4)`)
+      .bind(stored, poll.id, mergeOwner, eventId),
+    env.DB.prepare(`INSERT INTO poll_ip_ballot_owners (poll_id, ip_key, owner_key)
+      SELECT ?1, ?2, ?3 WHERE ?4 = 1 AND EXISTS (SELECT 1 FROM vote_events WHERE id = ?5)
+      ON CONFLICT(poll_id, ip_key) DO UPDATE SET owner_key = excluded.owner_key`)
+      .bind(poll.id, ipKey, stored, poll.ip_single_vote, eventId),
     env.DB.prepare(`INSERT INTO vote_ballots (poll_id, voter_key, option_ids, updated_at)
       SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM vote_events WHERE id = ?5)
       ON CONFLICT(poll_id, voter_key) DO UPDATE SET
         option_ids = excluded.option_ids, updated_at = excluded.updated_at`)
       .bind(poll.id, stored, document, now, eventId),
+    env.DB.prepare(`DELETE FROM vote_ballots WHERE poll_id = ?1 AND voter_key = ?2
+      AND EXISTS (SELECT 1 FROM vote_events WHERE id = ?3)`)
+      .bind(poll.id, mergeOwner, eventId),
   ]);
   if (Number(reservation?.meta.changes ?? 0) !== 1) {
     throw conflict("VOTE_STATE_CHANGED", "Voting state or quota changed. Reload and try again.");

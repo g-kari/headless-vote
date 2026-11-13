@@ -19,8 +19,15 @@ export async function drainObjectCleanup(env: Env, maxPages = 20): Promise<void>
         // removed the page or a parallel cleanup ran. Keys are never reused.
         const next = await store.deletePrefix(`t/${row.tenant_id}/`);
         if (next === null) {
-          await env.DB.prepare("DELETE FROM object_cleanup WHERE tenant_id = ?1 AND generation = ?2")
-            .bind(row.tenant_id, row.generation).run();
+          await env.DB.batch([
+            env.DB.prepare(`DELETE FROM object_cleanup WHERE tenant_id = ?1 AND generation = ?2
+              AND NOT EXISTS (SELECT 1 FROM image_upload_intents WHERE tenant_id = ?1)`)
+              .bind(row.tenant_id, row.generation),
+            // An in-flight/uncertain put may create an object after this empty
+            // sweep. Retain its job and rotate it so other tenants get a turn.
+            env.DB.prepare("UPDATE object_cleanup SET created_at = ?3 WHERE tenant_id = ?1 AND generation = ?2")
+              .bind(row.tenant_id, row.generation, new Date().toISOString()),
+          ]);
           break;
         }
       }

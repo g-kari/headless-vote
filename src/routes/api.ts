@@ -3,12 +3,13 @@ import { deleteAccountData, deleteWorkspace, listMemberships } from "../account"
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
 import { bearerToken, getSessionUser, optionalVoterSub, requireAdmin } from "../auth";
-import { ballotCount, deleteBallot, hashVoterKey, upsertBallot } from "../ballots";
+import { ballotCount, hashVoterKey, upsertBallot } from "../ballots";
 import { addTenantOrigin, listTenantOrigins, isAllowedTenantOrigin, removeTenantOrigin } from "../cors";
-import { randomId, sha256Hex } from "../crypto";
+import { randomId } from "../crypto";
 import { resultsToCsv } from "../export";
 import {
   assertSchedule,
+  canViewPublicResults,
   computeResults,
   getPollRow,
   isClosedForVoting,
@@ -22,8 +23,9 @@ import {
   pollToJson,
   reqString,
 } from "../domain";
+import { putImageWithQuota } from "../image-quota";
 import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from "../errors";
-import { findActiveApiKey, issueApiKey, listApiKeys, provisionTenant, publicKey, revokeApiKey, rotatePresentedKey } from "../keys";
+import { findActiveApiKey, issueApiKey, limitKeyRotation, listApiKeys, provisionTenant, publicKey, revokeApiKey, rotatePresentedKey } from "../keys";
 import { addMember, listMembers, removeMember, setMemberRole } from "../members";
 import { assertDailyVoteQuota, tenantQuotas } from "../quotas";
 import {
@@ -98,6 +100,7 @@ api.post("/tenants/:tenantId/rotate-key", async (c) => {
     throw unauthorized("INVALID_API_KEY", "API key is not valid for this tenant");
   }
   if (found.key.scope !== "write") throw forbidden("This API key is read-only");
+  await limitKeyRotation(c.env, tenantId);
   const apiKey = await rotatePresentedKey(c.env, tenantId, found);
   return c.json({ api_key: apiKey });
 });
@@ -701,47 +704,6 @@ api.get("/tenants/:tenantId/polls/:pollId/results", async (c) => {
 /* Admin: image upload (R2)                                            */
 /* ------------------------------------------------------------------ */
 
-/** Per-tenant image quota: count and total bytes across all uploads (PR #4 parity). */
-const MAX_IMAGES_PER_TENANT = 500;
-const MAX_IMAGE_BYTES_PER_TENANT = 500 * 1024 * 1024;
-
-interface ImageUsage {
-  image_count: number;
-  total_bytes: number;
-}
-
-/**
- * Read the tenant's image usage. The row is initialized from the actual
- * R2 prefix on first use, so images uploaded before quotas existed are
- * counted too.
- */
-async function getImageUsage(env: Env, tenantId: string): Promise<ImageUsage> {
-  const row = await env.DB.prepare(
-    "SELECT image_count, total_bytes FROM tenant_image_usage WHERE tenant_id = ?1",
-  )
-    .bind(tenantId)
-    .first<ImageUsage>();
-  if (row) return { image_count: Number(row.image_count), total_bytes: Number(row.total_bytes) };
-  let count = 0;
-  let bytes = 0;
-  let cursor: string | undefined;
-  do {
-    const page = await env.IMAGES.list({ prefix: `t/${tenantId}/`, cursor, limit: 1000 });
-    for (const obj of page.objects) {
-      count += 1;
-      bytes += obj.size;
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at)
-     VALUES (?1, ?2, ?3, ?4)`,
-  )
-    .bind(tenantId, count, bytes, nowIso())
-    .run();
-  return { image_count: count, total_bytes: bytes };
-}
-
 api.post("/tenants/:tenantId/images", async (c) => {
   const tenantId = c.req.param("tenantId");
   await requireAdmin(c, tenantId);
@@ -754,39 +716,14 @@ api.post("/tenants/:tenantId/images", async (c) => {
   if (bytes.byteLength === 0) throw badRequest("Image body is empty");
   const sniffed = sniffImage(bytes, contentType);
   if (!sniffed) throw badRequest("File contents do not match the declared image type");
-  const usage = await getImageUsage(c.env, tenantId);
-  if (usage.image_count >= MAX_IMAGES_PER_TENANT) {
-    throw new ApiError(
-      429,
-      "IMAGE_QUOTA_EXCEEDED",
-      `Image count quota reached for this workspace (${MAX_IMAGES_PER_TENANT} images)`,
-    );
-  }
-  if (usage.total_bytes + bytes.byteLength > MAX_IMAGE_BYTES_PER_TENANT) {
-    throw new ApiError(
-      429,
-      "IMAGE_QUOTA_EXCEEDED",
-      "Image storage quota reached for this workspace (500 MiB total)",
-    );
-  }
   const key = `t/${tenantId}/${randomId()}.${sniffed.ext}`;
-  await createObjectStore(c.env).put(key, bytes, sniffed.contentType);
+  await putImageWithQuota(c.env, tenantId, key, bytes, sniffed.contentType);
   const stillExists = await c.env.DB.prepare("SELECT id FROM tenants WHERE id = ?1").bind(tenantId).first();
   if (!stillExists) {
     await c.env.DB.prepare("INSERT INTO object_cleanup (tenant_id, created_at, generation) VALUES (?1, ?2, lower(hex(randomblob(16)))) ON CONFLICT(tenant_id) DO UPDATE SET generation = excluded.generation")
       .bind(tenantId, nowIso()).run();
     throw notFound("Workspace not found");
   }
-  await c.env.DB.prepare(
-    `INSERT INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at)
-     VALUES (?1, 1, ?2, ?3)
-     ON CONFLICT (tenant_id) DO UPDATE SET
-       image_count = image_count + 1,
-       total_bytes = total_bytes + excluded.total_bytes,
-       updated_at = excluded.updated_at`,
-  )
-    .bind(tenantId, bytes.byteLength, nowIso())
-    .run();
   return c.json({ key, url: `${originOf(c)}/images/${key}` }, 201);
 });
 
@@ -806,19 +743,10 @@ api.get("/polls/:pollId", async (c) => {
 });
 
 api.get("/polls/:pollId/results", async (c) => {
-  const visibilityPoll = await getPollRow(c.env, c.req.param("pollId"));
-  if (visibilityPoll) {
-    if (visibilityPoll.results_visibility === "admin_only") {
-      throw forbidden("Results for this poll are not public");
-    }
-    if (
-      visibilityPoll.results_visibility === "after_close" &&
-      !isClosedForVoting(visibilityPoll)
-    ) {
-      throw forbidden("Results are published after this poll closes");
-    }
-  }
   const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
+  if (!canViewPublicResults(poll)) {
+    throw forbidden("Results for this poll are not public");
+  }
   return c.json({ results: await computeResults(c.env, originOf(c), poll) });
 });
 
@@ -832,9 +760,6 @@ api.get("/polls/:pollId/ballot", async (c) => {
   let rawKey: string | null = null;
   if (sub) {
     rawKey = `user:${sub}`;
-  } else if (poll.ip_single_vote === 1) {
-    const ip = c.req.header("cf-connecting-ip") ?? "";
-    rawKey = `ip:${await sha256Hex(ip || "unknown")}`;
   } else {
     const token = new URL(c.req.url).searchParams.get("voter_token")?.trim() ?? "";
     if (token.length >= 8 && token.length <= 128) rawKey = `anon:${token}`;
@@ -881,9 +806,7 @@ api.get("/polls/:pollId/og.svg", async (c) => {
     .bind(poll.tenant_id)
     .first<{ brand_color: string | null }>();
   const color = tenant?.brand_color ?? "#1e4fd8";
-  const visible =
-    poll.results_visibility === "public" ||
-    (poll.results_visibility === "after_close" && isClosedForVoting(poll));
+  const visible = canViewPublicResults(poll);
   let detail = "";
   if (visible) {
     const results = await computeResults(c.env, originOf(c), poll);
@@ -963,12 +886,7 @@ api.post("/polls/:pollId/vote", async (c) => {
     }
     assertPlainText(trimmedToken);
     voterKey = `anon:${trimmedToken}`;
-    if (poll.ip_single_vote === 1) {
-      // One ballot per connection: the key is derived from the client IP
-      // only, so changing the browser token does not mint another ballot.
-      const ip = c.req.header("cf-connecting-ip") ?? "";
-      voterKey = `ip:${await sha256Hex(ip || "unknown")}`;
-    }
+
   }
   if (poll.confirm_required === 1 && body["confirm"] !== true) {
     throw conflict(
@@ -981,19 +899,12 @@ api.post("/polls/:pollId/vote", async (c) => {
   const questions = await listQuestionRows(c.env, poll.id);
   const options = await listOptionRows(c.env, poll.id);
   const answers = resolveAnswers(body, questions, options);
-  await upsertBallot(c.env, poll, voterKey, ballotDocument(answers), sub !== null);
-  if (sub) {
-    // A logged-in vote that also presents the anonymous voter token folds
-    // that token's earlier anonymous ballot into this login ballot, so the
-    // same person is not counted twice (PR #4 L7 parity).
-    const presented = body["voter_token"];
-    if (typeof presented === "string") {
-      const token = presented.trim();
-      if (token.length >= 8 && token.length <= 128) {
-        await deleteBallot(c.env, poll.id, `anon:${token}`);
-      }
-    }
-  }
+  const presented = body["voter_token"];
+  const mergeToken = typeof presented === "string" ? presented.trim() : "";
+  await upsertBallot(c.env, poll, voterKey, ballotDocument(answers), sub !== null, {
+    ip: c.req.header("cf-connecting-ip"),
+    anonymousToken: sub && mergeToken.length >= 8 && mergeToken.length <= 128 ? mergeToken : undefined,
+  });
   await dispatchWebhooks(c.env, poll.tenant_id, "vote.cast", {
     poll_id: poll.id,
     voter: sub ? "user" : "anonymous",
@@ -1004,7 +915,10 @@ api.post("/polls/:pollId/vote", async (c) => {
     })),
   });
 
-  const results = await computeResults(c.env, originOf(c), poll);
+  // Voting does not grant permission to view restricted aggregate results.
+  const results = canViewPublicResults(poll)
+    ? await computeResults(c.env, originOf(c), poll)
+    : null;
   return c.json({
     vote: {
       poll_id: poll.id,

@@ -12,7 +12,8 @@ export function createR2ObjectStore(env: Env): ObjectStore {
     },
     async put(key, body, contentType) {
       const bytes = body instanceof Uint8Array ? body : new Uint8Array(body);
-      await env.IMAGES.put(key, bytes, { httpMetadata: { contentType } });
+      const object = await env.IMAGES.put(key, bytes, { httpMetadata: { contentType } });
+      if (!object) throw new Error("Image storage did not confirm the upload");
     },
     async get(key): Promise<StoredObject | null> {
       const obj = await env.IMAGES.get(key);

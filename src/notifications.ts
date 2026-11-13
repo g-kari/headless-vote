@@ -23,8 +23,14 @@ export async function notifyClosingSoon(env: Env): Promise<number> {
     .all<{ id: string; tenant_id: string; question: string; closes_at: string }>();
   let sent = 0;
   for (const poll of res.results) {
-    await env.DB.prepare(
-      "INSERT INTO app_notifications (id, tenant_id, poll_id, kind, message, created_at) VALUES (?1, ?2, ?3, 'closing_soon', ?4, ?5)",
+    // Recheck and claim in a single write: concurrent cron runs can have
+    // selected the same poll before either one inserted its notification.
+    const claimed = await env.DB.prepare(
+      `INSERT INTO app_notifications (id, tenant_id, poll_id, kind, message, created_at)
+       SELECT ?1, ?2, ?3, 'closing_soon', ?4, ?5
+       WHERE NOT EXISTS (
+         SELECT 1 FROM app_notifications WHERE poll_id = ?3 AND kind = 'closing_soon'
+       )`,
     )
       .bind(
         randomId(),
@@ -34,6 +40,7 @@ export async function notifyClosingSoon(env: Env): Promise<number> {
         now.toISOString(),
       )
       .run();
+    if (Number(claimed.meta.changes ?? 0) !== 1) continue;
     await dispatchWebhooks(env, poll.tenant_id, "poll.closing_soon", {
       poll_id: poll.id,
       closes_at: poll.closes_at,

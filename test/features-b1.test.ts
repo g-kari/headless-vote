@@ -324,10 +324,13 @@ describe("results visibility and anti-fraud options", () => {
         answers: [{ question_id: q.id, option_ids: [q.options[1]?.id] }],
       }),
     });
-    expect(v2.status).toBe(200);
+    expect(v2.status).toBe(409);
     const res = await SELF.fetch(`${BASE}/api/v1/polls/${poll.id}/results`);
     const data = (await res.json()) as { results: { total_voters: number } };
     expect(data.results.total_voters).toBe(1);
+    const retained = await SELF.fetch(`${BASE}/api/v1/polls/${poll.id}/ballot?voter_token=ip-voter-one`, { headers });
+    const saved = (await retained.json()) as { ballot: { answers: { option_ids: string[] }[] } };
+    expect(saved.ballot.answers[0]?.option_ids).toEqual([q.options[0]?.id]);
   });
 
   it("rejects an unknown results_visibility value", async () => {

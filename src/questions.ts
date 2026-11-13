@@ -320,6 +320,9 @@ export function resolveAnswers(
     }
     const only = choice[0];
     if (!only) throw badRequest('"answers" is required');
+    if (only.kind !== "single" && only.kind !== "multiple") {
+      throw badRequest('"answers" is required for ranking and score questions');
+    }
     return [validateChoice(only, readOptionIds(body["option_ids"]), byQuestion.get(only.id) ?? [])];
   }
   const raw = body["answers"];

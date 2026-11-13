@@ -124,6 +124,8 @@ CREATE TABLE IF NOT EXISTS rate_limits (
   reset_at INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_rate_limits_expiry ON rate_limits(reset_at);
+
 CREATE TABLE IF NOT EXISTS app_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -227,6 +229,23 @@ CREATE TABLE IF NOT EXISTS email_outbox (
   body TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+-- IP addresses enforce uniqueness, never ballot ownership. Only HMACs are stored.
+-- Legacy IP-key ballots cannot be assigned to a token retroactively. Preserve
+-- them and fail closed for their IP. Never return their answers via IP lookup.
+CREATE TABLE IF NOT EXISTS poll_ip_ballot_owners (
+  poll_id TEXT NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+  ip_key TEXT NOT NULL,
+  owner_key TEXT NOT NULL,
+  PRIMARY KEY (poll_id, ip_key)
+);
+CREATE INDEX IF NOT EXISTS idx_poll_ip_ballot_owner ON poll_ip_ballot_owners(poll_id, owner_key);
+
+-- Survive tenant deletion: uncertain uploads must keep cleanup retryable.
+CREATE TABLE IF NOT EXISTS image_upload_intents (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_image_upload_intents_tenant ON image_upload_intents(tenant_id);
 `;
 
 /** Split a multi-statement SQL script into individual statements. */

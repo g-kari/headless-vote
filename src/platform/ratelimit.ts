@@ -8,7 +8,9 @@ export function createD1RateLimitStore(env: Env): RateLimitStore {
     async hit(bucket, limit, windowSec) {
       const now = Math.floor(Date.now() / 1000);
       const resetAt = now + windowSec;
-      await env.DB.prepare("DELETE FROM rate_limits WHERE reset_at < ?1").bind(now - 86_400).run();
+      await env.DB.prepare(`DELETE FROM rate_limits WHERE bucket IN (
+        SELECT bucket FROM rate_limits WHERE reset_at <= ?1 ORDER BY reset_at LIMIT 100
+      )`).bind(now).run();
       await env.DB.prepare(
         `INSERT INTO rate_limits (bucket, hits, reset_at) VALUES (?1, 1, ?2)
          ON CONFLICT(bucket) DO UPDATE SET
@@ -35,6 +37,9 @@ export class MemoryRateLimitStore implements RateLimitStore {
 
   async hit(bucket: string, limit: number, windowSec: number): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
+    for (const [key, value] of this.buckets) {
+      if (value.resetAt <= now) this.buckets.delete(key);
+    }
     const current = this.buckets.get(bucket);
     if (!current || current.resetAt <= now) {
       this.buckets.set(bucket, { hits: 1, resetAt: now + windowSec });
