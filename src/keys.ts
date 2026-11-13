@@ -63,6 +63,8 @@ export async function findActiveApiKey(
         name: row.tenant_name,
         api_key_hash: row.api_key_hash,
         created_at: row.tenant_created_at,
+        brand_color: null,
+        brand_logo_key: null,
       },
       key: {
         id: row.id,

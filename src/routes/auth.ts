@@ -8,7 +8,7 @@ import {
   type FlowState,
 } from "../auth";
 import { pkceChallenge, randomToken, sha256Hex, timingSafeEqual } from "../crypto";
-import { badRequest, notFound } from "../errors";
+import { ApiError, badRequest, notFound } from "../errors";
 import { exchangeCode, getDiscovery, verifyJwt } from "../oidc";
 import {
   loginLocalUser,
@@ -129,21 +129,38 @@ authRoutes.get("/auth/callback", async (c) => {
   if (Number(consumed.meta.changes ?? 0) !== 1) {
     throw badRequest("Login flow expired or state mismatch. Please try again.");
   }
-  const { idToken } = await exchangeCode(c.env, {
-    code,
-    codeVerifier: flow.verifier,
-    redirectUri: `${origin}/auth/callback`,
-  });
-  const verified = await verifyJwt(c.env, idToken, {
-    audience: c.env.OIDC_CLIENT_ID,
-    nonce: flow.nonce,
-  });
-  const sessionCookie = await newSessionCookieForToken(
-    c.env,
-    verified.claims,
-    verified.sub,
-    c.req.url,
-  );
+  // Past this point the flow is already consumed, so a failure in the code
+  // exchange or token verification (expired/replayed code, IdP hiccup) is a
+  // client-visible login failure, not a server fault: answer with a
+  // controlled 400 page that links back to the login form instead of the
+  // generic 500.
+  let sessionCookie: string;
+  try {
+    const { idToken } = await exchangeCode(c.env, {
+      code,
+      codeVerifier: flow.verifier,
+      redirectUri: `${origin}/auth/callback`,
+    });
+    const verified = await verifyJwt(c.env, idToken, {
+      audience: c.env.OIDC_CLIENT_ID,
+      nonce: flow.nonce,
+    });
+    sessionCookie = await newSessionCookieForToken(
+      c.env,
+      verified.claims,
+      verified.sub,
+      c.req.url,
+    );
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    const body = `
+      <h1>ログインに失敗しました</h1>
+      <p>サインインを完了できませんでした。認可コードの有効期限が切れているか、すでに使われている可能性があります。</p>
+      <p><a href="/admin/login">ログインをやり直す</a></p>`;
+    c.header("Set-Cookie", clearFlowCookie(c.req.url));
+    c.header("Cache-Control", "no-store");
+    return c.html(localPage(c, "ログインに失敗しました", body), 400);
+  }
   c.header("Set-Cookie", sessionCookie);
   c.header("Set-Cookie", clearFlowCookie(c.req.url), { append: true });
   c.header("Cache-Control", "no-store");

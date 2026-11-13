@@ -194,7 +194,12 @@ export function layout(opts: {
   body: string;
   origin: string;
   nonce: string;
+  brandColor?: string | null;
 }): string {
+  const brandStyle =
+    opts.brandColor && /^#[0-9a-fA-F]{6}$/.test(opts.brandColor)
+      ? `<style nonce="${escapeHtml(opts.nonce)}">:root{--accent:${opts.brandColor};--accent-strong:${opts.brandColor}}</style>`
+      : "";
   const userArea = opts.userEmail
     ? `<span class="user">${escapeHtml(opts.userEmail)}</span>
        <a class="btn small" href="/admin/account">アカウント</a>
@@ -219,6 +224,7 @@ export function layout(opts: {
 <meta property="og:image" content="${escapeHtml(opts.origin)}/ogp.png">
 <meta name="twitter:card" content="summary_large_image">
 <style nonce="${escapeHtml(opts.nonce)}">${CSS}</style>
+${brandStyle}
 </head>
 <body>
 <a class="skip" href="#main">本文へ移動</a>

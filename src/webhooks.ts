@@ -8,7 +8,7 @@ import { tenantQuotas } from "./quotas";
 import { assertPlainText } from "./security";
 import type { Env } from "./types";
 
-export const WEBHOOK_EVENTS = ["vote.cast", "poll.published", "poll.closed", "poll.updated"] as const;
+export const WEBHOOK_EVENTS = ["vote.cast", "poll.published", "poll.closed", "poll.updated", "poll.closing_soon"] as const;
 export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number];
 
 const encoder = new TextEncoder();
@@ -124,7 +124,7 @@ export async function createWebhook(
   const url = assertWebhookUrl(urlRaw);
   const unique = [...new Set(events)];
   if (unique.length === 0 || unique.some((e) => !WEBHOOK_EVENTS.includes(e))) {
-    throw badRequest("Webhook events must be vote.cast, poll.published, poll.closed, or poll.updated");
+    throw badRequest("Webhook events must be vote.cast, poll.published, poll.closed, poll.updated, or poll.closing_soon");
   }
   const quotas = await tenantQuotas(env, tenantId);
   const bytes = crypto.getRandomValues(new Uint8Array(32));
