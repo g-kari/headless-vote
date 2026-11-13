@@ -1,8 +1,11 @@
-/** Uniform API error shape: { error: { code, message } }. */
+/** Uniform API error shape: { error: { code, message, details? } }. */
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly retryAfter?: number;
+  /** Optional structured context (e.g. { question_id } or { field }) so
+   *  clients can attach the error to the offending input. */
+  details?: Record<string, unknown>;
 
   constructor(status: number, code: string, message: string, retryAfter?: number) {
     super(message);
@@ -12,8 +15,10 @@ export class ApiError extends Error {
   }
 }
 
-export function badRequest(message: string): ApiError {
-  return new ApiError(400, "BAD_REQUEST", message);
+export function badRequest(message: string, details?: Record<string, unknown>): ApiError {
+  const err = new ApiError(400, "BAD_REQUEST", message);
+  if (details) err.details = details;
+  return err;
 }
 
 export function unauthorized(code: string, message: string): ApiError {
