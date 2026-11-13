@@ -976,6 +976,7 @@ ui.post("/admin/account/delete", async (c) => {
 
 function pollFormScript(tenantId: string, pollId: string | null, nonce: string): string {
   const code = `
+(() => {
 const TENANT = ${safeJsonForScript(tenantId)};
 const POLL_ID = ${safeJsonForScript(pollId)};
 const questionsEl = document.getElementById('questions');
@@ -1033,7 +1034,7 @@ function refreshShowIf() {
     if (!qSel || !oSel) return;
     const prevQ = qSel.value || card.dataset.sq || '';
     const prevO = oSel.value || card.dataset.so || '';
-    qSel.innerHTML = '';
+    qSel.replaceChildren();
     const none = document.createElement('option');
     none.value = '';
     none.textContent = '条件なし（常に表示）';
@@ -1048,7 +1049,7 @@ function refreshShowIf() {
       qSel.append(opt);
     }
     qSel.value = [...qSel.options].some((o) => o.value === prevQ) ? prevQ : '';
-    oSel.innerHTML = '';
+    oSel.replaceChildren();
     const target = cards.find((cd) => cd.querySelector('.q-id').value === qSel.value);
     if (target) {
       for (const row of target.querySelectorAll('.option-row')) {
@@ -1244,6 +1245,17 @@ let pending = [];
 try { pending = JSON.parse(seedEl && seedEl.textContent ? seedEl.textContent : '[]'); } catch (e) { pending = []; }
 if (!Array.isArray(pending) || pending.length === 0) addQuestionCard(null);
 else for (const q of pending) addQuestionCard(q);
+for (const id of ['opens-at', 'closes-at']) {
+  const el = document.getElementById(id);
+  if (el && el.value) {
+    const d = new Date(el.value + 'Z');
+    if (!isNaN(d.getTime())) {
+      const pad = (n) => String(n).padStart(2, '0');
+      el.value = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+  }
+}
+})();
 `;
   return scriptTag(nonce, code);
 }
@@ -1276,7 +1288,7 @@ function pollFormBody(opts: {
       <textarea id="description" maxlength="5000">${p ? escapeHtml(p.description) : ""}</textarea>
       <div id="poll-image-row">
         <label for="poll-image-file">設問の画像 <span class="hint">任意。PNG / JPEG / WebP / GIF、5 MiB まで。</span></label>
-        ${p?.image_key ? `<p><img src="/images/${escapeHtml(p.image_key)}" alt="設問の画像" style="max-width:240px;border-radius:10px;border:1px solid var(--border)"></p>` : ""}
+        ${p?.image_key ? `<p><img src="/images/${escapeHtml(p.image_key)}" alt="設問の画像" style="max-width:240px;border:1px solid var(--border)"></p>` : ""}
         <input id="poll-image-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
         <input type="hidden" id="poll-image-key" value="${escapeHtml(p?.image_key ?? "")}">
       </div>
@@ -1439,6 +1451,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
 });`)}</pre>
       </div>
       ${scriptTag(nonce, `
+        (() => {
         function copyText(button, target) {
           const text = target && target.innerText ? target.innerText.trim() : "";
           if (!text) return;
@@ -1466,6 +1479,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
             if (target) copyText(button, target);
           });
         }
+        })();
       `)}`}
     </section>
     <div id="flash" class="notice bad" role="alert" hidden></div>
@@ -1478,6 +1492,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
       </div>
     </dialog>
     ${scriptTag(nonce, `
+      (() => {
       const TENANT = ${safeJsonForScript(tenantId)};
       const POLL = ${safeJsonForScript(poll.id)};
       let pendingStatus = null;
@@ -1510,6 +1525,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
         flash.textContent = (d.error && d.error.message) || "状態の変更に失敗しました";
         flash.hidden = false;
       });
+      })();
     `)}
     ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, questions: questionSeed, nonce }) : `<h2>内容</h2><section class="section">${questionSeed.map((q) => `<h3>${escapeHtml(q.prompt)}</h3><p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : q.kind === "ranking" ? "順位付け" : q.kind === "score" ? "点数付け" : "単一選択"}</p><ul>${q.options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul>`).join("")}</section>`}`;
   return c.html(
@@ -1559,38 +1575,38 @@ function resultsSections(results: PollResults, poll: PollRow): string {
       if (q.kind === "ranking") {
         const pct = totalPoints > 0 ? Math.round(((o.points ?? 0) / totalPoints) * 1000) / 10 : 0;
         const width = Math.round(((o.points ?? 0) / maxPoints) * 1000) / 10;
-        return `<div class="bar-row">
+        return `<div class="bar-row" data-qid="${escapeHtml(q.id)}" data-oid="${escapeHtml(o.id)}">
         <div>${escapeHtml(o.label)}</div>
         <div class="bar-track" role="img" aria-label="${escapeHtml(o.label)}: ${o.points ?? 0}ポイント (${pct}%)"><div class="bar-fill" style="width:${width}%;--d:${(i * 0.08).toFixed(2)}s"></div></div>
-        <div><strong>${o.points ?? 0}</strong> ポイント <span class="muted">(1位 ${o.votes} 回 ／ 平均 ${o.average_rank ?? "-"} 位)</span></div>
+        <div><strong data-points>${o.points ?? 0}</strong> ポイント <span class="muted">(1位 <span data-first>${o.votes}</span> 回 ／ 平均 <span data-avg>${o.average_rank ?? "-"}</span> 位)</span></div>
       </div>`;
       }
       if (q.kind === "score") {
         const avg = o.average_score ?? 0;
         const width = Math.round((avg / 5) * 1000) / 10;
-        return `<div class="bar-row">
+        return `<div class="bar-row" data-qid="${escapeHtml(q.id)}" data-oid="${escapeHtml(o.id)}">
         <div>${escapeHtml(o.label)}</div>
         <div class="bar-track" role="img" aria-label="${escapeHtml(o.label)}: 平均 ${o.average_score ?? "-"} 点（5点満点）"><div class="bar-fill" style="width:${width}%;--d:${(i * 0.08).toFixed(2)}s"></div></div>
-        <div><strong>${o.average_score ?? "-"}</strong> / 5 <span class="muted">(${o.votes} 件の評価)</span></div>
+        <div><strong data-avg>${o.average_score ?? "-"}</strong> / 5 <span class="muted">(<span data-evals>${o.votes}</span> 件の評価)</span></div>
       </div>`;
       }
       const pct = denom > 0 ? Math.round((o.votes / denom) * 1000) / 10 : 0;
       const width = Math.round((o.votes / maxVotes) * 1000) / 10;
-      return `<div class="bar-row">
+      return `<div class="bar-row" data-qid="${escapeHtml(q.id)}" data-oid="${escapeHtml(o.id)}">
         <div>${escapeHtml(o.label)}</div>
         <div class="bar-track" role="img" aria-label="${escapeHtml(o.label)}: ${o.votes}票 (${pct}%)"><div class="bar-fill" style="width:${width}%;--d:${(i * 0.08).toFixed(2)}s"></div></div>
-        <div><strong>${o.votes}</strong> 票 <span class="muted">(${pct}%)</span></div>
+        <div><strong data-votes>${o.votes}</strong> 票 <span class="muted">(<span data-pct>${pct}</span>%)</span></div>
       </div>`;
     }).join("");
     const stackSegments = q.options.map((o, i) => {
       const pct = denom > 0 ? (o.votes / denom) * 100 : 0;
-      return `<div class="stack-seg" style="width:${pct}%;background:${colorOf(i)};--d:${(i * 0.08).toFixed(2)}s"></div>`;
+      return `<div class="stack-seg" data-oid="${escapeHtml(o.id)}" style="width:${pct}%;background:${colorOf(i)};--d:${(i * 0.08).toFixed(2)}s"></div>`;
     }).join("");
     const legend = q.options.map((o, i) => `<span><span class="sw" style="background:${colorOf(i)}"></span>${escapeHtml(o.label)}</span>`).join("");
     const texts = (q.texts ?? []).map((t) => `<li>${escapeHtml(t)}</li>`).join("");
     return `<h2>${escapeHtml(q.prompt)}</h2>
-      <p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : q.kind === "ranking" ? "順位付け" : q.kind === "score" ? "点数付け" : "単一選択"} ／ 回答 ${q.response_count}</p>
-      ${q.kind === "text" ? `<ul>${texts || '<li class="muted">まだ回答がありません。</li>'}</ul>` : `${bars}${denom > 0 ? `<div class="stack" role="img" aria-label="得票割合の積み上げグラフ">${stackSegments}</div><div class="legend">${legend}</div>` : ""}`}`;
+      <p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : q.kind === "ranking" ? "順位付け" : q.kind === "score" ? "点数付け" : "単一選択"} ／ 回答 <span data-resp="${escapeHtml(q.id)}">${q.response_count}</span></p>
+      ${q.kind === "text" ? `<ul>${texts || '<li class="muted">まだ回答がありません。</li>'}</ul>` : `${bars}${denom > 0 ? `<div class="stack" data-stack="${escapeHtml(q.id)}" role="img" aria-label="得票割合の積み上げグラフ">${stackSegments}</div><div class="legend">${legend}</div>` : ""}`}`;
   }).join("");
 }
 
@@ -1768,23 +1784,97 @@ ui.get("/polls/:pollId/results-page", async (c) => {
   const refreshScript = scriptTag(
     nonce,
     `
-const POLL_ID = ${JSON.stringify(pollId)};
-let seen = ${results.total_voters} + ":" + ${results.total_votes};
-setInterval(async () => {
-  try {
-    const res = await fetch("/api/v1/polls/" + POLL_ID + "/results", { headers: { accept: "application/json" } });
-    if (!res.ok) return;
-    const data = await res.json();
-    const stamp = data.results.total_voters + ":" + data.results.total_votes;
-    if (stamp !== seen) location.reload();
-  } catch (e) { /* keep the current view */ }
-}, 10000);
+(() => {
+  const POLL_ID = ${JSON.stringify(pollId)};
+  let seen = ${results.total_voters} + ":" + ${results.total_votes};
+  let reloaded = false;
+  try { reloaded = sessionStorage.getItem("hv-reloaded-" + POLL_ID) === "1"; } catch (e) { reloaded = true; }
+  const round1 = (n) => Math.round(n * 10) / 10;
+  const esc = (s) => CSS.escape(s);
+  function reloadOnce() {
+    if (reloaded) return;
+    try { sessionStorage.setItem("hv-reloaded-" + POLL_ID, "1"); } catch (e) { /* ignore */ }
+    location.reload();
+  }
+  function applyResults(r) {
+    const totalsEl = document.getElementById("total-voters");
+    if (totalsEl) totalsEl.textContent = String(r.total_voters);
+    const votesEl = document.getElementById("total-votes");
+    if (votesEl) votesEl.textContent = String(r.total_votes);
+    const questions = r.questions.length > 0 ? r.questions : [{
+      id: r.poll_id, kind: "single", response_count: r.total_voters, options: r.options,
+    }];
+    for (const q of questions) {
+      const resp = document.querySelector('[data-resp="' + esc(q.id) + '"]');
+      if (resp) resp.textContent = String(q.response_count);
+      const denom = q.options.reduce((sum, o) => sum + o.votes, 0);
+      const totalPoints = q.options.reduce((sum, o) => sum + (o.points || 0), 0);
+      const maxVotes = Math.max(1, ...q.options.map((o) => o.votes));
+      const maxPoints = Math.max(1, ...q.options.map((o) => o.points || 0));
+      const stack = document.querySelector('[data-stack="' + esc(q.id) + '"]');
+      if (q.kind !== "text") {
+        if ((denom > 0) !== !!stack) return false;
+        if (stack) {
+          for (const o of q.options) {
+            const seg = stack.querySelector('[data-oid="' + esc(o.id) + '"]');
+            if (!seg) return false;
+            seg.style.width = (denom > 0 ? (o.votes / denom) * 100 : 0) + "%";
+          }
+        }
+      }
+      for (const o of q.options) {
+        const row = document.querySelector('.bar-row[data-qid="' + esc(q.id) + '"][data-oid="' + esc(o.id) + '"]');
+        if (!row) return false;
+        const fill = row.querySelector(".bar-fill");
+        const track = row.querySelector(".bar-track");
+        const label = row.children[0].textContent;
+        const set = (sel, value) => { const el = row.querySelector(sel); if (el) el.textContent = String(value); };
+        if (q.kind === "ranking") {
+          const pts = o.points || 0;
+          fill.style.width = round1((pts / maxPoints) * 100) + "%";
+          const pct = totalPoints > 0 ? round1((pts / totalPoints) * 100) : 0;
+          set("[data-points]", pts);
+          set("[data-first]", o.votes);
+          set("[data-avg]", o.average_rank != null ? o.average_rank : "-");
+          track.setAttribute("aria-label", label + ": " + pts + "ポイント (" + pct + "%)");
+        } else if (q.kind === "score") {
+          const avg = o.average_score != null ? o.average_score : 0;
+          fill.style.width = round1((avg / 5) * 100) + "%";
+          set("[data-avg]", o.average_score != null ? o.average_score : "-");
+          set("[data-evals]", o.votes);
+          track.setAttribute("aria-label", label + ": 平均 " + (o.average_score != null ? o.average_score : "-") + " 点（5点満点）");
+        } else {
+          fill.style.width = round1((o.votes / maxVotes) * 100) + "%";
+          const pct = denom > 0 ? round1((o.votes / denom) * 100) : 0;
+          set("[data-votes]", o.votes);
+          set("[data-pct]", pct);
+          track.setAttribute("aria-label", label + ": " + o.votes + "票 (" + pct + "%)");
+        }
+      }
+    }
+    return true;
+  }
+  setInterval(async () => {
+    try {
+      const res = await fetch("/api/v1/polls/" + POLL_ID + "/results", { headers: { accept: "application/json" } });
+      if (!res.ok) return;
+      const data = await res.json();
+      const stamp = data.results.total_voters + ":" + data.results.total_votes;
+      if (stamp === seen) return;
+      if (applyResults(data.results)) {
+        seen = stamp;
+      } else {
+        reloadOnce();
+      }
+    } catch (e) { /* keep the current view */ }
+  }, 10000);
+})();
 `,
   );
   const body = `
     ${brand?.brand_logo_key ? `<p><img src="/images/${escapeHtml(brand.brand_logo_key)}" alt="ワークスペースのロゴ" style="max-height:64px"></p>` : ""}
     <h1>${escapeHtml(poll.question)}</h1>
-    <p class="muted small">投票者数 ${results.total_voters} 人 ／ 総票数 ${results.total_votes} 票${poll.closes_at ? ` ／ 締切 ${escapeHtml(poll.closes_at)}` : ""} ／ 10秒ごとに自動更新</p>
+    <p class="muted small">投票者数 <span id="total-voters">${results.total_voters}</span> 人 ／ 総票数 <span id="total-votes">${results.total_votes}</span> 票${poll.closes_at ? ` ／ 締切 ${escapeHtml(poll.closes_at)}` : ""} ／ 10秒ごとに自動更新</p>
     <section class="section">
       ${sections || '<p class="muted">設問がありません。</p>'}
     </section>
