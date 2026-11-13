@@ -1103,7 +1103,15 @@ api.get("/polls/:pollId/og.svg", async (c) => {
         .join("") +
       `<text x="70" y="600" font-size="26" fill="#555555">投票者数 ${results.total_voters} 人</text>`;
   } else {
-    detail = `<text x="70" y="${Math.max(360, bandHeight + 76)}" font-size="34" fill="#222222">結果は締切後に公開されます</text>`;
+    // Results are hidden either only until the poll closes (after_close) or
+    // indefinitely (admin_only, and unknown values fail closed). Only the
+    // former may promise a later reveal; the wording matches the results
+    // page (ui.ts) for each case.
+    const hiddenNote =
+      poll.results_visibility === "after_close"
+        ? "結果は締切後に公開されます"
+        : "結果は非公開です";
+    detail = `<text x="70" y="${Math.max(360, bandHeight + 76)}" font-size="34" fill="#222222">${hiddenNote}</text>`;
   }
   const titleSvg = questionLines
     .map(
