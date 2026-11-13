@@ -380,6 +380,62 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
         "429": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/admin-ip-restriction:
+    get:
+      tags: [ワークスペース]
+      summary: 管理画面の IP 制限を取得（オーナー）
+      description: ワークスペースの管理画面・管理 API へのアクセスを許可する IP / CIDR の一覧です。許可リストは D1 に AES-GCM で暗号化して保存されます（IP_LIST_ENCRYPTION_KEY 未設定の環境では available が false で、機能は無効です）。制限が有効な場合、このエンドポイント自体も許可リストの対象です。投票の公開 API には適用されません。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 現在の制限状態
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+                  enabled: { type: boolean }
+                  entries:
+                    type: array
+                    items: { type: string }
+                  undecryptable: { type: boolean }
+                  current_ip: { type: string, nullable: true }
+        "403": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [ワークスペース]
+      summary: 管理画面の IP 制限を保存（オーナー）
+      description: entries を空配列にすると制限を解除します。自分の現在の IP が新しいリストに含まれていない場合、confirm_lockout を true にしないと 400 で拒否されます（締め出し防止）。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [entries]
+              properties:
+                entries:
+                  type: array
+                  items: { type: string }
+                  example: ["192.0.2.10", "198.51.100.0/24"]
+                confirm_lockout: { type: boolean }
+      responses:
+        "200":
+          description: 保存後の状態
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  entries:
+                    type: array
+                    items: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
   /api/v1/tenants/{tenantId}/origins:
     get:
       tags: [ワークスペース]

@@ -13,6 +13,8 @@ export default defineConfig({
       miniflare: {
         bindings: {
           SESSION_SECRET: "test-session-secret",
+          // Test-fixture key for the admin IP allowlist (32 bytes, base64).
+          IP_LIST_ENCRYPTION_KEY: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
           OIDC_CLIENT_ID: "test-client-id",
           APP_ORIGIN: "https://vote.test",
           OIDC_ISSUER: "https://idp.example.test",

@@ -216,7 +216,7 @@ node scripts/register-oidc-client.mjs
 必要な設定:
 
 - 変数: `AUTH_PROVIDER`、`OIDC_ISSUER`、`OIDC_CLIENT_ID`、`OIDC_SCOPES`（例 `openid profile email`）、`APP_ORIGIN`（管理ログインをこのオリジンに限定します）、`EMAIL_PROVIDER`
-- シークレット: `SESSION_SECRET`（セッション Cookie の署名用。`wrangler secret put SESSION_SECRET`）。任意で `VOTER_KEY_SECRET`（投票者識別子の HMAC。未設定時は `SESSION_SECRET` を使います。セッション秘密だけをローテーションしたいときに分けてください）。値はコミットしません。
+- シークレット: `SESSION_SECRET`（セッション Cookie の署名用。`wrangler secret put SESSION_SECRET`）。任意で `VOTER_KEY_SECRET`（投票者識別子の HMAC。未設定時は `SESSION_SECRET` を使います。セッション秘密だけをローテーションしたいときに分けてください）。任意で `IP_LIST_ENCRYPTION_KEY`（base64 の 32 バイト鍵。ワークスペースごとの管理画面 IP 許可リストを AES-GCM で暗号化して保存するために使います。未設定の環境では IP 制限機能が無効になります）。値はコミットしません。
 
 ## ローカル開発
 

@@ -118,6 +118,12 @@ CREATE TABLE IF NOT EXISTS tenant_origins (
   PRIMARY KEY (tenant_id, origin)
 );
 
+CREATE TABLE IF NOT EXISTS tenant_admin_ip_rules (
+  tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+  entries_enc TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS rate_limits (
   bucket TEXT PRIMARY KEY,
   hits INTEGER NOT NULL,
