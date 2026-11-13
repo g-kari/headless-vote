@@ -80,6 +80,7 @@ export interface PollRow {
   results_visibility: string;
   ip_single_vote: number;
   confirm_required: number;
+  passphrase_hash: string | null;
   created_at: string;
   updated_at: string;
   /** Optimistic concurrency token. Changes on every successful edit. */

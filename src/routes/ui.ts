@@ -1592,6 +1592,15 @@ function validateForm() {
   if (opensEl.value && closesEl.value && new Date(opensEl.value) >= new Date(closesEl.value)) {
     problems.push([closesEl, '締切日時は開始日時より後にしてください']);
   }
+  const passphraseEl = document.getElementById('passphrase');
+  const passphraseValue = passphraseEl ? passphraseEl.value : '';
+  const clearPassphraseEl = document.getElementById('clear-passphrase');
+  if (passphraseValue && passphraseValue.trim().length < 4) {
+    problems.push([passphraseEl, '合言葉は4〜128文字にしてください']);
+  }
+  if (passphraseValue && clearPassphraseEl && clearPassphraseEl.checked) {
+    problems.push([passphraseEl, '合言葉の解除と新しい合言葉の入力は同時にはできません']);
+  }
   const questionCards = [...questionsEl.querySelectorAll('.question-card')];
   if (questionCards.length < 1) problems.push([questionsEl, '設問は1つ以上必要です']);
   if (questionCards.length > 20) problems.push([questionsEl, '設問は20個までです']);
@@ -1693,6 +1702,14 @@ function validateForm() {
 
 /* Map an API validation message onto the field it belongs to. */
 function showServerError(message, details) {
+  if ((details && details.field === 'passphrase') || (message || '').includes('passphrase')) {
+    const passEl = document.getElementById('passphrase');
+    if (passEl) {
+      showFieldError(passEl, '合言葉を確認してください（4〜128文字）。');
+      passEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+  }
   const cards = [...questionsEl.querySelectorAll('.question-card')];
   let idx = -1;
   const m = /questions\[(\d+)\]/.exec(message || '');
@@ -1752,6 +1769,10 @@ async function submitPoll(ev) {
       closes_at: document.getElementById('closes-at').value ? new Date(document.getElementById('closes-at').value).toISOString() : null,
       questions,
     };
+    const passphraseValue = document.getElementById('passphrase').value;
+    if (passphraseValue) payload.passphrase = passphraseValue;
+    const clearPassphraseEl = document.getElementById('clear-passphrase');
+    if (clearPassphraseEl && clearPassphraseEl.checked) payload.clear_passphrase = true;
     const url = POLL_ID
       ? '/api/v1/tenants/' + TENANT + '/polls/' + POLL_ID
       : '/api/v1/tenants/' + TENANT + '/polls';
@@ -1858,6 +1879,13 @@ function pollFormBody(opts: {
         <label for="confirm-required" style="margin:0"><span>投票前に確認ステップを必須にする</span>
         <small>オンにすると、API は confirm: true が付いた投票だけを受け付けます。誤送信やボットの単純な連投を抑えるための確認です。</small></label>
       </div>
+      <label for="passphrase">合言葉 <span class="hint">${p?.passphrase_hash ? "設定済みです。入力すると新しい合言葉に置き換わります。空欄のままなら変更しません。" : "任意。設定すると、投票時に合言葉の入力が必要になります。合言葉はハッシュ化して保存され、画面には表示されません。"}</span></label>
+      <input id="passphrase" type="password" autocomplete="new-password" maxlength="128" placeholder="4〜128文字">
+      ${p?.passphrase_hash ? `<div class="check">
+        <input id="clear-passphrase" type="checkbox">
+        <label for="clear-passphrase" style="margin:0"><span>合言葉を解除する</span>
+        <small>チェックすると、この投票は合言葉なしで投票できるようになります。</small></label>
+      </div>` : ""}
       <h2>設問</h2>
       <p class="muted small">形式は単一選択、複数選択、自由記述（長文／短いテキスト）、順位付け、点数付け、数値入力、日付、段階評価、スライダー、配点です。単一・複数選択の回答を条件に、後ろの設問を表示する分岐も付けられます。並び順は上から下です。最大 20 問。</p>
       <div id="questions"></div>
@@ -1989,6 +2017,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
   body: JSON.stringify({
     voter_token: "stable-id-for-this-voter",
     ...(poll.poll.confirm_required ? { confirm: true } : {}),
+    ...(poll.poll.passphrase_required ? { passphrase: "設定した合言葉" } : {}),
     answers,
   }),
 });`)}</pre>
