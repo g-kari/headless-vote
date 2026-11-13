@@ -37,13 +37,32 @@ CREATE TABLE IF NOT EXISTS app_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_app_notifications_tenant ON app_notifications(tenant_id, read_at);
 
+CREATE TABLE IF NOT EXISTS accounts (
+  id TEXT PRIMARY KEY,
+  subject TEXT NOT NULL UNIQUE,
+  email TEXT,
+  name TEXT,
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
+
 CREATE TABLE IF NOT EXISTS tenant_members (
   tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  user_sub TEXT NOT NULL,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   role TEXT NOT NULL DEFAULT 'owner',
   created_at TEXT NOT NULL,
-  PRIMARY KEY (tenant_id, user_sub)
+  PRIMARY KEY (tenant_id, account_id)
 );
+
+CREATE TABLE IF NOT EXISTS member_invites (
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_member_invites_email ON member_invites(email);
 
 CREATE TABLE IF NOT EXISTS polls (
   id TEXT PRIMARY KEY,
@@ -217,7 +236,7 @@ CREATE TABLE IF NOT EXISTS object_cleanup (
 );
 
 CREATE TABLE IF NOT EXISTS session_epochs (
-  sub TEXT PRIMARY KEY,
+  account_id TEXT PRIMARY KEY,
   epoch INTEGER NOT NULL DEFAULT 0
 );
 

@@ -1,5 +1,6 @@
 import { env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
+import { resolveAccount } from "../src/accounts";
 import { randomId, randomToken, sha256Hex } from "../src/crypto";
 import { findActiveApiKey, issueApiKey, provisionTenant, revokeApiKey, rotatePresentedKey } from "../src/keys";
 import { addMember, removeMember, setMemberRole } from "../src/members";
@@ -9,14 +10,18 @@ import { applySchema } from "./fixtures";
 const bindings = env as unknown as Env;
 beforeAll(async () => { await applySchema(env.DB); });
 
-function actor(tenantId: string): AdminPrincipal {
-  return { kind: "session", tenantId, sub: "owner-a", role: "owner" };
+/** Internal account id for a test subject (the subject itself stays server-side). */
+async function accountId(subject: string): Promise<string> {
+  return (await resolveAccount(bindings, subject)).id;
+}
+async function actor(tenantId: string): Promise<AdminPrincipal> {
+  return { kind: "session", tenantId, accountId: await accountId("owner-a"), role: "owner" };
 }
 async function workspace() {
-  const created = await provisionTenant(bindings, "Security regression", "owner-a");
+  const created = await provisionTenant(bindings, "Security regression", await accountId("owner-a"));
   const presented = await findActiveApiKey(bindings, created.apiKey);
   expect(presented).not.toBeNull();
-  return { ...created, presented: presented!, actor: actor(created.tenantId) };
+  return { ...created, presented: presented!, actor: await actor(created.tenantId) };
 }
 async function activeCount(tenantId: string) {
   return (await env.DB.prepare(
@@ -100,18 +105,21 @@ describe("atomic API key changes", () => {
 describe("atomic last-owner protection", () => {
   it.each(["demote", "remove", "mixed"])("keeps an owner during competing %s operations", async (mode) => {
     const w = await workspace();
-    await addMember(bindings, w.tenantId, "owner-b", "owner", w.actor);
-    const outcomes = await Promise.allSettled(["owner-a", "owner-b"].map((sub, i) =>
+    await addMember(bindings, w.tenantId, await accountId("owner-b"), "owner", w.actor);
+    const ids = [await accountId("owner-a"), await accountId("owner-b")];
+    const outcomes = await Promise.allSettled(ids.map((id, i) =>
       mode === "demote" || (mode === "mixed" && i === 0)
-        ? setMemberRole(bindings, w.tenantId, sub, "member", w.actor)
-        : removeMember(bindings, w.tenantId, sub, w.actor)));
+        ? setMemberRole(bindings, w.tenantId, id, "member", w.actor)
+        : removeMember(bindings, w.tenantId, id, w.actor)));
     expect(outcomes.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     expect(await ownerCount(w.tenantId)).toBe(1);
   });
 
   it.each(["demote", "remove"])("rejects a stale member role during %s", async (operation) => {
     const w = await workspace();
-    await addMember(bindings, w.tenantId, "member", "member", w.actor);
+    const memberId = await accountId("member");
+    const ownerAId = await accountId("owner-a");
+    await addMember(bindings, w.tenantId, memberId, "member", w.actor);
     let intercepted = false;
     // Force the role to change after the function reads it, before its write.
     const racingEnv = {
@@ -128,8 +136,8 @@ describe("atomic last-owner protection", () => {
                     const snapshot = await bound.first();
                     intercepted = true;
                     await env.DB.batch([
-                      env.DB.prepare("UPDATE tenant_members SET role = 'owner' WHERE tenant_id = ?1 AND user_sub = 'member'").bind(w.tenantId),
-                      env.DB.prepare("UPDATE tenant_members SET role = 'member' WHERE tenant_id = ?1 AND user_sub = 'owner-a'").bind(w.tenantId),
+                      env.DB.prepare("UPDATE tenant_members SET role = 'owner' WHERE tenant_id = ?1 AND account_id = ?2").bind(w.tenantId, memberId),
+                      env.DB.prepare("UPDATE tenant_members SET role = 'member' WHERE tenant_id = ?1 AND account_id = ?2").bind(w.tenantId, ownerAId),
                     ]);
                     return snapshot;
                   },
@@ -142,20 +150,22 @@ describe("atomic last-owner protection", () => {
       },
     } as unknown as Env;
     const change = operation === "demote"
-      ? setMemberRole(racingEnv, w.tenantId, "member", "member", w.actor)
-      : removeMember(racingEnv, w.tenantId, "member", w.actor);
+      ? setMemberRole(racingEnv, w.tenantId, memberId, "member", w.actor)
+      : removeMember(racingEnv, w.tenantId, memberId, w.actor);
     await expect(change).rejects.toMatchObject({ code: "LAST_OWNER" });
     expect(await ownerCount(w.tenantId)).toBe(1);
   });
 
   it("allows ordinary member changes and keeping the sole owner role", async () => {
     const w = await workspace();
-    await setMemberRole(bindings, w.tenantId, "owner-a", "owner", w.actor);
-    await addMember(bindings, w.tenantId, "member", "member", w.actor);
-    await removeMember(bindings, w.tenantId, "member", w.actor);
-    await expect(setMemberRole(bindings, w.tenantId, "owner-a", "member", w.actor))
+    const ownerAId = await accountId("owner-a");
+    const memberId = await accountId("member");
+    await setMemberRole(bindings, w.tenantId, ownerAId, "owner", w.actor);
+    await addMember(bindings, w.tenantId, memberId, "member", w.actor);
+    await removeMember(bindings, w.tenantId, memberId, w.actor);
+    await expect(setMemberRole(bindings, w.tenantId, ownerAId, "member", w.actor))
       .rejects.toMatchObject({ code: "LAST_OWNER" });
-    await expect(removeMember(bindings, w.tenantId, "owner-a", w.actor))
+    await expect(removeMember(bindings, w.tenantId, ownerAId, w.actor))
       .rejects.toMatchObject({ code: "LAST_OWNER" });
     expect(await ownerCount(w.tenantId)).toBe(1);
   });

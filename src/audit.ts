@@ -2,7 +2,9 @@ import { randomId } from "./crypto";
 import type { AdminPrincipal, Env } from "./types";
 
 export function actorLabel(principal: AdminPrincipal): string {
-  if (principal.kind === "session") return `session:${principal.sub.slice(0, 80)}`;
+  // Session actors are labelled with the Hyo-internal account id. The IdP
+  // subject is never written to the audit log.
+  if (principal.kind === "session") return `session:${principal.accountId}`;
   return `key:${principal.prefix}`;
 }
 

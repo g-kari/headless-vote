@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { applySchema } from "./fixtures";
 import { upsertBallot } from "../src/ballots";
 import { getPollRow } from "../src/domain";
-import { makeSessionCookie } from "../src/auth";
+import { newSessionCookieForToken } from "../src/auth";
 import { replaceQuestionStatements, questionTextStatements, listQuestionRows } from "../src/questions";
 import type { Env, PollRow } from "../src/types";
 
@@ -75,7 +75,7 @@ describe("atomic voting boundaries", () => {
 
   it("rejects credentialed sibling-origin simple requests before voting", async () => {
     const { poll } = await fixture();
-    const cookie = (await makeSessionCookie(bindings, { sub: "csrf-voter" }, BASE)).split(";")[0]!;
+    const cookie = (await newSessionCookieForToken(bindings, {}, "csrf-voter", BASE)).split(";")[0]!;
     const origins: Record<string, string>[] = [
       { origin: "https://evil.vote.test", "sec-fetch-site": "same-site" },
       { origin: "null", "sec-fetch-site": "same-site" },
@@ -95,7 +95,7 @@ describe("atomic voting boundaries", () => {
     const origin = "https://embed.example.test";
     await env.DB.prepare("INSERT INTO tenant_origins (tenant_id, origin, created_at) VALUES (?1, ?2, ?3)")
       .bind(tenant, origin, new Date().toISOString()).run();
-    const cookie = (await makeSessionCookie(bindings, { sub: "allowed-voter" }, BASE)).split(";")[0]!;
+    const cookie = (await newSessionCookieForToken(bindings, {}, "allowed-voter", BASE)).split(";")[0]!;
     const response = await SELF.fetch(`${BASE}/api/v1/polls/${poll.id}/vote`, {
       method: "POST", headers: { cookie, origin, "sec-fetch-site": "cross-site", "content-type": "application/json" },
       body: '{"answers":[]}',
