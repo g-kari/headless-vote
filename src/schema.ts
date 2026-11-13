@@ -90,11 +90,12 @@ CREATE TABLE IF NOT EXISTS questions (
   prompt TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   image_key TEXT,
-  kind TEXT NOT NULL CHECK (kind IN ('single', 'multiple', 'text', 'ranking', 'score')),
+  kind TEXT NOT NULL CHECK (kind IN ('single', 'multiple', 'text', 'short_text', 'ranking', 'score', 'number', 'date', 'scale', 'slider', 'allocation')),
   required INTEGER NOT NULL DEFAULT 1,
   position INTEGER NOT NULL DEFAULT 0,
   show_if_question_id TEXT,
   show_if_option_id TEXT,
+  config TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_questions_poll ON questions(poll_id);

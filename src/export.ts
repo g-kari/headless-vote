@@ -27,10 +27,16 @@ export function resultsToCsv(poll: PollRow, results: PollResults): string {
       }];
   for (const question of questions) {
     const denom = question.options.reduce((sum, o) => sum + o.votes, 0);
-    if (question.kind === "text") {
+    if (question.kind === "text" || question.kind === "short_text" || question.kind === "date") {
       const texts = question.texts ?? [];
       if (texts.length === 0) lines.push(row(poll, results, question, "", "", question.response_count, 0, ""));
       for (const text of texts) lines.push(row(poll, results, question, "", "", 1, 0, text));
+      continue;
+    }
+    if (question.kind === "number" || question.kind === "slider") {
+      const values = question.values ?? [];
+      if (values.length === 0) lines.push(row(poll, results, question, "", "", question.response_count, 0, ""));
+      for (const value of values) lines.push(row(poll, results, question, "", "", 1, 0, String(value)));
       continue;
     }
     for (const option of question.options) {

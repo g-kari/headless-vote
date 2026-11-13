@@ -197,6 +197,9 @@ input:user-invalid,textarea:user-invalid,select:user-invalid{border-color:var(--
 .question-card{border-top:2px solid var(--text);padding-top:1rem;padding-bottom:1.4rem;margin-top:1.6rem}
 .question-card .q-prompt{margin-bottom:.6rem}
 .q-kind-hint{margin:.35rem 0 0}
+.q-config{display:flex;gap:1rem;flex-wrap:wrap;margin:.5rem 0 .2rem}
+.q-config .cfg-field{display:inline-flex;align-items:center;gap:.4rem;font-size:.92rem}
+.q-config .cfg-field input{width:6.5rem}
 .q-showif{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin:.7rem 0}
 .q-showif select{width:auto;max-width:100%}
 .q-showif-opt{display:inline-flex;align-items:center;gap:.5rem;flex-wrap:wrap}

@@ -1266,14 +1266,24 @@ components:
         question_id: { type: string, format: uuid }
         option_id: { type: string, format: uuid }
       required: [question_id, option_id]
+    QuestionConfig:
+      type: object
+      description: 形式ごとの設定。scale は steps（2〜10、既定5）、slider は min/max/step（既定 0/100/1）、allocation は total（既定100）、number は任意の min/max
+      properties:
+        steps: { type: integer, minimum: 2, maximum: 10 }
+        min: { type: number }
+        max: { type: number }
+        step: { type: number }
+        total: { type: integer, minimum: 1 }
     Question:
       type: object
       properties:
         id: { type: string, format: uuid }
         prompt: { type: string }
-        kind: { type: string, enum: [single, multiple, text, ranking, score] }
+        kind: { type: string, enum: [single, multiple, text, short_text, ranking, score, number, date, scale, slider, allocation] }
         required: { type: boolean }
         position: { type: integer }
+        config: { allOf: [{ $ref: "#/components/schemas/QuestionConfig" }], nullable: true }
         show_if: { allOf: [{ $ref: "#/components/schemas/ShowIf" }], nullable: true }
         options:
           type: array
@@ -1283,9 +1293,10 @@ components:
       properties:
         id: { type: string, format: uuid, description: 既存設問の維持に使う（省略時は新規） }
         prompt: { type: string, maxLength: 300 }
-        kind: { type: string, enum: [single, multiple, text, ranking, score], default: single }
+        kind: { type: string, enum: [single, multiple, text, short_text, ranking, score, number, date, scale, slider, allocation], default: single }
         required: { type: boolean, default: true }
         show_if: { allOf: [{ $ref: "#/components/schemas/ShowIf" }], nullable: true }
+        config: { allOf: [{ $ref: "#/components/schemas/QuestionConfig" }], nullable: true }
         options:
           type: array
           maxItems: 50
@@ -1362,11 +1373,12 @@ components:
           type: array
           items: { type: string, format: uuid }
           description: single / multiple の回答。ranking では並び順が順位
-        text: { type: string, description: text 形式の回答 }
+        text: { type: string, description: text / short_text / date 形式の回答（date は YYYY-MM-DD） }
         scores:
           type: object
-          description: score 形式の回答（選択肢 ID → 0〜5 点）
+          description: score 形式の回答（選択肢 ID → 0〜5 点）。allocation 形式では配点（合計が config.total と一致すること）
           additionalProperties: { type: number }
+        value: { type: number, description: number / scale / slider 形式の回答 }
     VoteRequest:
       type: object
       properties:
@@ -1400,22 +1412,36 @@ components:
         points: { type: number, description: ranking の合計ポイント }
         average_rank: { type: number, nullable: true, description: ranking の平均順位 }
         average_score: { type: number, nullable: true, description: score の平均点 }
+        average_points: { type: number, nullable: true, description: allocation の平均配点 }
     QuestionResults:
       type: object
       properties:
         id: { type: string, format: uuid }
         prompt: { type: string }
-        kind: { type: string, enum: [single, multiple, text, ranking, score] }
+        kind: { type: string, enum: [single, multiple, text, short_text, ranking, score, number, date, scale, slider, allocation] }
         required: { type: boolean }
         position: { type: integer }
         response_count: { type: integer }
         options:
           type: array
           items: { $ref: "#/components/schemas/OptionResults" }
+        config: { allOf: [{ $ref: "#/components/schemas/QuestionConfig" }], nullable: true }
         texts:
           type: array
           items: { type: string }
           description: 自由記述の回答（管理用のみ。公開 API では含まれません）
+        values:
+          type: array
+          items: { type: number }
+          description: number / slider の回答値（管理用のみ）
+        numeric:
+          type: object
+          description: number / scale / slider の集計
+          properties:
+            count: { type: integer }
+            average: { type: number, nullable: true }
+            min: { type: number, nullable: true }
+            max: { type: number, nullable: true }
     Results:
       type: object
       properties:
