@@ -135,7 +135,7 @@ export async function registerLocalUser(
   await email.send({
     to: address,
     subject: "Confirm your email",
-    text: `Confirm your headless-vote account:\n${link}\n`,
+    text: `Confirm your Hyo account:\n${link}\n`,
   });
 }
 
@@ -163,7 +163,7 @@ export async function requestPasswordReset(
   await email.send({
     to: address,
     subject: "Reset your password",
-    text: `Reset your headless-vote password:\n${link}\n`,
+    text: `Reset your Hyo password:\n${link}\n`,
   });
 }
 

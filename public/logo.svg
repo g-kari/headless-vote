@@ -1,6 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 64" role="img" aria-label="headless-vote">
-  <rect width="64" height="64" rx="14" fill="#5b5bd6"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 196 64" role="img" aria-label="Hyo">
+  <rect width="64" height="64" rx="14" fill="#1e4fd8"/>
   <path d="M19.2 30.1 L27.8 39.4 L45.4 20.2" fill="none" stroke="#ffffff" stroke-width="6.7" stroke-linecap="round" stroke-linejoin="round"/>
   <rect x="17.9" y="44.8" width="28.2" height="4.8" rx="2.4" fill="#ffffff" opacity="0.92"/>
-  <text x="76" y="41" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="27" font-weight="700" fill="#5b5bd6">headless-vote</text>
+  <text x="76" y="42" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="30" font-weight="700" fill="#111418">Hyo</text>
+  <text x="140" y="42" font-family="'Hiragino Kaku Gothic ProN', 'Noto Sans JP', sans-serif" font-size="17" font-weight="700" fill="#1e4fd8">票</text>
 </svg>

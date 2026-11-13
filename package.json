@@ -2,7 +2,7 @@
   "dependencies": {
     "hono": "^4.6.14"
   },
-  "description": "Headless voting app: multi-tenant voting API and admin UI. Auth, email, storage, rate limits, webhooks, and analytics are swappable adapters.",
+  "description": "Hyo — headless voting app: multi-tenant voting API and admin UI. Auth, email, storage, rate limits, webhooks, and analytics are swappable adapters.",
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.1",
     "@cloudflare/workers-types": "^5.20261110.0",

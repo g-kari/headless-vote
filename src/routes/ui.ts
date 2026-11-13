@@ -73,7 +73,7 @@ async function requireOwnerUser(
 ui.get("/", async (c) => {
   const user = await getSessionUser(c);
   const body = `
-    <h1>headless-vote 投票管理</h1>
+    <h1>Hyo 投票管理</h1>
     <p class="lead">投票の作成・公開・集計を行うサービスです。管理画面と API の両方から、同じ投票を操作できます。</p>
     <div class="actions">
       <a class="btn primary" href="/admin">管理画面を開く</a>
@@ -1601,7 +1601,7 @@ ui.get("/docs", async (c) => {
   const user = await getSessionUser(c);
   const body = `
     <h1>API 仕様書</h1>
-    <p class="lead">headless-vote の公開 API と管理 API の使い方です。ベース URL は <code>${escapeHtml(origin)}</code>、形式は JSON です。</p>
+    <p class="lead">Hyo の公開 API と管理 API の使い方です。ベース URL は <code>${escapeHtml(origin)}</code>、形式は JSON です。</p>
     <h2>認証</h2>
     <section class="section">
       <p>管理 API は次のどちらかで認証します。</p>

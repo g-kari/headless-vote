@@ -1,5 +1,6 @@
-# headless-vote
+# Hyo
 
+サービス名は「Hyo（票）」です（リポジトリ名は headless-vote のまま）。
 Headless な投票 SaaS です。
 投票の作成と管理はブラウザの管理画面で行います。
 投票の取得・実行・結果は JSON の API で提供します。

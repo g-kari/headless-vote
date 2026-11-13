@@ -32,7 +32,7 @@ export function scriptTag(nonce: string, code: string): string {
   return `<script nonce="${escapeHtml(nonce)}">${code}</script>`;
 }
 
-export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="img" aria-label="headless-vote logo"><rect width="64" height="64" rx="14" fill="#1e4fd8"/><path d="M19.2 30.1 L27.8 39.4 L45.4 20.2" fill="none" stroke="#ffffff" stroke-width="6.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="17.9" y="44.8" width="28.2" height="4.8" rx="2.4" fill="#ffffff" opacity="0.92"/></svg>`;
+export const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 64 64" role="img" aria-label="Hyo logo"><rect width="64" height="64" rx="14" fill="#1e4fd8"/><path d="M19.2 30.1 L27.8 39.4 L45.4 20.2" fill="none" stroke="#ffffff" stroke-width="6.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="17.9" y="44.8" width="28.2" height="4.8" rx="2.4" fill="#ffffff" opacity="0.92"/></svg>`;
 
 const CSS = `
 :root{
@@ -211,13 +211,13 @@ export function layout(opts: {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>${escapeHtml(opts.title)} | headless-vote</title>
-<meta name="description" content="headless-vote — Headless 投票 SaaS。API と管理画面で投票を作成・運用できます。">
+<title>${escapeHtml(opts.title)} | Hyo</title>
+<meta name="description" content="Hyo — Headless 投票 SaaS。API と管理画面で投票を作成・運用できます。">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon-32x32.png" type="image/png" sizes="32x32">
 <link rel="icon" href="/favicon-16x16.png" type="image/png" sizes="16x16">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<meta property="og:title" content="headless-vote">
+<meta property="og:title" content="Hyo">
 <meta property="og:description" content="Headless 投票 SaaS。API と管理画面で投票を作成・運用できます。">
 <meta property="og:type" content="website">
 <meta property="og:url" content="${escapeHtml(opts.origin)}/">
@@ -229,7 +229,7 @@ ${brandStyle}
 <body>
 <a class="skip" href="#main">本文へ移動</a>
 <header class="site"><div class="bar">
-  <a class="brand" href="/admin">${LOGO_SVG}<span>headless-vote</span></a>
+  <a class="brand" href="/admin">${LOGO_SVG}<span>Hyo</span></a>
   <span class="spacer"></span>
   ${userArea}
 </div></header>
