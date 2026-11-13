@@ -342,10 +342,15 @@ function contentSecurityPolicy(nonce: string, html: boolean, docs = false): stri
     // style-src and omits require-trusted-types-for. It serves only
     // first-party static content (the spec and the bundle); every other page
     // keeps the strict policy below.
+    //
+    // style-src must NOT carry the nonce here: under CSP3 a nonce (or hash)
+    // in style-src makes browsers ignore 'unsafe-inline', and the <style>
+    // elements styled-components creates at runtime bear no nonce, so they
+    // are blocked and insertRule throws, breaking Redoc rendering entirely.
     return [
       "default-src 'none'",
       `script-src 'nonce-${nonce}' 'strict-dynamic'`,
-      `style-src 'nonce-${nonce}' 'unsafe-inline'`,
+      "style-src 'unsafe-inline'",
       "style-src-attr 'unsafe-inline'",
       "img-src 'self' data:",
       "connect-src 'self'",
