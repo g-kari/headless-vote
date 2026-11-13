@@ -86,7 +86,32 @@ export interface PollRow {
   revision: string;
 }
 
-export type QuestionKind = "single" | "multiple" | "text" | "ranking" | "score";
+export type QuestionKind =
+  | "single"
+  | "multiple"
+  | "text"
+  | "short_text"
+  | "ranking"
+  | "score"
+  | "number"
+  | "date"
+  | "scale"
+  | "slider"
+  | "allocation";
+
+/** Per-kind settings stored as JSON in questions.config. All fields optional. */
+export interface QuestionConfig {
+  /** scale: number of steps (2..10, default 5). */
+  steps?: number;
+  /** number/slider: lower bound. slider default 0, number none. */
+  min?: number;
+  /** number/slider: upper bound. slider default 100, number none. */
+  max?: number;
+  /** slider: step increment (default 1). */
+  step?: number;
+  /** allocation: points that must be distributed in total (default 100). */
+  total?: number;
+}
 
 export interface QuestionRow {
   id: string;
@@ -99,6 +124,8 @@ export interface QuestionRow {
   position: number;
   show_if_question_id: string | null;
   show_if_option_id: string | null;
+  /** JSON-encoded QuestionConfig, or null when the kind needs no settings. */
+  config: string | null;
   created_at: string;
 }
 

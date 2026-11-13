@@ -811,6 +811,7 @@ api.get("/polls/:pollId/ballot", async (c) => {
             option_ids: a.option_ids,
             text: a.text,
             scores: a.scores,
+            value: a.value,
           })),
           updated_at: row.updated_at,
         }

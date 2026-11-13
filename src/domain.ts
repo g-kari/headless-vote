@@ -1,8 +1,8 @@
 import { ensureVoterKeysHashed } from "./ballots";
 import { ApiError, badRequest } from "./errors";
-import { listQuestionRows, parseBallotDocument } from "./questions";
+import { TEXT_KINDS, listQuestionRows, parseBallotDocument, questionConfig } from "./questions";
 import { assertPlainText, readBodyLimited } from "./security";
-import type { AppContext, Env, OptionRow, PollRow, QuestionRow } from "./types";
+import type { AppContext, Env, OptionRow, PollRow, QuestionConfig, QuestionRow } from "./types";
 
 const MAX_JSON_BYTES = 64 * 1024;
 
@@ -107,13 +107,14 @@ export function pollToJson(
     kind: q.kind,
     required: q.required === 1,
     position: q.position,
+    config: q.config ? questionConfig(q) : null,
     show_if:
       q.show_if_question_id && q.show_if_option_id
         ? { question_id: q.show_if_question_id, option_id: q.show_if_option_id }
         : null,
     options: options.filter((o) => o.question_id === q.id).map((o) => optionToJson(origin, o)),
   }));
-  const firstChoice = questions.find((q) => q.kind !== "text");
+  const firstChoice = questions.find((q) => q.kind === "single" || q.kind === "multiple" || q.kind === "ranking" || q.kind === "score" || q.kind === "allocation");
   return {
     id: poll.id,
     question: poll.question,
@@ -184,6 +185,7 @@ export interface QuestionResult {
   required: boolean;
   position: number;
   response_count: number;
+  config: QuestionConfig | null;
   options: {
     id: string;
     label: string;
@@ -192,8 +194,13 @@ export interface QuestionResult {
     points?: number;
     average_rank?: number | null;
     average_score?: number | null;
+    average_points?: number | null;
   }[];
   texts?: string[];
+  /** Raw numeric answers (number/slider), only with includeText. */
+  values?: number[];
+  /** Summary statistics for number/scale/slider questions. */
+  numeric?: { count: number; average: number | null; min: number | null; max: number | null };
 }
 
 export interface PollResults {
@@ -229,6 +236,7 @@ export async function computeResults(
   }
   const optionVotes = new Map<string, number>();
   const textAnswers = new Map<string, string[]>();
+  const numericAnswers = new Map<string, number[]>();
   const answered = new Map<string, number>();
   const rankStats = new Map<string, { points: number; rankSum: number; count: number; first: number }>();
   const scoreStats = new Map<string, { sum: number; count: number }>();
@@ -236,6 +244,11 @@ export async function computeResults(
     for (const answer of parseBallotDocument(ballot.option_ids, defaultQuestionId)) {
       answered.set(answer.question_id, (answered.get(answer.question_id) ?? 0) + 1);
       const kind = kindByQuestion.get(answer.question_id);
+      if (answer.value !== null && answer.value !== undefined) {
+        const list = numericAnswers.get(answer.question_id) ?? [];
+        list.push(answer.value);
+        numericAnswers.set(answer.question_id, list);
+      }
       if (kind === "ranking") {
         const total = optionCountByQuestion.get(answer.question_id) ?? answer.option_ids.length;
         answer.option_ids.forEach((id, index) => {
@@ -266,7 +279,9 @@ export async function computeResults(
   }
   const round2 = (n: number) => Math.round(n * 100) / 100;
   const questionResults: QuestionResult[] = questions.map((q) => {
-    const qOptions = options
+    const config = q.config ? questionConfig(q) : null;
+    const values = numericAnswers.get(q.id) ?? [];
+    let qOptions = options
       .filter((o) => o.question_id === q.id)
       .map((o) => {
         const base = {
@@ -292,8 +307,30 @@ export async function computeResults(
             average_score: stat && stat.count > 0 ? round2(stat.sum / stat.count) : null,
           };
         }
+        if (q.kind === "allocation") {
+          const stat = scoreStats.get(o.id);
+          return {
+            ...base,
+            votes: stat?.count ?? 0,
+            points: stat?.sum ?? 0,
+            average_points: stat && stat.count > 0 ? round2(stat.sum / stat.count) : null,
+          };
+        }
         return base;
       });
+    if (q.kind === "scale") {
+      // Steps are synthesized as options so bars and exports work uniformly.
+      const steps = config?.steps ?? 5;
+      qOptions = Array.from({ length: steps }, (_, i) => {
+        const step = i + 1;
+        return {
+          id: `${q.id}:step:${step}`,
+          label: String(step),
+          image_url: null,
+          votes: values.filter((v) => v === step).length,
+        };
+      });
+    }
     const result: QuestionResult = {
       id: q.id,
       prompt: q.prompt,
@@ -301,9 +338,21 @@ export async function computeResults(
       required: q.required === 1,
       position: q.position,
       response_count: answered.get(q.id) ?? 0,
+      config,
       options: qOptions,
     };
-    if (opts.includeText && q.kind === "text") result.texts = textAnswers.get(q.id) ?? [];
+    if (q.kind === "number" || q.kind === "scale" || q.kind === "slider") {
+      result.numeric = values.length > 0
+        ? {
+            count: values.length,
+            average: round2(values.reduce((a, b) => a + b, 0) / values.length),
+            min: Math.min(...values),
+            max: Math.max(...values),
+          }
+        : { count: 0, average: null, min: null, max: null };
+    }
+    if (opts.includeText && TEXT_KINDS.includes(q.kind)) result.texts = textAnswers.get(q.id) ?? [];
+    if (opts.includeText && (q.kind === "number" || q.kind === "slider")) result.values = values;
     return result;
   });
   const flat = questionResults.flatMap((q) => q.options);

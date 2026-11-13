@@ -19,7 +19,7 @@ import {
   saveIpRestriction,
   validateIpEntries,
 } from "../ip-restriction";
-import { listQuestionRows } from "../questions";
+import { listQuestionRows, questionConfig } from "../questions";
 import { computeResults, getPollRow, isClosedForVoting, listOptionRows, type PollResults } from "../domain";
 import { issueApiKey, limitKeyRotation, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
 import { addMember, cancelInvite, inviteMemberByEmail, listInvites, listMembers, removeMember, setMemberRole } from "../members";
@@ -140,7 +140,7 @@ ui.get("/", async (c) => {
     </div>
     <h2>仕様</h2>
     <dl class="spec">
-      <dt>投票の設定</dt><dd>1つの投票に設問を最大20件まで追加できます。形式は単一選択・複数選択・自由記述。設問と選択肢に画像を添付できます。</dd>
+      <dt>投票の設定</dt><dd>1つの投票に設問を最大20件まで追加できます。形式は単一選択・複数選択・自由記述・短いテキスト・順位付け・点数付け・数値入力・日付・段階評価・スライダー・配点。設問と選択肢に画像を添付できます。</dd>
       <dt>投票ごとに選べる項目</dt><dd>ログイン必須か任意か、公開日時と締切日時。</dd>
       <dt>投票の数え方</dt><dd>1人1票。締切前なら投票の変更ができます。ログインした人はアカウント単位、匿名の人は投票者トークン単位で数えます。</dd>
       <dt>匿名投票の限界</dt><dd>トークンを変えた同一人物は別人として数えられます。厳密に1人1票が必要な投票では「ログイン必須」を選んでください。</dd>
@@ -1218,14 +1218,26 @@ const TENANT = ${safeJsonForScript(tenantId)};
 const POLL_ID = ${safeJsonForScript(pollId)};
 const questionsEl = document.getElementById('questions');
 const errorEl = document.getElementById('form-error');
-const OPTION_KINDS = ['single', 'multiple', 'ranking', 'score'];
+const OPTION_KINDS = ['single', 'multiple', 'ranking', 'score', 'allocation'];
 const KIND_HINTS = {
   single: '投票者は選択肢から1つだけ選びます。',
   multiple: '投票者は選択肢を複数選べます。',
-  text: '投票者が自由に文章を入力します。選択肢は不要です。',
+  text: '投票者が自由に文章を入力します（長文・改行可）。選択肢は不要です。',
+  short_text: '投票者が短い文章を1行で入力します（200文字まで）。選択肢は不要です。',
   ranking: '投票者は選択肢を並べ替えて順位を付けます。選択肢が順位付けの対象になります。',
   score: '投票者は選択肢ごとに0〜5点で評価します。選択肢が評価の対象になります。',
+  number: '投票者が数値を入力します。最小値・最大値で範囲を絞れます。選択肢は不要です。',
+  date: '投票者が日付（YYYY-MM-DD）を入力します。選択肢は不要です。',
+  scale: '投票者が段階（既定は5段階）から1つ選びます。選択肢は不要です。',
+  slider: '投票者がスライダーで範囲内の数値を選びます。選択肢は不要です。',
+  allocation: '投票者が合計点を各選択肢へ割り振ります。選択肢が配点の対象になります。',
 };
+const KIND_OPTIONS = [
+  ['single', '単一選択'], ['multiple', '複数選択'], ['text', '自由記述（長文）'],
+  ['short_text', '短いテキスト（1行）'], ['ranking', '順位付け'], ['score', '点数付け（0〜5）'],
+  ['number', '数値入力'], ['date', '日付'], ['scale', '段階評価'], ['slider', 'スライダー'],
+  ['allocation', '配点（合計を割り振る）'],
+];
 
 /* ---- inline field errors -------------------------------------------- */
 let errorSeq = 0;
@@ -1375,7 +1387,7 @@ function addQuestionCard(data) {
   prompt.value = (data && data.prompt) || '';
   const kind = document.createElement('select');
   kind.className = 'q-kind';
-  for (const [value, label] of [['single', '単一選択'], ['multiple', '複数選択'], ['text', '自由記述'], ['ranking', '順位付け'], ['score', '点数付け（0〜5）']]) {
+  for (const [value, label] of KIND_OPTIONS) {
     const opt = document.createElement('option');
     opt.value = value;
     opt.textContent = label;
@@ -1384,6 +1396,24 @@ function addQuestionCard(data) {
   }
   const kindHint = document.createElement('p');
   kindHint.className = 'q-kind-hint muted small';
+  const configWrap = document.createElement('div');
+  configWrap.className = 'q-config';
+  const cfgFields = {};
+  for (const [key, label] of [['min', '最小値'], ['max', '最大値'], ['steps', '段階数'], ['step', '刻み'], ['total', '合計点']]) {
+    const wrap = document.createElement('label');
+    wrap.className = 'cfg-field';
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.className = 'cfg-' + key;
+    wrap.append(document.createTextNode(label + ' '), input);
+    configWrap.append(wrap);
+    cfgFields[key] = { wrap, input };
+  }
+  if (data && data.config) {
+    for (const key of Object.keys(cfgFields)) {
+      if (data.config[key] !== undefined && data.config[key] !== null) cfgFields[key].input.value = data.config[key];
+    }
+  }
   const requiredLabel = document.createElement('label');
   requiredLabel.className = 'check';
   const required = document.createElement('input');
@@ -1423,11 +1453,20 @@ function addQuestionCard(data) {
   addOpt.className = 'btn small';
   addOpt.textContent = '選択肢を追加';
   addOpt.addEventListener('click', () => { addOptionRow(options, '', null, ''); refreshShowIf(); });
+  const CONFIG_FIELDS = {
+    number: ['min', 'max'],
+    scale: ['steps'],
+    slider: ['min', 'max', 'step'],
+    allocation: ['total'],
+  };
   const syncKind = () => {
-    const isText = kind.value === 'text';
-    options.hidden = isText;
-    addOpt.hidden = isText;
+    const noOptions = !OPTION_KINDS.includes(kind.value);
+    options.hidden = noOptions;
+    addOpt.hidden = noOptions;
     kindHint.textContent = KIND_HINTS[kind.value] || '';
+    const fields = CONFIG_FIELDS[kind.value] || [];
+    configWrap.hidden = fields.length === 0;
+    for (const key of Object.keys(cfgFields)) cfgFields[key].wrap.hidden = !fields.includes(key);
   };
   kind.addEventListener('change', () => { syncKind(); refreshShowIf(); });
   const up = document.createElement('button');
@@ -1448,10 +1487,10 @@ function addQuestionCard(data) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   actions.append(up, down, del);
-  card.append(prompt, kind, kindHint, requiredLabel, qid, showIfWrap, options, addOpt, actions);
+  card.append(prompt, kind, kindHint, configWrap, requiredLabel, qid, showIfWrap, options, addOpt, actions);
   questionsEl.append(card);
   const seedOptions = (data && data.options) || [];
-  if (seedOptions.length === 0 && (!data || data.kind !== 'text')) {
+  if (seedOptions.length === 0 && (!data || OPTION_KINDS.includes(data.kind))) {
     addOptionRow(options, '', null, '');
     addOptionRow(options, '', null, '');
   }
@@ -1519,6 +1558,42 @@ function validateForm() {
         });
       }
     }
+    const cfgNum = (key) => {
+      const el = card.querySelector('.cfg-' + key);
+      const v = el.value.trim();
+      return { el, value: v === '' ? null : Number(v) };
+    };
+    let config = null;
+    if (kind === 'number') {
+      const mn = cfgNum('min');
+      const mx = cfgNum('max');
+      for (const f of [mn, mx]) if (f.value !== null && !Number.isFinite(f.value)) problems.push([f.el, '数値を入力してください']);
+      if (mn.value !== null && mx.value !== null && mn.value > mx.value) problems.push([mx.el, '最大値は最小値以上にしてください']);
+      config = {};
+      if (mn.value !== null) config.min = mn.value;
+      if (mx.value !== null) config.max = mx.value;
+      if (Object.keys(config).length === 0) config = null;
+    } else if (kind === 'scale') {
+      const st = cfgNum('steps');
+      const steps = st.value === null ? 5 : st.value;
+      if (!Number.isInteger(steps) || steps < 2 || steps > 10) problems.push([st.el, '段階数は2〜10の整数にしてください']);
+      config = { steps };
+    } else if (kind === 'slider') {
+      const mn = cfgNum('min');
+      const mx = cfgNum('max');
+      const st = cfgNum('step');
+      const min = mn.value === null ? 0 : mn.value;
+      const max = mx.value === null ? 100 : mx.value;
+      const step = st.value === null ? 1 : st.value;
+      if (min >= max) problems.push([mx.el, '最大値は最小値より大きくしてください']);
+      if (!(step > 0)) problems.push([st.el, '刻みは0より大きくしてください']);
+      config = { min, max, step };
+    } else if (kind === 'allocation') {
+      const tt = cfgNum('total');
+      const total = tt.value === null ? 100 : tt.value;
+      if (!Number.isInteger(total) || total < 1) problems.push([tt.el, '合計点は1以上の整数にしてください']);
+      config = { total };
+    }
     const showQ = card.querySelector('.q-showif-q').value;
     const showO = card.querySelector('.q-showif-o').value;
     if (showQ && !showO) {
@@ -1530,6 +1605,7 @@ function validateForm() {
       kind,
       required: card.querySelector('.q-required').checked,
       options,
+      config,
       show_if: showQ ? { question_id: showQ, option_id: showO } : null,
       _card: card,
       _index: cardIndex,
@@ -1572,6 +1648,8 @@ function showServerError(message, details) {
     let anchor;
     if ((message || '').includes('show_if')) {
       anchor = showBoxError(card.querySelector('.q-showif'), '表示条件を確認してください。対象は前の単一・複数選択の設問と、その選択肢です。');
+    } else if ((message || '').includes('config')) {
+      anchor = showBoxError(card.querySelector('.q-config'), '形式の設定（範囲・段階数・合計点など）を確認してください。');
     } else if ((message || '').includes('option')) {
       anchor = showBoxError(card.querySelector('.q-options'), '選択肢を確認してください。2〜50個、各200文字までです。');
     } else {
@@ -1721,7 +1799,7 @@ function pollFormBody(opts: {
         <small>オンにすると、API は confirm: true が付いた投票だけを受け付けます。誤送信やボットの単純な連投を抑えるための確認です。</small></label>
       </div>
       <h2>設問</h2>
-      <p class="muted small">形式は単一選択、複数選択、自由記述、順位付け、点数付けです。単一・複数選択の回答を条件に、後ろの設問を表示する分岐も付けられます。並び順は上から下です。最大 20 問。</p>
+      <p class="muted small">形式は単一選択、複数選択、自由記述（長文／短いテキスト）、順位付け、点数付け、数値入力、日付、段階評価、スライダー、配点です。単一・複数選択の回答を条件に、後ろの設問を表示する分岐も付けられます。並び順は上から下です。最大 20 問。</p>
       <div id="questions"></div>
       <div class="actions"><button type="button" class="btn" id="add-question">設問を追加</button></div>
       <div class="actions"><button class="btn primary" type="submit">${p ? "変更を保存" : "下書きとして作成"}</button></div>
@@ -1762,6 +1840,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
     id: q.id,
     prompt: q.prompt,
     kind: q.kind,
+    config: q.config ? questionConfig(q) : null,
     required: q.required === 1,
     show_if:
       q.show_if_question_id && q.show_if_option_id
@@ -1839,8 +1918,9 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
 const base = "${origin}";
 const poll = await fetch(base + "/api/v1/polls/" + pollId).then((r) => r.json());
 const answers = poll.poll.questions.map((q) => {
-  if (q.kind === "text") return { question_id: q.id, text: "" };
-  if (q.kind === "score") return { question_id: q.id, scores: Object.fromEntries(q.options.map((o) => [o.id, 0])) };
+  if (q.kind === "text" || q.kind === "short_text" || q.kind === "date") return { question_id: q.id, text: "" };
+  if (q.kind === "score" || q.kind === "allocation") return { question_id: q.id, scores: Object.fromEntries(q.options.map((o) => [o.id, 0])) };
+  if (q.kind === "number" || q.kind === "scale" || q.kind === "slider") return { question_id: q.id, value: 0 };
   return { question_id: q.id, option_ids: [q.options[0].id] };
 });
 await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
@@ -1930,7 +2010,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
       });
       })();
     `)}
-    ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, questions: questionSeed, nonce }) : `<h2>内容</h2><section class="section">${questionSeed.map((q) => `<h3>${escapeHtml(q.prompt)}</h3><p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : q.kind === "ranking" ? "順位付け" : q.kind === "score" ? "点数付け" : "単一選択"}</p><ul>${q.options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul>`).join("")}</section>`}`;
+    ${poll.status !== "closed" ? pollFormBody({ tenantId, poll, questions: questionSeed, nonce }) : `<h2>内容</h2><section class="section">${questionSeed.map((q) => `<h3>${escapeHtml(q.prompt)}</h3><p class="muted small">${questionKindLabel(q.kind)}</p><ul>${q.options.map((o) => `<li>${escapeHtml(o.label)}</li>`).join("")}</ul>`).join("")}</section>`}`;
   return c.html(
     layout({
       title: poll.question,
@@ -1948,18 +2028,25 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
 
 const SEGMENT_COLORS = ["#1e4fd8", "#e07b00", "#0c6b34", "#b91c1c", "#6d28d9", "#0e7490"];
 
+function questionKindLabel(kind: string): string {
+  switch (kind) {
+    case "text": return "自由記述";
+    case "short_text": return "短いテキスト";
+    case "multiple": return "複数選択";
+    case "ranking": return "順位付け";
+    case "score": return "点数付け";
+    case "number": return "数値入力";
+    case "date": return "日付";
+    case "scale": return "段階評価";
+    case "slider": return "スライダー";
+    case "allocation": return "配点";
+    default: return "単一選択";
+  }
+}
+
 function resultsSections(results: PollResults, poll: PollRow): string {
   const colorOf = (i: number) => SEGMENT_COLORS[i % SEGMENT_COLORS.length] as string;
-  const kindLabel = (kind: string) =>
-    kind === "text"
-      ? "自由記述"
-      : kind === "multiple"
-        ? "複数選択"
-        : kind === "ranking"
-          ? "順位付け"
-          : kind === "score"
-            ? "点数付け"
-            : "単一選択";
+  const kindLabel = questionKindLabel;
   return (results.questions.length > 0 ? results.questions : [{
     id: poll.id,
     prompt: poll.question,
@@ -1967,6 +2054,7 @@ function resultsSections(results: PollResults, poll: PollRow): string {
     required: true,
     position: 0,
     response_count: results.total_voters,
+    config: null,
     options: results.options,
     texts: [] as string[],
   }]).map((q) => {
@@ -1993,6 +2081,16 @@ function resultsSections(results: PollResults, poll: PollRow): string {
         <div><strong data-avg>${o.average_score ?? "-"}</strong> / 5 <span class="muted">(<span data-evals>${o.votes}</span> 件の評価)</span></div>
       </div>`;
       }
+      if (q.kind === "allocation") {
+        const totalAlloc = q.config?.total ?? 100;
+        const avgP = o.average_points ?? 0;
+        const width = Math.round((avgP / totalAlloc) * 1000) / 10;
+        return `<div class="bar-row" data-qid="${escapeHtml(q.id)}" data-oid="${escapeHtml(o.id)}">
+        <div>${escapeHtml(o.label)}</div>
+        <div class="bar-track" role="img" aria-label="${escapeHtml(o.label)}: 平均 ${o.average_points ?? "-"} 点（合計 ${totalAlloc} 点の配点）"><div class="bar-fill" style="width:${width}%;--d:${(i * 0.08).toFixed(2)}s"></div></div>
+        <div>平均 <strong data-avgpoints>${o.average_points ?? "-"}</strong> 点 <span class="muted">(合計 <span data-points>${o.points ?? 0}</span> 点 ／ <span data-evals>${o.votes}</span> 件)</span></div>
+      </div>`;
+      }
       const pct = denom > 0 ? Math.round((o.votes / denom) * 1000) / 10 : 0;
       const width = Math.round((o.votes / maxVotes) * 1000) / 10;
       return `<div class="bar-row" data-qid="${escapeHtml(q.id)}" data-oid="${escapeHtml(o.id)}">
@@ -2007,9 +2105,14 @@ function resultsSections(results: PollResults, poll: PollRow): string {
     }).join("");
     const legend = q.options.map((o, i) => `<span><span class="sw" style="background:${colorOf(i)}"></span>${escapeHtml(o.label)}</span>`).join("");
     const texts = (q.texts ?? []).map((t) => `<li>${escapeHtml(t)}</li>`).join("");
+    const isTextKind = q.kind === "text" || q.kind === "short_text" || q.kind === "date";
+    const isValueKind = q.kind === "number" || q.kind === "slider";
+    const numericBlock = q.numeric
+      ? `<p class="small">平均 <strong data-num-avg="${escapeHtml(q.id)}">${q.numeric.average ?? "-"}</strong> ／ 最小 <span data-num-min="${escapeHtml(q.id)}">${q.numeric.min ?? "-"}</span> ／ 最大 <span data-num-max="${escapeHtml(q.id)}">${q.numeric.max ?? "-"}</span></p>`
+      : "";
     return `<h2>${escapeHtml(q.prompt)}</h2>
-      <p class="muted small">${q.kind === "text" ? "自由記述" : q.kind === "multiple" ? "複数選択" : q.kind === "ranking" ? "順位付け" : q.kind === "score" ? "点数付け" : "単一選択"} ／ 回答 <span data-resp="${escapeHtml(q.id)}">${q.response_count}</span></p>
-      ${q.kind === "text" ? `<ul>${texts || '<li class="muted">まだ回答がありません。</li>'}</ul>` : `${bars}${denom > 0 ? `<div class="stack" data-stack="${escapeHtml(q.id)}" role="img" aria-label="得票割合の積み上げグラフ">${stackSegments}</div><div class="legend">${legend}</div>` : ""}`}`;
+      <p class="muted small">${kindLabel(q.kind)} ／ 回答 <span data-resp="${escapeHtml(q.id)}">${q.response_count}</span></p>
+      ${isTextKind ? `<ul>${texts || '<li class="muted">まだ回答がありません。</li>'}</ul>` : isValueKind ? numericBlock : `${bars}${q.kind === "scale" ? numericBlock : ""}${denom > 0 && q.kind !== "allocation" ? `<div class="stack" data-stack="${escapeHtml(q.id)}" role="img" aria-label="得票割合の積み上げグラフ">${stackSegments}</div><div class="legend">${legend}</div>` : ""}`}`;
   }).join("");
 }
 
@@ -2161,7 +2264,13 @@ ui.get("/polls/:pollId/results-page", async (c) => {
       const maxVotes = Math.max(1, ...q.options.map((o) => o.votes));
       const maxPoints = Math.max(1, ...q.options.map((o) => o.points || 0));
       const stack = document.querySelector('[data-stack="' + esc(q.id) + '"]');
-      if (q.kind !== "text") {
+      if (q.numeric) {
+        const setNum = (attr, v) => { const el = document.querySelector('[' + attr + '="' + esc(q.id) + '"]'); if (el) el.textContent = v != null ? String(v) : "-"; };
+        setNum("data-num-avg", q.numeric.average);
+        setNum("data-num-min", q.numeric.min);
+        setNum("data-num-max", q.numeric.max);
+      }
+      if (!["text", "short_text", "date", "number", "slider", "allocation"].includes(q.kind)) {
         if ((denom > 0) !== !!stack) return false;
         if (stack) {
           for (const o of q.options) {
@@ -2192,6 +2301,14 @@ ui.get("/polls/:pollId/results-page", async (c) => {
           set("[data-avg]", o.average_score != null ? o.average_score : "-");
           set("[data-evals]", o.votes);
           track.setAttribute("aria-label", label + ": 平均 " + (o.average_score != null ? o.average_score : "-") + " 点（5点満点）");
+        } else if (q.kind === "allocation") {
+          const totalAlloc = (q.config && q.config.total) || 100;
+          const avgP = o.average_points != null ? o.average_points : 0;
+          fill.style.width = round1((avgP / totalAlloc) * 100) + "%";
+          set("[data-avgpoints]", o.average_points != null ? o.average_points : "-");
+          set("[data-points]", o.points || 0);
+          set("[data-evals]", o.votes);
+          track.setAttribute("aria-label", label + ": 平均 " + (o.average_points != null ? o.average_points : "-") + " 点（合計 " + totalAlloc + " 点の配点）");
         } else {
           fill.style.width = round1((o.votes / maxVotes) * 100) + "%";
           const pct = denom > 0 ? round1((o.votes / denom) * 100) : 0;
