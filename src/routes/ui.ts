@@ -8,7 +8,16 @@ import {
   listTenantOrigins,
   removeTenantOrigin,
 } from "../cors";
-import { listAuditEvents } from "../audit";
+import { actorLabel, listAuditEvents, recordAudit } from "../audit";
+import {
+  clientIpOf,
+  ipMatchesEntries,
+  ipRestrictionAvailable,
+  isAdminIpAllowed,
+  loadIpRestriction,
+  saveIpRestriction,
+  validateIpEntries,
+} from "../ip-restriction";
 import { listQuestionRows } from "../questions";
 import { computeResults, getPollRow, isClosedForVoting, listOptionRows, type PollResults } from "../domain";
 import { issueApiKey, limitKeyRotation, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
@@ -65,6 +74,47 @@ async function requireOwnerUser(
   }
   return user;
 }
+
+/**
+ * Per-workspace admin IP allowlist for the admin UI. Only workspace-scoped
+ * pages are guarded, and only once the visitor is known to be a member of
+ * that workspace (signed-out visitors and non-members keep the usual
+ * redirect behaviour). The login flow itself (/admin/login, /auth/*) is
+ * deliberately outside the restriction: it is account-scoped, happens
+ * before a workspace is chosen, and guarding it could lock an owner out of
+ * every workspace at once. The guard still applies to every workspace page
+ * and action after login.
+ */
+async function adminIpUiGuard(
+  c: Context<{ Bindings: Env; Variables: Variables }>,
+  next: () => Promise<void>,
+): Promise<Response | void> {
+  const tenantId = normalizeUuid(c.req.param("tenantId") ?? "");
+  if (tenantId) {
+    const user = await getSessionUser(c);
+    if (user && (await isTenantMember(c.env, tenantId, user.sub))) {
+      const clientIp = clientIpOf(c);
+      if (!(await isAdminIpAllowed(c.env, tenantId, clientIp))) {
+        return c.html(
+          layout({
+            title: "IP 制限によりアクセスできません",
+            userEmail: user.email ?? user.sub,
+            body: `<h1>このワークスペースは IP 制限が有効です</h1>
+              <p class="lead">現在のアクセス元 IP（<code>${escapeHtml(clientIp || "不明")}</code>）は、このワークスペースの管理画面の許可リストに含まれていません。</p>
+              <p class="muted">許可されたネットワークからアクセスし直してください。許可リストの変更は、許可済み IP からオーナーが設定画面で行えます。</p>
+              <div class="actions"><a class="btn" href="/admin">ワークスペース一覧へ</a></div>`,
+            origin: originOf(c),
+            nonce: c.get("cspNonce") ?? "",
+          }),
+          403,
+        );
+      }
+    }
+  }
+  await next();
+}
+ui.use("/admin/workspaces/:tenantId", adminIpUiGuard);
+ui.use("/admin/workspaces/:tenantId/*", adminIpUiGuard);
 
 /* ------------------------------------------------------------------ */
 /* Landing + workspace list                                            */
@@ -436,7 +486,7 @@ function settingsBody(
   origins: string[],
   error: string | null,
   owner: boolean,
-  extras: { quotas: string; members: string; webhooks: string; branding: string },
+  extras: { quotas: string; members: string; webhooks: string; branding: string; ipRestriction: string },
 ): string {
   const tid = escapeHtml(tenantId);
   const items = origins
@@ -457,6 +507,7 @@ function settingsBody(
     ${extras.members}
     ${extras.webhooks}
     ${extras.branding}
+    ${extras.ipRestriction}
     <p class="lead">${escapeHtml(workspaceName)} の投票を、別のサイトのブラウザから呼ぶときに許可するオリジンです。
     この管理画面と同じオリジンから使う場合は追加不要です。ワイルドカードやパスは使えません。</p>
     ${error ? `<div class="notice bad" role="alert">${escapeHtml(error)}</div>` : ""}
@@ -485,7 +536,67 @@ function settingsBody(
     </section>`;
 }
 
-async function settingsExtras(env: Env, tenantId: string, owner: boolean, nonce = "") {
+async function ipRestrictionSection(
+  env: Env,
+  tenantId: string,
+  owner: boolean,
+  currentIp: string,
+  opts: { warnEntries?: string | null; error?: string | null; entriesText?: string } = {},
+): Promise<string> {
+  const tid = escapeHtml(tenantId);
+  const available = await ipRestrictionAvailable(env);
+  const state = await loadIpRestriction(env, tenantId);
+  const entries = state.kind === "enabled" ? state.entries : [];
+  const shownEntries = opts.entriesText ?? entries.join("\n");
+  const statusLine = state.kind === "error"
+    ? `<div class="notice bad" role="alert">保存されている制限データを復号できませんでした。安全のため、このワークスペースへの管理アクセスは現在すべて拒否されています。</div>`
+    : state.kind === "enabled"
+      ? `<p>状態: <strong>有効</strong>（${entries.length} 件の許可エントリ）。許可リストに含まれない IP からは、このワークスペースの管理画面と管理 API を開けません。投票の公開ページと投票 API には影響しません。</p>`
+      : `<p>状態: <strong>無効</strong>。現在はすべての IP から管理アクセスできます。</p>`;
+  if (!available) {
+    return `<h2>管理画面の IP 制限</h2><section class="section">
+      ${statusLine}
+      <p class="muted">このデプロイでは暗号鍵（IP_LIST_ENCRYPTION_KEY）が未設定のため、IP 制限の設定は利用できません。許可リストは暗号化して保存する設計で、鍵がない環境では機能自体を無効にしています。</p>
+    </section>`;
+  }
+  if (!owner) {
+    return `<h2>管理画面の IP 制限</h2><section class="section">
+      ${statusLine}
+      <p class="muted">IP 制限の変更はオーナーだけが実行できます。許可リストの内容はオーナーにだけ表示されます。</p>
+    </section>`;
+  }
+  const warn = opts.warnEntries != null
+    ? `<div class="notice bad" role="alert">
+        <p><strong>警告: 現在のアクセス元 IP（<code>${escapeHtml(currentIp || "不明")}</code>）は、新しい許可リストに含まれていません。</strong></p>
+        <p>このまま保存すると、この接続からは管理画面と管理 API を開けなくなります。許可リストに現在の IP を追加するか、下の確認にチェックして保存してください。</p>
+      </div>
+      <form method="post" action="/admin/workspaces/${tid}/ip-restriction">
+        <input type="hidden" name="entries" value="${escapeHtml(opts.warnEntries)}">
+        <label class="check"><input type="checkbox" name="confirm_lockout" value="1" required> 現在の IP が含まれていないことを理解し、このまま保存します</label>
+        <div class="actions"><button class="btn danger" type="submit">警告を理解して保存する</button></div>
+      </form>`
+    : "";
+  return `<h2>管理画面の IP 制限</h2><section class="section">
+    ${statusLine}
+    ${opts.error ? `<div class="notice bad" role="alert">${escapeHtml(opts.error)}</div>` : ""}
+    <p class="muted">許可する IP アドレスまたは CIDR を 1 行に 1 件ずつ書きます（IPv4 / IPv6 対応、最大 50 件）。空にして保存すると制限を解除します。リストは暗号化して保存され、平文では残りません。ログイン画面そのものには適用されません（ログイン後、各ワークスペースの画面と API で判定します）。</p>
+    <p>現在のアクセス元 IP: <code>${escapeHtml(currentIp || "不明")}</code></p>
+    <form method="post" action="/admin/workspaces/${tid}/ip-restriction">
+      <label for="ip-entries">許可する IP / CIDR <span class="hint">例: 192.0.2.10 や 198.51.100.0/24、2001:db8::/32。保存時に現在の IP が含まれていない場合は確認を求めます。</span></label>
+      <textarea id="ip-entries" name="entries" rows="6" spellcheck="false" autocapitalize="none" autocomplete="off" placeholder="192.0.2.10&#10;198.51.100.0/24">${escapeHtml(shownEntries)}</textarea>
+      <div class="actions"><button class="btn primary" type="submit">IP 制限を保存する</button></div>
+    </form>
+    ${warn}
+  </section>`;
+}
+
+async function settingsExtras(
+  env: Env,
+  tenantId: string,
+  owner: boolean,
+  nonce = "",
+  ipOpts: { currentIp?: string; warnEntries?: string | null; error?: string | null; entriesText?: string } = {},
+) {
   const quotas = await tenantQuotas(env, tenantId);
   const members = await listMembers(env, tenantId);
   const hooks = await listWebhooks(env, tenantId);
@@ -555,6 +666,7 @@ document.getElementById('branding-form').addEventListener('submit', async (ev) =
 `,
   );
   return {
+    ipRestriction: await ipRestrictionSection(env, tenantId, owner, ipOpts.currentIp ?? "", ipOpts),
     branding: `<h2>ブランド設定</h2><section class="section">
       <p class="muted">公開結果ページと共有用画像に使う、ワークスペースのアクセント色とロゴです。</p>
       ${
@@ -613,7 +725,7 @@ ui.get("/admin/workspaces/:tenantId/settings", async (c) => {
     layout({
       title: "設定",
       userEmail: user.email ?? user.sub,
-      body: settingsBody(tenantId, tenant.name, origins, null, owner, await settingsExtras(c.env, tenantId, owner, c.get("cspNonce") ?? "")),
+      body: settingsBody(tenantId, tenant.name, origins, null, owner, await settingsExtras(c.env, tenantId, owner, c.get("cspNonce") ?? "", { currentIp: clientIpOf(c) })),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }),
@@ -639,7 +751,7 @@ ui.post("/admin/workspaces/:tenantId/origins", async (c) => {
         layout({
           title: "設定",
           userEmail: user.email ?? user.sub,
-          body: settingsBody(tenantId, tenant?.name ?? "", origins, err.message, true, await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "")),
+          body: settingsBody(tenantId, tenant?.name ?? "", origins, err.message, true, await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "", { currentIp: clientIpOf(c) })),
           origin: originOf(c),
           nonce: c.get("cspNonce") ?? "",
         }),
@@ -662,6 +774,78 @@ ui.post("/admin/workspaces/:tenantId/origins/remove", async (c) => {
   return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
 });
 
+ui.post("/admin/workspaces/:tenantId/ip-restriction", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  const entriesText = String(form.get("entries") ?? "");
+  const currentIp = clientIpOf(c);
+  const renderSettings = async (
+    ipOpts: { error?: string | null; warnEntries?: string | null },
+    status: 400,
+  ) => {
+    const tenant = await c.env.DB.prepare("SELECT name FROM tenants WHERE id = ?1")
+      .bind(tenantId)
+      .first<{ name: string }>();
+    const origins = await listTenantOrigins(c.env, tenantId);
+    return c.html(
+      layout({
+        title: "設定",
+        userEmail: user.email ?? user.sub,
+        body: settingsBody(
+          tenantId,
+          tenant?.name ?? "",
+          origins,
+          null,
+          true,
+          await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "", {
+            currentIp,
+            entriesText,
+            ...ipOpts,
+          }),
+        ),
+        origin: originOf(c),
+        nonce: c.get("cspNonce") ?? "",
+      }),
+      status,
+    );
+  };
+  if (!(await ipRestrictionAvailable(c.env))) {
+    return renderSettings(
+      { error: "この環境では暗号鍵が未設定のため、IP 制限を利用できません。" },
+      400,
+    );
+  }
+  let entries: string[];
+  try {
+    entries = validateIpEntries(entriesText.split(/\r?\n/));
+  } catch (err) {
+    if (err instanceof ApiError) return renderSettings({ error: err.message }, 400);
+    throw err;
+  }
+  const confirmed = String(form.get("confirm_lockout") ?? "") === "1";
+  if (
+    entries.length > 0 &&
+    !confirmed &&
+    !(currentIp && ipMatchesEntries(currentIp, entries))
+  ) {
+    // Lockout guard: the submitter's own IP is not on the new list. Do not
+    // save yet; re-render with a strong warning and an explicit confirm.
+    return renderSettings({ warnEntries: entries.join("\n") }, 400);
+  }
+  await saveIpRestriction(c.env, tenantId, entries);
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel({ kind: "session", tenantId, sub: user.sub, role: "owner" }),
+    action: "admin_ip_restriction.update",
+    detail: entries.length > 0 ? `entries=${entries.length}` : "restriction cleared",
+  });
+  return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
+});
+
 ui.post("/admin/workspaces/:tenantId/delete", async (c) => {
   const tenantId = routeTenant(c);
   if (!tenantId) return c.redirect("/admin", 302);
@@ -677,7 +861,7 @@ ui.post("/admin/workspaces/:tenantId/delete", async (c) => {
     return c.html(layout({
       title: "設定",
       userEmail: user.email ?? user.sub,
-      body: settingsBody(tenantId, tenant?.name ?? "", origins, "ワークスペース名が一致しません。", true, await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "")),
+      body: settingsBody(tenantId, tenant?.name ?? "", origins, "ワークスペース名が一致しません。", true, await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "", { currentIp: clientIpOf(c) })),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }), 400);

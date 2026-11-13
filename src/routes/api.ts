@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { deleteAccountData, deleteWorkspace, listMemberships } from "../account";
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
@@ -41,13 +41,40 @@ import {
 } from "../questions";
 import { createObjectStore } from "../platform/objects";
 import { selectAuthProvider } from "../platform";
-import { assertPlainText, assertSameOriginMutation, isSafeImageKey, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
+import { assertPlainText, assertSameOriginMutation, isSafeImageKey, normalizeUuid, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
 import { createWebhook, disableWebhook, dispatchWebhooks, listWebhooks, WEBHOOK_EVENTS, type WebhookEvent } from "../webhooks";
+import {
+  clientIpOf,
+  ipMatchesEntries,
+  ipRestrictionAvailable,
+  isAdminIpAllowed,
+  loadIpRestriction,
+  saveIpRestriction,
+  validateIpEntries,
+} from "../ip-restriction";
 import { qrSvg } from "../qr";
 import { escapeHtml } from "../views";
 import type { Env, OptionRow, PollRow, QuestionRow, TenantRow, Variables } from "../types";
 
 export const api = new Hono<{ Bindings: Env; Variables: Variables }>();
+
+/**
+ * Per-workspace admin IP allowlist, enforced before any tenant-scoped admin
+ * route runs. Only /tenants/:tenantId routes are guarded; the public voting
+ * routes (/polls/*) and account routes (/me) are intentionally outside it.
+ */
+async function adminIpGuard(
+  c: Context<{ Bindings: Env; Variables: Variables }>,
+  next: () => Promise<void>,
+): Promise<void> {
+  const tenantId = normalizeUuid(c.req.param("tenantId") ?? "");
+  if (tenantId && !(await isAdminIpAllowed(c.env, tenantId, clientIpOf(c)))) {
+    throw forbidden("Admin access is not allowed from this IP address");
+  }
+  await next();
+}
+api.use("/tenants/:tenantId", adminIpGuard);
+api.use("/tenants/:tenantId/*", adminIpGuard);
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const IMAGE_TYPES: Record<string, string> = {
@@ -1016,6 +1043,54 @@ api.delete("/tenants/:tenantId/origins", async (c) => {
     detail: raw.slice(0, 200),
   });
   return c.json({ removed: true });
+});
+
+/* Admin IP allowlist (owner only). Entries are stored AES-GCM-encrypted;
+   responses return them only to the workspace owner who manages them. */
+api.get("/tenants/:tenantId/admin-ip-restriction", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read", "owner");
+  const available = await ipRestrictionAvailable(c.env);
+  const state = await loadIpRestriction(c.env, tenantId);
+  return c.json({
+    available,
+    enabled: state.kind === "enabled",
+    entries: state.kind === "enabled" ? state.entries : [],
+    undecryptable: state.kind === "error",
+    current_ip: clientIpOf(c) || null,
+  });
+});
+
+api.put("/tenants/:tenantId/admin-ip-restriction", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
+  if (!(await ipRestrictionAvailable(c.env))) {
+    throw badRequest("IP_LIST_ENCRYPTION_KEY is not configured on this deployment");
+  }
+  const body = await jsonBody(c);
+  const raw = body["entries"];
+  if (!Array.isArray(raw) || raw.some((e) => typeof e !== "string")) {
+    throw badRequest('"entries" must be an array of IP addresses or CIDR ranges');
+  }
+  const entries = validateIpEntries(raw as string[]);
+  const currentIp = clientIpOf(c);
+  if (
+    entries.length > 0 &&
+    body["confirm_lockout"] !== true &&
+    !(currentIp && ipMatchesEntries(currentIp, entries))
+  ) {
+    throw badRequest(
+      "Your current IP address is not in the new allowlist. Resend with \"confirm_lockout\": true to save anyway.",
+    );
+  }
+  await saveIpRestriction(c.env, tenantId, entries);
+  await recordAudit(c.env, {
+    tenantId,
+    actor: actorLabel(admin),
+    action: "admin_ip_restriction.update",
+    detail: entries.length > 0 ? `entries=${entries.length}` : "restriction cleared",
+  });
+  return c.json({ enabled: entries.length > 0, entries });
 });
 
 api.get("/tenants/:tenantId/notifications", async (c) => {

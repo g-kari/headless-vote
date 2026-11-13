@@ -36,6 +36,13 @@ export interface Env {
    */
   VOTER_KEY_SECRET?: string;
   /**
+   * Base64-encoded 32-byte AES-GCM key for the per-workspace admin IP
+   * allowlist (entries are stored encrypted in D1). Set with
+   * `wrangler secret put IP_LIST_ENCRYPTION_KEY`. When unset, the admin IP
+   * restriction feature is disabled.
+   */
+  IP_LIST_ENCRYPTION_KEY?: string;
+  /**
    * Canonical origin of this deployment, for example "https://vote.example.com".
    * Login is rejected on any other host (http localhost is still allowed).
    */

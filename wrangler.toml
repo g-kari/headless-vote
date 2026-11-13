@@ -20,7 +20,9 @@ not_found_handling = "none"
 
 # Identity provider and origin for this deployment (0g0-id).
 # Secrets (SESSION_SECRET and, for confidential clients, OIDC_CLIENT_SECRET)
-# are set with `wrangler secret put` and are not listed here.
+# are set with `wrangler secret put` and are not listed here. The optional
+# IP_LIST_ENCRYPTION_KEY (base64-encoded 32-byte key) enables the
+# per-workspace admin IP allowlist; without it that feature stays disabled.
 [vars]
 AUTH_PROVIDER = "oidc"
 EMAIL_PROVIDER = "outbox"
