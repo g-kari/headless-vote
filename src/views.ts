@@ -207,6 +207,11 @@ input:user-invalid,textarea:user-invalid,select:user-invalid{border-color:var(--
 .q-bulk{margin-top:.8rem}
 .q-bulk label{margin-top:0}
 .q-bulk textarea{margin-top:.3rem}
+.csv-import{border-top:1px solid var(--border);padding-top:1rem;margin-top:1.4rem}
+.csv-import h3{margin:.2rem 0 .4rem}
+.csv-preview{margin-top:.6rem}
+.csv-preview ul{margin:.3rem 0;padding-left:1.2rem}
+.csv-preview li{margin:.15rem 0}
 .question-card .actions{margin-top:1.1rem}
 .opt-preview{max-width:120px;border:1px solid var(--border)}
 /* Print: results pages become a clean report. Navigation and controls are
