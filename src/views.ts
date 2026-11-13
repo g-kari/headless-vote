@@ -1,5 +1,7 @@
 /** Shared HTML shell + styles for the admin UI (server-rendered, no build step). */
 
+import { bestTextOn, readableOnWhite } from "./color";
+
 export function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -236,10 +238,20 @@ export function layout(opts: {
   nonce: string;
   brandColor?: string | null;
 }): string {
-  const brandStyle =
-    opts.brandColor && /^#[0-9a-fA-F]{6}$/.test(opts.brandColor)
-      ? `<style nonce="${escapeHtml(opts.nonce)}">:root{--accent:${opts.brandColor};--accent-strong:${opts.brandColor}}</style>`
-      : "";
+  // The brand color becomes the page accent (result bars, primary buttons).
+  // A very light brand color would paint white bars and white-on-white
+  // buttons in the light scheme, so the light-scheme accent is darkened
+  // until it reads on white; the dark scheme keeps the color as-is (light
+  // colors read fine on the dark background). --on-accent follows whichever
+  // accent it sits on.
+  const brandStyle = (() => {
+    const brand = opts.brandColor;
+    if (!brand || !/^#[0-9a-fA-F]{6}$/.test(brand)) return "";
+    const lightAccent = readableOnWhite(brand);
+    const onLight = bestTextOn(lightAccent, "#ffffff", "#0a1120");
+    const onDark = bestTextOn(brand, "#ffffff", "#0a1120");
+    return `<style nonce="${escapeHtml(opts.nonce)}">:root{--accent:light-dark(${lightAccent},${brand});--accent-strong:light-dark(${lightAccent},${brand});--on-accent:light-dark(${onLight},${onDark})}</style>`;
+  })();
   const userArea = opts.userEmail
     ? `<span class="user">${escapeHtml(opts.userEmail)}</span>
        <a class="btn small" href="/admin/account">アカウント</a>

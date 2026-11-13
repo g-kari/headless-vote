@@ -4,6 +4,7 @@ import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
 import { bearerToken, getSessionUser, optionalVoterIdentity, requireAdmin } from "../auth";
 import { ballotCount, hashVoterKey, upsertBallot } from "../ballots";
+import { bestTextOn, readableOnWhite } from "../color";
 import { addTenantOrigin, listTenantOrigins, isAllowedTenantOrigin, removeTenantOrigin } from "../cors";
 import { randomId } from "../crypto";
 import { resultsToCsv } from "../export";
@@ -90,17 +91,76 @@ function originOf(c: { req: { url: string } }): string {
   return new URL(c.req.url).origin;
 }
 
-/** Split a title into lines of at most `width` characters for share images. */
-function wrapShareText(text: string, width: number, maxLines: number): string[] {
-  const chars = Array.from(text);
-  const lines: string[] = [];
-  for (let i = 0; i < chars.length && lines.length < maxLines; i += width) {
-    lines.push(chars.slice(i, i + width).join(""));
+/**
+ * Estimated glyph advance (px) for share-image text. Full-width scripts
+ * (kana, kanji, hangul, fullwidth forms) advance one em; latin text is
+ * narrower. Counting characters instead of width made long full-width
+ * titles overflow the 1200px canvas (21 chars x 56px > 1060px usable).
+ */
+function shareCharWidth(ch: string, fontSize: number): number {
+  const cp = ch.codePointAt(0) ?? 0;
+  const wide =
+    (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+    (cp >= 0x2e80 && cp <= 0xa4cf) || // CJK radicals, kana, kanji
+    (cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
+    (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
+    (cp >= 0xfe30 && cp <= 0xfe4f) || // CJK compatibility forms
+    (cp >= 0xff00 && cp <= 0xff60) || // fullwidth forms
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    cp === 0x2026 || // ellipsis
+    cp >= 0x20000; // CJK ext. B and later
+  if (wide) return fontSize;
+  if (ch === " ") return fontSize * 0.3;
+  return fontSize * 0.55;
+}
+
+export function shareTextWidth(text: string, fontSize: number): number {
+  let w = 0;
+  for (const ch of text) w += shareCharWidth(ch, fontSize);
+  return w;
+}
+
+/** Split a title into lines that fit `maxWidth` px at `fontSize` for share images. */
+export function wrapShareText(
+  text: string,
+  maxWidth: number,
+  fontSize: number,
+  maxLines: number,
+): string[] {
+  const clean = text.replace(/[\r\n]+/g, " ");
+  const all: string[] = [];
+  let line = "";
+  let lineWidth = 0;
+  for (const ch of clean) {
+    const w = shareCharWidth(ch, fontSize);
+    if (line.length > 0 && lineWidth + w > maxWidth) {
+      all.push(line);
+      line = "";
+      lineWidth = 0;
+    }
+    line += ch;
+    lineWidth += w;
   }
-  if (chars.length > width * maxLines && lines.length > 0) {
-    lines[lines.length - 1] = `${lines[lines.length - 1]?.slice(0, width - 1)}…`;
+  if (line.length > 0 || all.length === 0) all.push(line);
+  if (all.length <= maxLines) return all;
+  const kept = all.slice(0, maxLines);
+  let last = kept[maxLines - 1] ?? "";
+  while (last.length > 0 && shareTextWidth(`${last}…`, fontSize) > maxWidth) {
+    last = Array.from(last).slice(0, -1).join("");
   }
-  return lines.length > 0 ? lines : [""];
+  kept[maxLines - 1] = `${last}…`;
+  return kept;
+}
+
+/** Truncate a share-image label with an ellipsis so it fits `maxWidth` px. */
+function fitShareLabel(label: string, fontSize: number, maxWidth: number): string {
+  if (shareTextWidth(label, fontSize) <= maxWidth) return label;
+  let out = "";
+  for (const ch of label) {
+    if (shareTextWidth(`${out}${ch}…`, fontSize) > maxWidth) break;
+    out += ch;
+  }
+  return `${out}…`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1008,32 +1068,50 @@ api.get("/polls/:pollId/og.svg", async (c) => {
     .bind(poll.tenant_id)
     .first<{ brand_color: string | null }>();
   const color = tenant?.brand_color ?? "#1e4fd8";
+  // The band is painted in the free-form brand color while the title used to
+  // be hard-coded white: a light brand color (e.g. #ffffff) made the band
+  // and title vanish into the white canvas. Pick the title color by
+  // contrast against the band, and darken the bar color enough to stay
+  // visible on white.
+  const titleColor = bestTextOn(color);
+  const barColor = readableOnWhite(color);
+  const questionLines = wrapShareText(poll.question, 1060, 56, 3);
+  const bandHeight = 110 + questionLines.length * 72;
   const visible = canViewPublicResults(poll);
   let detail = "";
   if (visible) {
     const results = await computeResults(c.env, originOf(c), poll);
     const first = results.questions[0];
-    const bars = (first?.options ?? []).slice(0, 4);
+    const allBars = (first?.options ?? []).slice(0, 4);
+    // Rows start below the band; with a 3-line title the band reaches y=326,
+    // so starting at the old fixed y=330 overlapped it and 4 rows would run
+    // into the footer. Shift down and drop rows that no longer fit.
+    const rowsTop = Math.max(330, bandHeight + 76);
+    const maxRows = Math.max(
+      1,
+      Math.min(allBars.length, Math.floor((556 - 30 - rowsTop) / 62) + 1),
+    );
+    const bars = allBars.slice(0, maxRows);
     const denom = Math.max(1, bars.reduce((sum, o) => sum + o.votes, 0));
     detail =
       bars
         .map((o, i) => {
           const w = Math.round((o.votes / denom) * 560);
-          return `<text x="70" y="${330 + i * 62}" font-size="30" fill="#222222">${escapeHtml(o.label)}</text><rect x="70" y="${342 + i * 62}" width="${w}" height="18" fill="${color}"/><text x="${86 + w}" y="${360 + i * 62}" font-size="26" fill="#222222">${o.votes}</text>`;
+          const label = fitShareLabel(o.label, 30, 1060);
+          return `<text x="70" y="${rowsTop + i * 62}" font-size="30" fill="#222222">${escapeHtml(label)}</text><rect x="70" y="${rowsTop + 12 + i * 62}" width="${w}" height="18" fill="${barColor}"/><text x="${86 + w}" y="${rowsTop + 30 + i * 62}" font-size="26" fill="#222222">${o.votes}</text>`;
         })
         .join("") +
       `<text x="70" y="600" font-size="26" fill="#555555">投票者数 ${results.total_voters} 人</text>`;
   } else {
-    detail = `<text x="70" y="360" font-size="34" fill="#222222">結果は締切後に公開されます</text>`;
+    detail = `<text x="70" y="${Math.max(360, bandHeight + 76)}" font-size="34" fill="#222222">結果は締切後に公開されます</text>`;
   }
-  const questionLines = wrapShareText(poll.question, 21, 3);
   const titleSvg = questionLines
     .map(
       (line, i) =>
-        `<text x="70" y="${150 + i * 72}" font-size="56" font-weight="bold" fill="#ffffff">${escapeHtml(line)}</text>`,
+        `<text x="70" y="${150 + i * 72}" font-size="56" font-weight="bold" fill="${titleColor}">${escapeHtml(line)}</text>`,
     )
     .join("");
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630"><rect width="1200" height="630" fill="#ffffff"/><rect width="1200" height="${110 + questionLines.length * 72}" fill="${color}"/>${titleSvg}${detail}<text x="1130" y="600" font-size="24" fill="#555555" text-anchor="end">Hyo</text></svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630"><rect width="1200" height="630" fill="#ffffff"/><rect width="1200" height="${bandHeight}" fill="${color}"/>${titleSvg}${detail}<text x="1130" y="600" font-size="24" fill="#555555" text-anchor="end">Hyo</text></svg>`;
   c.header("content-type", "image/svg+xml");
   c.header("cache-control", "public, max-age=300");
   return c.body(svg);
