@@ -77,6 +77,7 @@ ui.get("/", async (c) => {
     <p class="lead">投票の作成・公開・集計を行うサービスです。管理画面と API の両方から、同じ投票を操作できます。</p>
     <div class="actions">
       <a class="btn primary" href="/admin">管理画面を開く</a>
+      <a class="btn" href="/docs">API 仕様書</a>
       <a class="btn" href="/api/v1/health">API の状態を見る</a>
     </div>
     <h2>処理の流れ</h2>
@@ -197,6 +198,20 @@ function statusBadge(status: PollRow["status"]): string {
   return `<span class="badge ${status}">${label}</span>`;
 }
 
+ui.post("/admin/workspaces/:tenantId/notifications/:notificationId/read", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireMember(c, tenantId);
+  if (!user) return c.redirect("/admin", 302);
+  assertSameOriginMutation(c);
+  await c.env.DB.prepare(
+    "UPDATE app_notifications SET read_at = ?1 WHERE id = ?2 AND tenant_id = ?3 AND read_at IS NULL",
+  )
+    .bind(new Date().toISOString(), c.req.param("notificationId"), tenantId)
+    .run();
+  return c.redirect(`/admin/workspaces/${tenantId}`, 302);
+});
+
 ui.get("/admin/workspaces/:tenantId", async (c) => {
   const tenantId = routeTenant(c);
   if (!tenantId) return c.redirect("/admin", 302);
@@ -212,6 +227,18 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
     .bind(tenantId)
     .all<PollRow>();
   const role = await memberRole(c.env, tenantId, user.sub);
+  const notifications = await c.env.DB.prepare(
+    "SELECT id, message, created_at, read_at FROM app_notifications WHERE tenant_id = ?1 ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 10",
+  )
+    .bind(tenantId)
+    .all<{ id: string; message: string; created_at: string; read_at: string | null }>();
+  const notificationItems = notifications.results
+    .map(
+      (n) => `<li>${n.read_at ? "" : '<span class="badge published">未読</span> '}${escapeHtml(n.message)} <span class="muted small">${escapeHtml(n.created_at)}</span>
+        ${n.read_at ? "" : `<form method="post" action="/admin/workspaces/${escapeHtml(tenantId)}/notifications/${escapeHtml(n.id)}/read" style="display:inline"><button class="btn small" type="submit">既読にする</button></form>`}
+      </li>`,
+    )
+    .join("");
   const quotas = await tenantQuotas(c.env, tenantId);
   const keys = await listApiKeys(c.env, tenantId);
   const keyItems = keys
@@ -242,6 +269,10 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
       <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/settings">設定</a>
       <a class="btn" href="/admin/workspaces/${escapeHtml(tenantId)}/audit">操作履歴</a>
     </div>
+    ${notificationItems ? `<h2>通知</h2>
+    <section class="section">
+      <ul>${notificationItems}</ul>
+    </section>` : ""}
     <h2>投票一覧</h2>
     <section class="section">
       ${rows ? `<div class="table-wrapper" tabindex="0" role="region" aria-label="投票一覧"><table><thead><tr><th scope="col">設問</th><th scope="col">状態</th><th scope="col">設定</th><th scope="col">締切</th><th scope="col"><span class="muted">操作</span></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">まだ投票がありません。</p>'}
@@ -404,7 +435,7 @@ function settingsBody(
   origins: string[],
   error: string | null,
   owner: boolean,
-  extras: { quotas: string; members: string; webhooks: string },
+  extras: { quotas: string; members: string; webhooks: string; branding: string },
 ): string {
   const tid = escapeHtml(tenantId);
   const items = origins
@@ -424,6 +455,7 @@ function settingsBody(
     ${extras.quotas}
     ${extras.members}
     ${extras.webhooks}
+    ${extras.branding}
     <p class="lead">${escapeHtml(workspaceName)} の投票を、別のサイトのブラウザから呼ぶときに許可するオリジンです。
     この管理画面と同じオリジンから使う場合は追加不要です。ワイルドカードやパスは使えません。</p>
     ${error ? `<div class="notice bad" role="alert">${escapeHtml(error)}</div>` : ""}
@@ -452,7 +484,7 @@ function settingsBody(
     </section>`;
 }
 
-async function settingsExtras(env: Env, tenantId: string, owner: boolean) {
+async function settingsExtras(env: Env, tenantId: string, owner: boolean, nonce = "") {
   const quotas = await tenantQuotas(env, tenantId);
   const members = await listMembers(env, tenantId);
   const hooks = await listWebhooks(env, tenantId);
@@ -473,7 +505,75 @@ async function settingsExtras(env: Env, tenantId: string, owner: boolean) {
   const hookItems = hooks
     .map((hook) => `<li><code>${escapeHtml(hook.url)}</code> ${hook.events.map((event) => escapeHtml(event)).join(", ")} ${hook.disabled_at ? '<span class="badge closed">停止</span>' : owner ? `<form method="post" action="/admin/workspaces/${tid}/webhooks/disable" style="display:inline"><input type="hidden" name="webhook_id" value="${escapeHtml(hook.id)}"><button class="btn small" type="submit">停止</button></form>` : ""}</li>`)
     .join("");
+  const brand = await env.DB.prepare(
+    "SELECT brand_color, brand_logo_key FROM tenants WHERE id = ?1",
+  )
+    .bind(tenantId)
+    .first<{ brand_color: string | null; brand_logo_key: string | null }>();
+  const brandingScript = scriptTag(
+    nonce,
+    `
+const TID = ${JSON.stringify(tenantId)};
+document.getElementById('branding-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const status = document.getElementById('branding-status');
+  status.textContent = '保存しています';
+  try {
+    let logoKey = document.getElementById('brand-logo-key').value || null;
+    const file = document.getElementById('brand-logo-file').files[0];
+    if (file) {
+      const res = await fetch('/api/v1/tenants/' + TID + '/images', {
+        method: 'POST',
+        headers: { 'content-type': file.type },
+        body: file,
+        credentials: 'same-origin',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((data.error && data.error.message) || 'ロゴのアップロードに失敗しました');
+      logoKey = data.key;
+    }
+    if (document.getElementById('brand-logo-clear').checked) logoKey = null;
+    const colorValue = document.getElementById('brand-color').value;
+    const body = {
+      brand_color: document.getElementById('brand-color-clear').checked ? null : colorValue,
+      brand_logo_key: logoKey,
+    };
+    const res = await fetch('/api/v1/tenants/' + TID + '/branding', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      credentials: 'same-origin',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((data.error && data.error.message) || '保存に失敗しました');
+    status.textContent = '保存しました';
+  } catch (e) {
+    status.textContent = e.message || String(e);
+  }
+});
+`,
+  );
   return {
+    branding: `<h2>ブランド設定</h2><section class="section">
+      <p class="muted">公開結果ページと共有用画像に使う、ワークスペースのアクセント色とロゴです。</p>
+      ${
+        owner
+          ? `<form id="branding-form">
+        <label for="brand-color">アクセント色</label>
+        <input id="brand-color" type="color" value="${escapeHtml(brand?.brand_color ?? "#1e4fd8")}">
+        <label class="check"><input id="brand-color-clear" type="checkbox"> 色を未設定に戻す</label>
+        <label for="brand-logo-file">ロゴ画像 <span class="hint">PNG / JPEG / WebP / GIF、5 MiB まで。選ばなければ現在のロゴを維持します。</span></label>
+        ${brand?.brand_logo_key ? `<p><img src="/images/${escapeHtml(brand.brand_logo_key)}" alt="現在のロゴ" style="max-height:64px"></p>` : ""}
+        <input id="brand-logo-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+        <input type="hidden" id="brand-logo-key" value="${escapeHtml(brand?.brand_logo_key ?? "")}">
+        <label class="check"><input id="brand-logo-clear" type="checkbox"> ロゴを外す</label>
+        <div class="actions"><button class="btn" type="submit">ブランド設定を保存</button></div>
+        <p class="muted small" id="branding-status" role="status"></p>
+      </form>
+      ${brandingScript}`
+          : `<p class="muted">ブランド設定の変更はオーナーだけが実行できます。</p>`
+      }
+    </section>`,
     quotas: `<h2>利用上限</h2><section class="section"><p>プラン <strong>${escapeHtml(quotas.plan)}</strong>。投票 ${quotas.polls} 件、有効な API キー ${quotas.keys} 個、Webhook ${quotas.webhooks} 件、1 日の投票送信 ${quotas.votesPerDay} 件まで。上限はワークスペースに保存され、自分では引き上げられません。</p></section>`,
     members: `<h2>メンバー</h2><section class="section">${memberItems ? `<ul>${memberItems}</ul>` : `<p class="muted">メンバーはいません。</p>`}
       ${owner ? `<form method="post" action="/admin/workspaces/${tid}/members" aria-labelledby="member-heading">
@@ -512,7 +612,7 @@ ui.get("/admin/workspaces/:tenantId/settings", async (c) => {
     layout({
       title: "設定",
       userEmail: user.email ?? user.sub,
-      body: settingsBody(tenantId, tenant.name, origins, null, owner, await settingsExtras(c.env, tenantId, owner)),
+      body: settingsBody(tenantId, tenant.name, origins, null, owner, await settingsExtras(c.env, tenantId, owner, c.get("cspNonce") ?? "")),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }),
@@ -538,7 +638,7 @@ ui.post("/admin/workspaces/:tenantId/origins", async (c) => {
         layout({
           title: "設定",
           userEmail: user.email ?? user.sub,
-          body: settingsBody(tenantId, tenant?.name ?? "", origins, err.message, true, await settingsExtras(c.env, tenantId, true)),
+          body: settingsBody(tenantId, tenant?.name ?? "", origins, err.message, true, await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "")),
           origin: originOf(c),
           nonce: c.get("cspNonce") ?? "",
         }),
@@ -576,7 +676,7 @@ ui.post("/admin/workspaces/:tenantId/delete", async (c) => {
     return c.html(layout({
       title: "設定",
       userEmail: user.email ?? user.sub,
-      body: settingsBody(tenantId, tenant?.name ?? "", origins, "ワークスペース名が一致しません。", true, await settingsExtras(c.env, tenantId, true)),
+      body: settingsBody(tenantId, tenant?.name ?? "", origins, "ワークスペース名が一致しません。", true, await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "")),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }), 400);
@@ -1296,7 +1396,22 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
     <section class="section">
       <p class="small">投票の取得: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}</code><br>
       投票の実行: <code>POST ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/vote</code><br>
-      結果の取得: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/results</code></p>
+      結果の取得: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/results</code><br>
+      自分の票の確認: <code>GET ${escapeHtml(origin)}/api/v1/polls/${escapeHtml(poll.id)}/ballot?voter_token=...</code></p>
+    </section>
+    ${poll.status === "draft" ? "" : `<h2>共有</h2>
+    <section class="section">
+      <p class="small">結果ページ: <a href="/polls/${escapeHtml(poll.id)}/results-page">${escapeHtml(origin)}/polls/${escapeHtml(poll.id)}/results-page</a></p>
+      <div class="poll-head">
+        <img src="/api/v1/polls/${escapeHtml(poll.id)}/qr.svg" alt="結果ページへの QR コード" width="180" height="180">
+        <div>
+          <p class="muted small">QR コードは結果ページへのリンクです。共有用画像はワークスペースのブランド色で生成されます。</p>
+          <p><a class="btn" href="/api/v1/polls/${escapeHtml(poll.id)}/og.svg">共有用画像（SVG）を開く</a></p>
+        </div>
+      </div>
+    </section>`}
+    <section class="section">
+      <p class="small">埋め込みや API の使い方は <a href="/docs">API 仕様書</a> にまとまっています。</p>
       ${poll.status === "draft" ? "" : `<h3>埋め込み用スニペット</h3>
       <p class="muted small">別サイトから呼ぶときは、そのオリジンを設定画面の許可リストに追加してください。開始前は POLL_NOT_OPEN、締切後は POLL_CLOSED が返ります。</p>
       <div class="copyable">
@@ -1307,13 +1422,19 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId", async (c) => {
         <pre id="embed-snippet" tabindex="0">${escapeHtml(`const pollId = "${poll.id}";
 const base = "${origin}";
 const poll = await fetch(base + "/api/v1/polls/" + pollId).then((r) => r.json());
-const answers = poll.poll.questions.map((q) => q.kind === "text"
-  ? { question_id: q.id, text: "" }
-  : { question_id: q.id, option_ids: [q.options[0].id] });
+const answers = poll.poll.questions.map((q) => {
+  if (q.kind === "text") return { question_id: q.id, text: "" };
+  if (q.kind === "score") return { question_id: q.id, scores: Object.fromEntries(q.options.map((o) => [o.id, 0])) };
+  return { question_id: q.id, option_ids: [q.options[0].id] };
+});
 await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
   method: "POST",
   headers: { "content-type": "application/json" },
-  body: JSON.stringify({ voter_token: "stable-id-for-this-voter", answers }),
+  body: JSON.stringify({
+    voter_token: "stable-id-for-this-voter",
+    ...(poll.poll.confirm_required ? { confirm: true } : {}),
+    answers,
+  }),
 });`)}</pre>
       </div>
       ${scriptTag(nonce, `
@@ -1473,6 +1594,121 @@ function resultsSections(results: PollResults, poll: PollRow): string {
 }
 
 
+
+ui.get("/docs", async (c) => {
+  const origin = originOf(c);
+  const nonce = c.get("cspNonce") ?? "";
+  const user = await getSessionUser(c);
+  const body = `
+    <h1>API 仕様書</h1>
+    <p class="lead">headless-vote の公開 API と管理 API の使い方です。ベース URL は <code>${escapeHtml(origin)}</code>、形式は JSON です。</p>
+    <h2>認証</h2>
+    <section class="section">
+      <p>管理 API は次のどちらかで認証します。</p>
+      <ul>
+        <li>API キー: <code>Authorization: Bearer hv_...</code>。キーはワークスペース作成時に発行され、<code>read</code>（参照・書き出し）と <code>write</code>（作成・更新・失効）の 2 つの権限があります。キーの追加発行・失効・ローテーションは管理 API と設定画面から行えます。</li>
+        <li>管理画面のログインセッション（Cookie）。画面と同じ操作を fetch で呼べます。</li>
+      </ul>
+      <p>公開 API（投票の取得・投票・結果・自分の票・QR・共有画像）は認証不要です。投票にログインが必須の投票では、投票だけログインセッションが必要です。</p>
+    </section>
+    <h2>公開 API</h2>
+    <section class="section">
+      <ul>
+        <li><code>GET /api/v1/polls/:pollId</code> — 投票と設問（形式・表示条件を含む）を取得</li>
+        <li><code>POST /api/v1/polls/:pollId/vote</code> — 投票する（下の形式）</li>
+        <li><code>GET /api/v1/polls/:pollId/results</code> — 設問ごとの集計。公開範囲が「締切後」や「非公開」の投票では 403</li>
+        <li><code>GET /api/v1/polls/:pollId/ballot?voter_token=...</code> — 自分の票の控えと変更可否</li>
+        <li><code>GET /api/v1/polls/:pollId/qr.svg</code> — 結果ページへの QR コード（SVG）</li>
+        <li><code>GET /api/v1/polls/:pollId/og.svg</code> — 共有用画像（SVG、ブランド色を反映）</li>
+        <li><code>GET /polls/:pollId/results-page</code> — 人間向けの結果ページ（10 秒ごとに自動更新）</li>
+      </ul>
+      <h3>投票のリクエスト</h3>
+      <pre>${escapeHtml(`POST /api/v1/polls/<pollId>/vote
+{
+  "voter_token": "stable-id-for-this-voter",
+  "answers": [
+    { "question_id": "<id>", "option_ids": ["<option id>"] },
+    { "question_id": "<id>", "text": "自由記述の回答" },
+    { "question_id": "<id>", "scores": { "<option id>": 5 } }
+  ]
+}`)}</pre>
+      <p class="muted small">voter_token は投票者を識別する安定した文字列（8〜128 文字）で、同じトークンの再投票は前の票を上書きします。設問の形式は single（1 つだけ）、multiple（複数可）、text（自由記述）、ranking（option_ids の並びが順位）、score（選択肢ごとに 0〜5 点）です。表示条件（show_if）が付いた設問は、条件を満たさない回答では送らなくて構いません。確認ステップ必須の投票では <code>confirm: true</code> が必要です。</p>
+    </section>
+    <h2>管理 API</h2>
+    <section class="section">
+      <ul>
+        <li><code>POST /api/v1/tenants</code> — ワークスペース作成（API キーを返す）</li>
+        <li><code>POST /api/v1/tenants/:id/polls</code> — 投票作成（questions 配列で複数設問、最大 20 問）</li>
+        <li><code>PATCH /api/v1/tenants/:id/polls/:pollId</code> — 投票の編集</li>
+        <li><code>POST /api/v1/tenants/:id/polls/:pollId/status</code> — 公開・締切（published / closed）</li>
+        <li><code>POST /api/v1/tenants/:id/polls/:pollId/duplicate</code> — 投票の複製（下書きとして）</li>
+        <li><code>GET /api/v1/tenants/:id/polls/:pollId/results</code> — 管理用の集計</li>
+        <li><code>GET /api/v1/tenants/:id/polls/:pollId/export?format=csv|json</code> — 書き出し</li>
+        <li><code>GET /api/v1/tenants/:id/polls/:pollId/analytics</code> — 日別の投票推移</li>
+        <li><code>POST /api/v1/tenants/:id/templates</code> / <code>GET /api/v1/tenants/:id/templates</code> / <code>POST /api/v1/tenants/:id/templates/:templateId/polls</code> / <code>DELETE /api/v1/tenants/:id/templates/:templateId</code> — テンプレート</li>
+        <li><code>GET /api/v1/tenants/:id/api-keys</code>、<code>POST</code>、<code>POST /api/v1/tenants/:id/api-keys/:keyId/revoke</code>、<code>POST /api/v1/tenants/:id/rotate-key</code> — キー管理</li>
+        <li><code>PATCH /api/v1/tenants/:id/branding</code> — ブランド色とロゴ（オーナー）</li>
+        <li><code>GET /api/v1/tenants/:id/notifications</code>、<code>POST /api/v1/tenants/:id/notifications/:notificationId/read</code> — 通知</li>
+        <li><code>GET /api/v1/tenants/:id/audit</code> — 操作履歴</li>
+        <li><code>GET /api/v1/tenants/:id/export</code> — ワークスペースの書き出し</li>
+      </ul>
+      <h3>サンプル（JavaScript）</h3>
+      <pre>${escapeHtml(`const base = "${origin}";
+const key = "hv_..."; // write キー
+const created = await fetch(base + "/api/v1/tenants/<tenantId>/polls", {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: "Bearer " + key },
+  body: JSON.stringify({
+    question: "好きな季節は？",
+    questions: [
+      { prompt: "季節", kind: "single", options: [{ label: "春" }, { label: "夏" }, { label: "秋" }, { label: "冬" }] },
+      { prompt: "理由", kind: "text", required: false },
+    ],
+  }),
+}).then((r) => r.json());`)}</pre>
+    </section>
+    <h2>Webhook</h2>
+    <section class="section">
+      <p>イベントは <code>vote.cast</code>、<code>poll.published</code>、<code>poll.closed</code>、<code>poll.updated</code>、<code>poll.closing_soon</code>（締切 48 時間以内に 1 回）です。本文は JSON（<code>id</code>、<code>type</code>、<code>created_at</code>、<code>tenant_id</code>、<code>data</code>）で、ヘッダー <code>X-Headless-Vote-Event</code> と署名 <code>X-Headless-Vote-Signature: v1=&lt;hex&gt;</code>（本文全体の HMAC-SHA256）が付きます。検証サンプル:</p>
+      <pre>${escapeHtml(`import { createHmac, timingSafeEqual } from "node:crypto";
+
+function verify(secret, rawBody, signatureHeader) {
+  const expected = "v1=" + createHmac("sha256", secret)
+    .update(rawBody)
+    .digest("hex");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signatureHeader);
+  return a.length === b.length && timingSafeEqual(a, b);
+}`)}</pre>
+      <p class="muted small">配送結果（HTTP ステータス）はサーバ側に記録されます。本文の <code>id</code> がイベントごとの一意な ID なので、受け側での重複判定に使えます。URL は公開前に検証され、プライベートアドレス宛ては送られません。</p>
+    </section>
+    <h2>埋め込みと CORS</h2>
+    <section class="section">
+      <p>別サイトのブラウザから公開 API を読む場合は、そのオリジンをワークスペース設定の許可リストに追加してください。各投票の管理画面に、設問形式に応じた埋め込み用スニペットを用意しています。</p>
+    </section>
+    <h2>主なエラーコード</h2>
+    <section class="section">
+      <ul>
+        <li><code>POLL_NOT_OPEN</code>（409）— 開始日時より前</li>
+        <li><code>POLL_CLOSED</code>（409）— 締切済み</li>
+        <li><code>CONFIRM_REQUIRED</code>（409）— 確認ステップ必須の投票で confirm が無い</li>
+        <li><code>LOGIN_REQUIRED</code>（401）— ログイン必須の投票</li>
+        <li><code>OPTIONS_LOCKED</code>（409）— 投票が入った後の設問・選択肢の構造変更</li>
+        <li><code>QUOTA_EXCEEDED</code>（409）— 件数や 1 日の上限</li>
+        <li><code>RATE_LIMITED</code>（429）— 短時間の大量リクエスト</li>
+      </ul>
+    </section>`;
+  return c.html(
+    layout({
+      title: "API 仕様書",
+      userEmail: user?.email ?? user?.sub ?? null,
+      body,
+      origin,
+      nonce,
+    }),
+  );
+});
+
 ui.get("/polls/:pollId/results-page", async (c) => {
   const pollId = normalizeUuid(c.req.param("pollId"));
   const nonce = c.get("cspNonce") ?? "";
@@ -1523,6 +1759,11 @@ ui.get("/polls/:pollId/results-page", async (c) => {
   }
   const results = await computeResults(c.env, origin, poll);
   const sections = resultsSections(results, poll);
+  const brand = await c.env.DB.prepare(
+    "SELECT brand_color, brand_logo_key FROM tenants WHERE id = ?1",
+  )
+    .bind(poll.tenant_id)
+    .first<{ brand_color: string | null; brand_logo_key: string | null }>();
   const refreshScript = scriptTag(
     nonce,
     `
@@ -1540,6 +1781,7 @@ setInterval(async () => {
 `,
   );
   const body = `
+    ${brand?.brand_logo_key ? `<p><img src="/images/${escapeHtml(brand.brand_logo_key)}" alt="ワークスペースのロゴ" style="max-height:64px"></p>` : ""}
     <h1>${escapeHtml(poll.question)}</h1>
     <p class="muted small">投票者数 ${results.total_voters} 人 ／ 総票数 ${results.total_votes} 票${poll.closes_at ? ` ／ 締切 ${escapeHtml(poll.closes_at)}` : ""} ／ 10秒ごとに自動更新</p>
     <section class="section">
@@ -1547,7 +1789,14 @@ setInterval(async () => {
     </section>
     ${refreshScript}`;
   return c.html(
-    layout({ title: `結果: ${poll.question}`, userEmail: "", body, origin, nonce }),
+    layout({
+      title: `結果: ${poll.question}`,
+      userEmail: "",
+      body,
+      origin,
+      nonce,
+      brandColor: brand?.brand_color ?? null,
+    }),
   );
 });
 

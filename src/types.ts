@@ -55,6 +55,8 @@ export interface TenantRow {
   name: string;
   api_key_hash: string;
   created_at: string;
+  brand_color: string | null;
+  brand_logo_key: string | null;
 }
 
 export interface PollRow {

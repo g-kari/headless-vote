@@ -12,8 +12,30 @@ CREATE TABLE IF NOT EXISTS tenants (
   quota_polls INTEGER NOT NULL DEFAULT 100,
   quota_keys INTEGER NOT NULL DEFAULT 10,
   quota_webhooks INTEGER NOT NULL DEFAULT 5,
-  quota_votes_per_day INTEGER NOT NULL DEFAULT 5000
+  quota_votes_per_day INTEGER NOT NULL DEFAULT 5000,
+  brand_color TEXT,
+  brand_logo_key TEXT
 );
+
+CREATE TABLE IF NOT EXISTS poll_templates (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_poll_templates_tenant ON poll_templates(tenant_id);
+
+CREATE TABLE IF NOT EXISTS app_notifications (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  poll_id TEXT,
+  kind TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  read_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_app_notifications_tenant ON app_notifications(tenant_id, read_at);
 
 CREATE TABLE IF NOT EXISTS tenant_members (
   tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,

@@ -3,7 +3,7 @@ import { deleteAccountData, deleteWorkspace, listMemberships } from "../account"
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
 import { bearerToken, getSessionUser, optionalVoterSub, requireAdmin } from "../auth";
-import { ballotCount, deleteBallot, upsertBallot } from "../ballots";
+import { ballotCount, deleteBallot, hashVoterKey, upsertBallot } from "../ballots";
 import { addTenantOrigin, listTenantOrigins, isAllowedTenantOrigin, removeTenantOrigin } from "../cors";
 import { randomId, sha256Hex } from "../crypto";
 import { resultsToCsv } from "../export";
@@ -30,6 +30,7 @@ import {
   ballotDocument,
   legacyQuestion,
   listQuestionRows,
+  parseBallotDocument,
   parseQuestions,
   replaceQuestionStatements,
   resolveAnswers,
@@ -40,7 +41,9 @@ import { createObjectStore } from "../platform/objects";
 import { selectAuthProvider } from "../platform";
 import { assertPlainText, assertSameOriginMutation, isSafeImageKey, rateLimitByIp, readBodyLimited, sniffImage } from "../security";
 import { createWebhook, disableWebhook, dispatchWebhooks, listWebhooks, WEBHOOK_EVENTS, type WebhookEvent } from "../webhooks";
-import type { Env, OptionRow, PollRow, TenantRow, Variables } from "../types";
+import { qrSvg } from "../qr";
+import { escapeHtml } from "../views";
+import type { Env, OptionRow, PollRow, QuestionRow, TenantRow, Variables } from "../types";
 
 export const api = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -54,6 +57,19 @@ const IMAGE_TYPES: Record<string, string> = {
 
 function originOf(c: { req: { url: string } }): string {
   return new URL(c.req.url).origin;
+}
+
+/** Split a title into lines of at most `width` characters for share images. */
+function wrapShareText(text: string, width: number, maxLines: number): string[] {
+  const chars = Array.from(text);
+  const lines: string[] = [];
+  for (let i = 0; i < chars.length && lines.length < maxLines; i += width) {
+    lines.push(chars.slice(i, i + width).join(""));
+  }
+  if (chars.length > width * maxLines && lines.length > 0) {
+    lines[lines.length - 1] = `${lines[lines.length - 1]?.slice(0, width - 1)}…`;
+  }
+  return lines.length > 0 ? lines : [""];
 }
 
 /* ------------------------------------------------------------------ */
@@ -203,8 +219,54 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const ipSingleVote = optBool(body, "ip_single_vote");
   const confirmRequired = optBool(body, "confirm_required");
   const questions = await questionInputsFromBody(c, tenantId, body, question, allowMultiple);
-  const firstChoice = questions.find((q) => q.kind !== "text");
-  const multiple = firstChoice ? firstChoice.kind === "multiple" : allowMultiple;
+  const poll = await createPollRecord(
+    c,
+    tenantId,
+    {
+      question,
+      description,
+      image_key: imageKey,
+      require_login: requireLogin,
+      results_visibility: resultsVisibility,
+      ip_single_vote: ipSingleVote,
+      confirm_required: confirmRequired,
+      opens_at: opensAt,
+      closes_at: closesAt,
+      allow_multiple_fallback: allowMultiple,
+      questions,
+    },
+    admin,
+    "poll.create",
+  );
+  return c.json({ poll: await renderPoll(c, poll) }, 201);
+});
+
+interface PollSpec {
+  question: string;
+  description: string;
+  image_key: string | null;
+  require_login: boolean;
+  results_visibility: string;
+  ip_single_vote: boolean;
+  confirm_required: boolean;
+  opens_at: string | null;
+  closes_at: string | null;
+  allow_multiple_fallback: boolean;
+  questions: QuestionInput[];
+}
+
+type Admin = Awaited<ReturnType<typeof requireAdmin>>;
+
+/** Shared poll creation for the create endpoint, duplication, and templates. */
+async function createPollRecord(
+  c: { env: Env },
+  tenantId: string,
+  spec: PollSpec,
+  admin: Admin,
+  auditAction: string,
+): Promise<PollRow> {
+  const firstChoice = spec.questions.find((q) => q.kind !== "text");
+  const multiple = firstChoice ? firstChoice.kind === "multiple" : spec.allow_multiple_fallback;
   const quotas = await tenantQuotas(c.env, tenantId);
   const existingPolls = await c.env.DB.prepare(
     "SELECT COUNT(*) AS n FROM polls WHERE tenant_id = ?1",
@@ -214,7 +276,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   if (Number(existingPolls?.n ?? 0) >= quotas.polls) {
     throw conflict("QUOTA_EXCEEDED", `A workspace can have at most ${quotas.polls} polls`);
   }
-  await assertImageKeyBelongsToTenant(c.env, tenantId, imageKey);
+  await assertImageKeyBelongsToTenant(c.env, tenantId, spec.image_key);
   const pollId = randomId();
   const now = nowIso();
   const revision = randomId();
@@ -223,33 +285,222 @@ api.post("/tenants/:tenantId/polls", async (c) => {
      SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?12, ?13, ?14, ?10, ?10, ?11
      WHERE (SELECT COUNT(*) FROM polls WHERE tenant_id = ?2) <
        (SELECT quota_polls FROM tenants WHERE id = ?2)`,
-  )
-    .bind(
-      pollId,
-      tenantId,
-      question,
-      description,
-      imageKey,
-      multiple ? 1 : 0,
-      requireLogin ? 1 : 0,
-      opensAt,
-      closesAt,
-      now,
-      revision,
-      resultsVisibility,
-      ipSingleVote ? 1 : 0,
-      confirmRequired ? 1 : 0,
-    );
-  const [created] = await c.env.DB.batch([insertPoll, ...replaceQuestionStatements(c.env, pollId, questions, revision)]);
+  ).bind(
+    pollId,
+    tenantId,
+    spec.question,
+    spec.description,
+    spec.image_key,
+    multiple ? 1 : 0,
+    spec.require_login ? 1 : 0,
+    spec.opens_at,
+    spec.closes_at,
+    now,
+    revision,
+    spec.results_visibility,
+    spec.ip_single_vote ? 1 : 0,
+    spec.confirm_required ? 1 : 0,
+  );
+  const [created] = await c.env.DB.batch([
+    insertPoll,
+    ...replaceQuestionStatements(c.env, pollId, spec.questions, revision),
+  ]);
   if (Number(created?.meta.changes ?? 0) !== 1) throw conflict("QUOTA_EXCEEDED", "Poll quota exceeded");
+  await recordAudit(c.env, { tenantId, actor: actorLabel(admin), action: auditAction, target: pollId });
+  const poll = await getPollRow(c.env, pollId);
+  return poll as PollRow;
+}
+
+/** Client-shaped questions payload rebuilt from stored rows (ids preserved). */
+function rawQuestionsFromRows(questions: QuestionRow[], options: OptionRow[]): unknown[] {
+  return questions.map((q) => ({
+    id: q.id,
+    prompt: q.prompt,
+    description: q.description,
+    image_key: q.image_key,
+    kind: q.kind,
+    required: q.required === 1,
+    show_if:
+      q.show_if_question_id && q.show_if_option_id
+        ? { question_id: q.show_if_question_id, option_id: q.show_if_option_id }
+        : null,
+    options: options
+      .filter((o) => o.question_id === q.id)
+      .map((o) => ({ id: o.id, label: o.label, image_key: o.image_key })),
+  }));
+}
+
+async function specFromPoll(c: { env: Env }, source: PollRow): Promise<PollSpec> {
+  const questions = await listQuestionRows(c.env, source.id);
+  const options = await listOptionRows(c.env, source.id);
+  return {
+    question: source.question,
+    description: source.description,
+    image_key: source.image_key,
+    require_login: source.require_login === 1,
+    results_visibility: source.results_visibility,
+    ip_single_vote: source.ip_single_vote === 1,
+    confirm_required: source.confirm_required === 1,
+    opens_at: null,
+    closes_at: null,
+    allow_multiple_fallback: source.allow_multiple === 1,
+    questions: parseQuestions({ questions: rawQuestionsFromRows(questions, options) }) ?? [],
+  };
+}
+
+api.post("/tenants/:tenantId/polls/:pollId/duplicate", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId);
+  const source = await loadPollForAdmin(c, tenantId, c.req.param("pollId"));
+  const spec = await specFromPoll(c, source);
+  const body: Record<string, unknown> = await jsonBody(c).catch(() => ({}));
+  const title = body["question"];
+  if (typeof title === "string" && title.trim().length > 0) {
+    spec.question = reqString(body, "question", { max: 300 });
+  }
+  const poll = await createPollRecord(c, tenantId, spec, admin, "poll.duplicate");
+  return c.json({ poll: await renderPoll(c, poll) }, 201);
+});
+
+/* ------------------------------------------------------------------ */
+/* Poll templates                                                      */
+/* ------------------------------------------------------------------ */
+
+interface TemplateRow {
+  id: string;
+  tenant_id: string;
+  name: string;
+  payload: string;
+  created_at: string;
+}
+
+api.post("/tenants/:tenantId/templates", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId);
+  const body = await jsonBody(c);
+  const name = reqString(body, "name", { max: 100 });
+  const pollId = typeof body["poll_id"] === "string" ? body["poll_id"] : "";
+  const source = await loadPollForAdmin(c, tenantId, pollId);
+  const spec = await specFromPoll(c, source);
+  const payload = JSON.stringify({
+    question: spec.question,
+    description: spec.description,
+    image_key: spec.image_key,
+    require_login: spec.require_login,
+    results_visibility: spec.results_visibility,
+    ip_single_vote: spec.ip_single_vote,
+    confirm_required: spec.confirm_required,
+    allow_multiple_fallback: spec.allow_multiple_fallback,
+    questions: rawQuestionsFromRows(
+      await listQuestionRows(c.env, source.id),
+      await listOptionRows(c.env, source.id),
+    ),
+  });
+  const id = randomId();
+  await c.env.DB.prepare(
+    "INSERT INTO poll_templates (id, tenant_id, name, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+  )
+    .bind(id, tenantId, name, payload, nowIso())
+    .run();
+  await recordAudit(c.env, { tenantId, actor: actorLabel(admin), action: "template.create", target: id });
+  return c.json({ template: { id, name, created_at: nowIso() } }, 201);
+});
+
+api.get("/tenants/:tenantId/templates", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  const res = await c.env.DB.prepare(
+    "SELECT id, name, created_at FROM poll_templates WHERE tenant_id = ?1 ORDER BY created_at DESC",
+  )
+    .bind(tenantId)
+    .all<{ id: string; name: string; created_at: string }>();
+  return c.json({ templates: res.results });
+});
+
+api.post("/tenants/:tenantId/templates/:templateId/polls", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId);
+  const row = await c.env.DB.prepare(
+    "SELECT * FROM poll_templates WHERE id = ?1 AND tenant_id = ?2",
+  )
+    .bind(c.req.param("templateId"), tenantId)
+    .first<TemplateRow>();
+  if (!row) throw notFound("Template not found");
+  const stored = JSON.parse(row.payload) as {
+    question: string;
+    description: string;
+    image_key: string | null;
+    require_login: boolean;
+    results_visibility: string;
+    ip_single_vote: boolean;
+    confirm_required: boolean;
+    allow_multiple_fallback: boolean;
+    questions: unknown[];
+  };
+  const body: Record<string, unknown> = await jsonBody(c).catch(() => ({}));
+  const spec: PollSpec = {
+    question:
+      typeof body["question"] === "string" && (body["question"] as string).trim().length > 0
+        ? reqString(body, "question", { max: 300 })
+        : stored.question,
+    description: stored.description,
+    image_key: stored.image_key,
+    require_login: stored.require_login,
+    results_visibility: stored.results_visibility,
+    ip_single_vote: stored.ip_single_vote,
+    confirm_required: stored.confirm_required,
+    opens_at: null,
+    closes_at: null,
+    allow_multiple_fallback: stored.allow_multiple_fallback,
+    questions: parseQuestions({ questions: stored.questions }) ?? [],
+  };
+  const poll = await createPollRecord(c, tenantId, spec, admin, "poll.create");
+  return c.json({ poll: await renderPoll(c, poll) }, 201);
+});
+
+api.delete("/tenants/:tenantId/templates/:templateId", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId);
+  const res = await c.env.DB.prepare(
+    "DELETE FROM poll_templates WHERE id = ?1 AND tenant_id = ?2",
+  )
+    .bind(c.req.param("templateId"), tenantId)
+    .run();
+  if (Number(res.meta.changes ?? 0) !== 1) throw notFound("Template not found");
   await recordAudit(c.env, {
     tenantId,
     actor: actorLabel(admin),
-    action: "poll.create",
-    target: pollId,
+    action: "template.delete",
+    target: c.req.param("templateId"),
   });
-  const poll = await getPollRow(c.env, pollId);
-  return c.json({ poll: await renderPoll(c, poll as PollRow) }, 201);
+  return c.body(null, 204);
+});
+
+/* ------------------------------------------------------------------ */
+/* Branding                                                            */
+/* ------------------------------------------------------------------ */
+
+api.patch("/tenants/:tenantId/branding", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
+  const body = await jsonBody(c);
+  let color: string | null = null;
+  if (body["brand_color"] !== undefined && body["brand_color"] !== null) {
+    if (typeof body["brand_color"] !== "string" || !/^#[0-9a-fA-F]{6}$/.test(body["brand_color"])) {
+      throw badRequest('"brand_color" must be a #RRGGBB hex color or null');
+    }
+    color = body["brand_color"].toLowerCase();
+  }
+  let logoKey: string | null = null;
+  if (body["brand_logo_key"] !== undefined && body["brand_logo_key"] !== null) {
+    logoKey = optString(body, "brand_logo_key", { max: 300 });
+    await assertImageKeyBelongsToTenant(c.env, tenantId, logoKey);
+  }
+  await c.env.DB.prepare("UPDATE tenants SET brand_color = ?1, brand_logo_key = ?2 WHERE id = ?3")
+    .bind(color, logoKey, tenantId)
+    .run();
+  await recordAudit(c.env, { tenantId, actor: actorLabel(admin), action: "tenant.branding", target: tenantId });
+  return c.json({ tenant: { id: tenantId, brand_color: color, brand_logo_key: logoKey } });
 });
 
 api.get("/tenants/:tenantId/polls", async (c) => {
@@ -571,6 +822,98 @@ api.get("/polls/:pollId/results", async (c) => {
   return c.json({ results: await computeResults(c.env, originOf(c), poll) });
 });
 
+api.get("/polls/:pollId/ballot", async (c) => {
+  await rateLimitByIp(c, "ballot-read", 600, 60);
+  const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
+  const sub = await optionalVoterSub(c);
+  if (poll.require_login === 1 && !sub) {
+    throw unauthorized("LOGIN_REQUIRED", "This poll requires voters to log in");
+  }
+  let rawKey: string | null = null;
+  if (sub) {
+    rawKey = `user:${sub}`;
+  } else if (poll.ip_single_vote === 1) {
+    const ip = c.req.header("cf-connecting-ip") ?? "";
+    rawKey = `ip:${await sha256Hex(ip || "unknown")}`;
+  } else {
+    const token = new URL(c.req.url).searchParams.get("voter_token")?.trim() ?? "";
+    if (token.length >= 8 && token.length <= 128) rawKey = `anon:${token}`;
+  }
+  if (!rawKey) {
+    throw badRequest('"voter_token" (8-128 chars) is required to look up an anonymous ballot');
+  }
+  const stored = await hashVoterKey(c.env, rawKey);
+  const row = await c.env.DB.prepare(
+    "SELECT option_ids, updated_at FROM vote_ballots WHERE poll_id = ?1 AND voter_key = ?2",
+  )
+    .bind(poll.id, stored)
+    .first<{ option_ids: string; updated_at: string }>();
+  const questions = await listQuestionRows(c.env, poll.id);
+  const editable =
+    poll.status === "published" && !isNotYetOpen(poll) && !isClosedForVoting(poll);
+  return c.json({
+    ballot: row
+      ? {
+          answers: parseBallotDocument(row.option_ids, questions[0]?.id ?? poll.id).map((a) => ({
+            question_id: a.question_id,
+            option_ids: a.option_ids,
+            text: a.text,
+            scores: a.scores,
+          })),
+          updated_at: row.updated_at,
+        }
+      : null,
+    editable,
+  });
+});
+
+api.get("/polls/:pollId/qr.svg", async (c) => {
+  const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
+  const url = `${originOf(c)}/polls/${poll.id}/results-page`;
+  c.header("content-type", "image/svg+xml");
+  c.header("cache-control", "public, max-age=3600");
+  return c.body(qrSvg(url));
+});
+
+api.get("/polls/:pollId/og.svg", async (c) => {
+  const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
+  const tenant = await c.env.DB.prepare("SELECT brand_color FROM tenants WHERE id = ?1")
+    .bind(poll.tenant_id)
+    .first<{ brand_color: string | null }>();
+  const color = tenant?.brand_color ?? "#1e4fd8";
+  const visible =
+    poll.results_visibility === "public" ||
+    (poll.results_visibility === "after_close" && isClosedForVoting(poll));
+  let detail = "";
+  if (visible) {
+    const results = await computeResults(c.env, originOf(c), poll);
+    const first = results.questions[0];
+    const bars = (first?.options ?? []).slice(0, 4);
+    const denom = Math.max(1, bars.reduce((sum, o) => sum + o.votes, 0));
+    detail =
+      bars
+        .map((o, i) => {
+          const w = Math.round((o.votes / denom) * 560);
+          return `<text x="70" y="${330 + i * 62}" font-size="30" fill="#222222">${escapeHtml(o.label)}</text><rect x="70" y="${342 + i * 62}" width="${w}" height="18" fill="${color}"/><text x="${86 + w}" y="${360 + i * 62}" font-size="26" fill="#222222">${o.votes}</text>`;
+        })
+        .join("") +
+      `<text x="70" y="600" font-size="26" fill="#555555">投票者数 ${results.total_voters} 人</text>`;
+  } else {
+    detail = `<text x="70" y="360" font-size="34" fill="#222222">結果は締切後に公開されます</text>`;
+  }
+  const questionLines = wrapShareText(poll.question, 21, 3);
+  const titleSvg = questionLines
+    .map(
+      (line, i) =>
+        `<text x="70" y="${150 + i * 72}" font-size="56" font-weight="bold" fill="#ffffff">${escapeHtml(line)}</text>`,
+    )
+    .join("");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630"><rect width="1200" height="630" fill="#ffffff"/><rect width="1200" height="${110 + questionLines.length * 72}" fill="${color}"/>${titleSvg}${detail}<text x="1130" y="600" font-size="24" fill="#555555" text-anchor="end">headless-vote</text></svg>`;
+  c.header("content-type", "image/svg+xml");
+  c.header("cache-control", "public, max-age=300");
+  return c.body(svg);
+});
+
 api.post("/polls/:pollId/vote", async (c) => {
   await rateLimitByIp(c, "vote", 600, 60);
   const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
@@ -759,6 +1102,36 @@ api.delete("/tenants/:tenantId/origins", async (c) => {
     detail: raw.slice(0, 200),
   });
   return c.json({ removed: true });
+});
+
+api.get("/tenants/:tenantId/notifications", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId, "read");
+  const res = await c.env.DB.prepare(
+    "SELECT id, poll_id, kind, message, created_at, read_at FROM app_notifications WHERE tenant_id = ?1 ORDER BY created_at DESC LIMIT 50",
+  )
+    .bind(tenantId)
+    .all<{
+      id: string;
+      poll_id: string | null;
+      kind: string;
+      message: string;
+      created_at: string;
+      read_at: string | null;
+    }>();
+  return c.json({ notifications: res.results });
+});
+
+api.post("/tenants/:tenantId/notifications/:notificationId/read", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  await requireAdmin(c, tenantId);
+  const res = await c.env.DB.prepare(
+    "UPDATE app_notifications SET read_at = ?1 WHERE id = ?2 AND tenant_id = ?3 AND read_at IS NULL",
+  )
+    .bind(nowIso(), c.req.param("notificationId"), tenantId)
+    .run();
+  if (Number(res.meta.changes ?? 0) !== 1) throw notFound("Notification not found");
+  return c.json({ ok: true });
 });
 
 api.get("/tenants/:tenantId/audit", async (c) => {

@@ -13,7 +13,7 @@ export const MAX_ORIGINS = 20;
 const MAX_ORIGIN_LENGTH = 200;
 
 const POLL_PATH =
-  /^\/api\/v1\/polls\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/(?:results|vote))?$/;
+  /^\/api\/v1\/polls\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/(?:results|vote|ballot|qr\.svg|og\.svg))?$/;
 const IMAGE_PATH =
   /^\/images\/t\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(png|jpg|webp|gif)$/;
 
