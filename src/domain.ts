@@ -158,7 +158,7 @@ export function isNotYetOpen(poll: PollRow, now = new Date()): boolean {
 
 export function assertSchedule(opensAt: string | null, closesAt: string | null): void {
   if (opensAt && closesAt && Date.parse(opensAt) >= Date.parse(closesAt)) {
-    throw badRequest('"opens_at" must be earlier than "closes_at"');
+    throw badRequest('"opens_at" must be earlier than "closes_at"', { field: "closes_at" });
   }
 }
 

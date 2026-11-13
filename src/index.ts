@@ -68,7 +68,13 @@ app.onError(async (err, c) => {
     }
     applySecurityHeaders(c, { html: false });
     return c.json(
-      { error: { code: err.code, message: err.message } },
+      {
+        error: {
+          code: err.code,
+          message: err.message,
+          ...(err.details ? { details: err.details } : {}),
+        },
+      },
       err.status as 400,
     );
   }

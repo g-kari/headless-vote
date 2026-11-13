@@ -1218,6 +1218,57 @@ const TENANT = ${safeJsonForScript(tenantId)};
 const POLL_ID = ${safeJsonForScript(pollId)};
 const questionsEl = document.getElementById('questions');
 const errorEl = document.getElementById('form-error');
+const OPTION_KINDS = ['single', 'multiple', 'ranking', 'score'];
+const KIND_HINTS = {
+  single: '投票者は選択肢から1つだけ選びます。',
+  multiple: '投票者は選択肢を複数選べます。',
+  text: '投票者が自由に文章を入力します。選択肢は不要です。',
+  ranking: '投票者は選択肢を並べ替えて順位を付けます。選択肢が順位付けの対象になります。',
+  score: '投票者は選択肢ごとに0〜5点で評価します。選択肢が評価の対象になります。',
+};
+
+/* ---- inline field errors -------------------------------------------- */
+let errorSeq = 0;
+function showFieldError(field, message) {
+  clearFieldError(field);
+  const div = document.createElement('div');
+  div.className = 'field-error';
+  div.id = 'fe-' + (++errorSeq);
+  div.textContent = message;
+  field.setAttribute('aria-invalid', 'true');
+  field.setAttribute('aria-describedby', div.id);
+  field.after(div);
+  field._hvError = div;
+  return div;
+}
+function showBoxError(box, message) {
+  clearFieldError(box);
+  const div = document.createElement('div');
+  div.className = 'field-error';
+  div.textContent = message;
+  box.classList.add('has-error');
+  box.after(div);
+  box._hvError = div;
+  return div;
+}
+function clearFieldError(el) {
+  if (!el) return;
+  if (el._hvError) { el._hvError.remove(); el._hvError = null; }
+  el.classList.remove('has-error');
+  if (el.getAttribute && el.getAttribute('aria-invalid')) {
+    el.removeAttribute('aria-invalid');
+    el.removeAttribute('aria-describedby');
+  }
+}
+function clearAllErrors() {
+  errorEl.style.display = 'none';
+  errorEl.textContent = '';
+  for (const el of document.querySelectorAll('#poll-form [aria-invalid="true"], #poll-form .has-error')) {
+    clearFieldError(el);
+  }
+  // Error nodes whose anchor lost its marker are removed as well.
+  for (const div of document.querySelectorAll('#poll-form .field-error')) div.remove();
+}
 
 function addOptionRow(list, label, imageKey, optionId) {
   const row = document.createElement('div');
@@ -1269,6 +1320,8 @@ function refreshShowIf() {
     const qSel = card.querySelector('.q-showif-q');
     const oSel = card.querySelector('.q-showif-o');
     if (!qSel || !oSel) return;
+    const optWrap = card.querySelector('.q-showif-opt');
+    const noneHint = card.querySelector('.q-showif-none');
     const prevQ = qSel.value || card.dataset.sq || '';
     const prevO = oSel.value || card.dataset.so || '';
     qSel.replaceChildren();
@@ -1285,9 +1338,17 @@ function refreshShowIf() {
       opt.textContent = '設問' + (i + 1) + '「' + (other.querySelector('.q-prompt').value.trim() || '無題') + '」の回答が次のとき';
       qSel.append(opt);
     }
+    const eligible = qSel.options.length > 1;
     qSel.value = [...qSel.options].some((o) => o.value === prevQ) ? prevQ : '';
+    // No earlier single/multiple question: explain instead of showing
+    // dead controls. No target chosen yet: keep the option select hidden
+    // rather than rendering an empty box.
+    qSel.hidden = !eligible;
+    if (noneHint) noneHint.hidden = eligible;
+    const hasTarget = eligible && !!qSel.value;
+    if (optWrap) optWrap.hidden = !hasTarget;
     oSel.replaceChildren();
-    const target = cards.find((cd) => cd.querySelector('.q-id').value === qSel.value);
+    const target = hasTarget ? cards.find((cd) => cd.querySelector('.q-id').value === qSel.value) : null;
     if (target) {
       for (const row of target.querySelectorAll('.option-row')) {
         const opt = document.createElement('option');
@@ -1297,7 +1358,7 @@ function refreshShowIf() {
       }
       oSel.value = [...oSel.options].some((o) => o.value === prevO) ? prevO : (oSel.options[0] ? oSel.options[0].value : '');
     }
-    oSel.disabled = !qSel.value;
+    oSel.disabled = !target;
   });
 }
 questionsEl.addEventListener('input', () => refreshShowIf());
@@ -1321,6 +1382,8 @@ function addQuestionCard(data) {
     if (data && data.kind === value) opt.selected = true;
     kind.append(opt);
   }
+  const kindHint = document.createElement('p');
+  kindHint.className = 'q-kind-hint muted small';
   const requiredLabel = document.createElement('label');
   requiredLabel.className = 'check';
   const required = document.createElement('input');
@@ -1339,14 +1402,20 @@ function addQuestionCard(data) {
   showIfLabel.textContent = '表示条件: ';
   const showQ = document.createElement('select');
   showQ.className = 'q-showif-q';
+  const showNone = document.createElement('span');
+  showNone.className = 'q-showif-none muted small';
+  showNone.textContent = '前の単一選択・複数選択の設問があると、その回答を表示条件にできます。';
+  const showOptWrap = document.createElement('span');
+  showOptWrap.className = 'q-showif-opt';
   const showO = document.createElement('select');
   showO.className = 'q-showif-o';
+  showOptWrap.append(document.createTextNode(' のときだけ表示 '), showO);
   showQ.addEventListener('change', refreshShowIf);
   if (data && data.show_if) {
     card.dataset.sq = data.show_if.question_id;
     card.dataset.so = data.show_if.option_id;
   }
-  showIfWrap.append(showIfLabel, showQ, document.createTextNode(' のときだけ表示 '), showO);
+  showIfWrap.append(showIfLabel, showQ, showNone, showOptWrap);
   const options = document.createElement('div');
   options.className = 'q-options';
   const addOpt = document.createElement('button');
@@ -1354,7 +1423,12 @@ function addQuestionCard(data) {
   addOpt.className = 'btn small';
   addOpt.textContent = '選択肢を追加';
   addOpt.addEventListener('click', () => { addOptionRow(options, '', null, ''); refreshShowIf(); });
-  const syncKind = () => { options.hidden = kind.value === 'text'; addOpt.hidden = kind.value === 'text'; };
+  const syncKind = () => {
+    const isText = kind.value === 'text';
+    options.hidden = isText;
+    addOpt.hidden = isText;
+    kindHint.textContent = KIND_HINTS[kind.value] || '';
+  };
   kind.addEventListener('change', () => { syncKind(); refreshShowIf(); });
   const up = document.createElement('button');
   up.type = 'button';
@@ -1374,9 +1448,8 @@ function addQuestionCard(data) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   actions.append(up, down, del);
-  card.append(prompt, kind, requiredLabel, qid, showIfWrap, options, addOpt, actions);
+  card.append(prompt, kind, kindHint, requiredLabel, qid, showIfWrap, options, addOpt, actions);
   questionsEl.append(card);
-  refreshShowIf();
   const seedOptions = (data && data.options) || [];
   if (seedOptions.length === 0 && (!data || data.kind !== 'text')) {
     addOptionRow(options, '', null, '');
@@ -1384,6 +1457,7 @@ function addQuestionCard(data) {
   }
   for (const o of seedOptions) addOptionRow(options, o.label, o.image_key, o.id);
   syncKind();
+  refreshShowIf();
 }
 document.getElementById('add-question').addEventListener('click', () => addQuestionCard(null));
 
@@ -1407,45 +1481,127 @@ async function uploadFrom(row, fileInputSelector, keySelector) {
   }
 }
 
+/* Validate the whole form, placing a message next to each problem field.
+ * Returns the question payload when valid, or null after showing errors. */
+function validateForm() {
+  clearAllErrors();
+  const problems = [];
+  const titleEl = document.getElementById('question');
+  if (!titleEl.value.trim()) problems.push([titleEl, '設問文を入力してください']);
+  const opensEl = document.getElementById('opens-at');
+  const closesEl = document.getElementById('closes-at');
+  if (opensEl.value && closesEl.value && new Date(opensEl.value) >= new Date(closesEl.value)) {
+    problems.push([closesEl, '締切日時は開始日時より後にしてください']);
+  }
+  const questionCards = [...questionsEl.querySelectorAll('.question-card')];
+  if (questionCards.length < 1) problems.push([questionsEl, '設問は1つ以上必要です']);
+  if (questionCards.length > 20) problems.push([questionsEl, '設問は20個までです']);
+  const questions = [];
+  questionCards.forEach((card, cardIndex) => {
+    const kind = card.querySelector('.q-kind').value;
+    const promptEl = card.querySelector('.q-prompt');
+    const prompt = promptEl.value.trim();
+    if (!prompt) problems.push([promptEl, '設問文を入力してください']);
+    const options = [];
+    if (OPTION_KINDS.includes(kind)) {
+      const optionsEl = card.querySelector('.q-options');
+      const rows = [...card.querySelectorAll('.option-row')];
+      if (rows.length < 2) problems.push([optionsEl, '選択式の設問には選択肢が2つ以上必要です']);
+      for (const row of rows) {
+        const labelEl = row.querySelector('.opt-label');
+        const label = labelEl.value.trim();
+        if (!label) problems.push([labelEl, '選択肢の文言を入力してください']);
+        options.push({
+          id: row.querySelector('.opt-id').value || undefined,
+          label,
+          image_key: row.querySelector('.opt-key').value || null,
+          _row: row,
+        });
+      }
+    }
+    const showQ = card.querySelector('.q-showif-q').value;
+    const showO = card.querySelector('.q-showif-o').value;
+    if (showQ && !showO) {
+      problems.push([card.querySelector('.q-showif'), '表示条件の選択肢を選んでください']);
+    }
+    questions.push({
+      id: card.querySelector('.q-id').value || undefined,
+      prompt,
+      kind,
+      required: card.querySelector('.q-required').checked,
+      options,
+      show_if: showQ ? { question_id: showQ, option_id: showO } : null,
+      _card: card,
+      _index: cardIndex,
+    });
+  });
+  if (problems.length > 0) {
+    for (const [field, message] of problems) {
+      if (field.classList && (field.classList.contains('q-options') || field.classList.contains('q-showif') || field === questionsEl)) {
+        showBoxError(field, message);
+      } else {
+        showFieldError(field, message);
+      }
+    }
+    errorEl.textContent = '入力内容に ' + problems.length + ' 件の問題があります。各欄の表示を確認してください。';
+    errorEl.style.display = 'block';
+    const firstAnchor = problems[0][0];
+    firstAnchor.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    const focusTarget = firstAnchor.querySelector && firstAnchor.querySelector('input, select, textarea')
+      ? firstAnchor.querySelector('input, select, textarea') : firstAnchor;
+    if (focusTarget && focusTarget.focus) setTimeout(() => focusTarget.focus({ preventScroll: true }), 250);
+    return null;
+  }
+  return questions;
+}
+
+/* Map an API validation message onto the field it belongs to. */
+function showServerError(message, details) {
+  const cards = [...questionsEl.querySelectorAll('.question-card')];
+  let idx = -1;
+  const m = /questions\[(\d+)\]/.exec(message || '');
+  if (m) idx = Number(m[1]);
+  if (details && typeof details.question_index === 'number') idx = details.question_index;
+  if ((message || '').includes('"opens_at" must be earlier') || (details && details.field === 'closes_at')) {
+    showFieldError(document.getElementById('closes-at'), '締切日時は開始日時より後にしてください');
+    document.getElementById('closes-at').scrollIntoView({ block: 'center', behavior: 'smooth' });
+    return;
+  }
+  if (idx >= 0 && cards[idx]) {
+    const card = cards[idx];
+    let anchor;
+    if ((message || '').includes('show_if')) {
+      anchor = showBoxError(card.querySelector('.q-showif'), '表示条件を確認してください。対象は前の単一・複数選択の設問と、その選択肢です。');
+    } else if ((message || '').includes('option')) {
+      anchor = showBoxError(card.querySelector('.q-options'), '選択肢を確認してください。2〜50個、各200文字までです。');
+    } else {
+      anchor = showFieldError(card.querySelector('.q-prompt'), 'この設問の内容を確認してください。');
+    }
+    card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    errorEl.textContent = '設問 ' + (idx + 1) + ' に問題があります: ' + message;
+    errorEl.style.display = 'block';
+    return;
+  }
+  errorEl.textContent = message || '保存に失敗しました';
+  errorEl.style.display = 'block';
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
 async function submitPoll(ev) {
   ev.preventDefault();
-  errorEl.style.display = 'none';
+  const questions = validateForm();
+  if (!questions) return;
   try {
     await uploadFrom(document.getElementById('poll-image-row'), '#poll-image-file', '#poll-image-key');
-    const questions = [];
-    for (const card of questionsEl.querySelectorAll('.question-card')) {
-      const kind = card.querySelector('.q-kind').value;
-      const prompt = card.querySelector('.q-prompt').value.trim();
-      if (!prompt) throw new Error('設問文が空です');
-      const options = [];
-      if (kind !== 'text') {
-        for (const row of card.querySelectorAll('.option-row')) {
-          await uploadFrom(row, '.opt-file', '.opt-key');
-          const label = row.querySelector('.opt-label').value.trim();
-          if (!label) throw new Error('選択肢の文言が空です');
-          const imageKey = row.querySelector('.opt-key').value || null;
-          const id = row.querySelector('.opt-id').value || undefined;
-          options.push({ id, label, image_key: imageKey });
-        }
-        if (options.length < 2) throw new Error('選択式の設問には選択肢が2つ以上必要です');
+    for (const q of questions) {
+      for (const o of q.options) {
+        if (o._row) await uploadFrom(o._row, '.opt-file', '.opt-key');
+        o.image_key = o._row ? (o._row.querySelector('.opt-key').value || null) : o.image_key;
+        delete o._row;
       }
-      const id = card.querySelector('.q-id').value || undefined;
-      const showQ = card.querySelector('.q-showif-q').value;
-      const showO = card.querySelector('.q-showif-o').value;
-      if (showQ && !showO) throw new Error('表示条件の選択肢が未選択です');
-      questions.push({
-        id,
-        prompt,
-        kind,
-        required: card.querySelector('.q-required').checked,
-        options,
-        show_if: showQ ? { question_id: showQ, option_id: showO } : null,
-      });
+      delete q._card;
+      delete q._index;
     }
-    if (questions.length < 1) throw new Error('設問は1つ以上必要です');
-    if (questions.length > 20) throw new Error('設問は20個までです');
-    const closesRaw = document.getElementById('closes-at').value;
-    const opensRaw = document.getElementById('opens-at').value;
     const payload = {
       question: document.getElementById('question').value.trim(),
       description: document.getElementById('description').value,
@@ -1454,8 +1610,8 @@ async function submitPoll(ev) {
       results_visibility: document.getElementById('results-visibility').value,
       ip_single_vote: document.getElementById('ip-single-vote').checked,
       confirm_required: document.getElementById('confirm-required').checked,
-      opens_at: opensRaw ? new Date(opensRaw).toISOString() : null,
-      closes_at: closesRaw ? new Date(closesRaw).toISOString() : null,
+      opens_at: document.getElementById('opens-at').value ? new Date(document.getElementById('opens-at').value).toISOString() : null,
+      closes_at: document.getElementById('closes-at').value ? new Date(document.getElementById('closes-at').value).toISOString() : null,
       questions,
     };
     const url = POLL_ID
@@ -1468,7 +1624,10 @@ async function submitPoll(ev) {
       credentials: 'same-origin',
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error((data.error && data.error.message) || '保存に失敗しました');
+    if (!res.ok) {
+      showServerError((data.error && data.error.message) || '保存に失敗しました', data.error && data.error.details);
+      return;
+    }
     location.href = '/admin/workspaces/' + TENANT + '/polls/' + data.poll.id;
   } catch (e) {
     errorEl.textContent = e.message || String(e);
@@ -1477,6 +1636,13 @@ async function submitPoll(ev) {
   }
 }
 document.getElementById('poll-form').addEventListener('submit', submitPoll);
+// Clear a field's error as soon as the user starts fixing it.
+document.getElementById('poll-form').addEventListener('input', (ev) => {
+  const t = ev.target;
+  clearFieldError(t);
+  const box = t.closest && (t.closest('.q-options') || t.closest('.q-showif'));
+  if (box) clearFieldError(box);
+});
 const seedEl = document.getElementById('poll-seed');
 let pending = [];
 try { pending = JSON.parse(seedEl && seedEl.textContent ? seedEl.textContent : '[]'); } catch (e) { pending = []; }

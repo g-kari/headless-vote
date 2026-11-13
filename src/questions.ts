@@ -1,5 +1,5 @@
 import { randomId } from "./crypto";
-import { badRequest, conflict } from "./errors";
+import { ApiError, badRequest, conflict } from "./errors";
 import { assertPlainText, normalizeUuid } from "./security";
 import type { Env, OptionRow, QuestionKind, QuestionRow } from "./types";
 
@@ -102,63 +102,87 @@ export function parseQuestions(body: Record<string, unknown>): QuestionInput[] |
     throw badRequest(`"questions" must be an array of 1 to ${MAX_QUESTIONS} items`);
   }
   const parsed: QuestionInput[] = raw.map((item, index) => {
-    if (typeof item !== "object" || item === null) {
-      throw badRequest(`questions[${index}] must be an object`);
-    }
-    const q = item as Record<string, unknown>;
-    const kind = q["kind"];
-    if (kind !== "single" && kind !== "multiple" && kind !== "text" && kind !== "ranking" && kind !== "score") {
-      throw badRequest(`questions[${index}].kind must be single, multiple, text, ranking, or score`);
-    }
-    const prompt = readString(q, "prompt", 300);
-    const description = typeof q["description"] === "string" ? q["description"] : "";
-    if (description.length > 2000) throw badRequest('"description" is too long (max 2000)');
-    if (description) assertPlainText(description, { newlines: true });
-    const required = q["required"] === undefined ? true : q["required"];
-    if (typeof required !== "boolean") throw badRequest(`questions[${index}].required must be a boolean`);
-    const options = kind === "text" ? [] : parseOptionList(q["options"], `questions[${index}].options`);
-    if (kind === "text" && q["options"] !== undefined && Array.isArray(q["options"]) && q["options"].length > 0) {
-      throw badRequest(`questions[${index}] is free text and cannot have options`);
-    }
-    let showIf: ShowIfInput | null = null;
-    if (q["show_if"] !== undefined && q["show_if"] !== null) {
-      const raw = q["show_if"];
-      if (typeof raw !== "object" || Array.isArray(raw)) {
-        throw badRequest(`questions[${index}].show_if must be an object`);
+    try {
+      return parseQuestionItem(item, index);
+     } catch (err) {
+      // Make every per-question failure locatable: messages that do not
+      // already carry the questions[index] prefix gain it, plus details.
+      if (err instanceof ApiError && err.status === 400) {
+        if (!err.message.startsWith("questions[")) {
+          const wrapped = badRequest(`questions[${index}]: ${err.message}`, {
+            question_index: index,
+            ...(err.details ?? {}),
+          });
+          throw wrapped;
+        }
+        err.details = { question_index: index, ...(err.details ?? {}) };
       }
-      const target = raw as Record<string, unknown>;
-      const targetQuestion = readOptionalId(target, "question_id");
-      const targetOption = readOptionalId(target, "option_id");
-      if (!targetQuestion || !targetOption) {
-        throw badRequest(`questions[${index}].show_if requires question_id and option_id`);
-      }
-      showIf = { question_id: targetQuestion, option_id: targetOption };
+      throw err;
     }
-    return {
-      id: readOptionalId(q, "id"),
-      prompt,
-      description,
-      image_key: readOptionalString(q, "image_key", 300),
-      kind,
-      required,
-      options,
-      show_if: showIf,
-    };
   });
+  return finishParseQuestions(parsed);
+}
+
+function parseQuestionItem(item: unknown, index: number): QuestionInput {
+  if (typeof item !== "object" || item === null) {
+    throw badRequest(`questions[${index}] must be an object`);
+  }
+  const q = item as Record<string, unknown>;
+  const kind = q["kind"];
+  if (kind !== "single" && kind !== "multiple" && kind !== "text" && kind !== "ranking" && kind !== "score") {
+    throw badRequest(`questions[${index}].kind must be single, multiple, text, ranking, or score`);
+  }
+  const prompt = readString(q, "prompt", 300);
+  const description = typeof q["description"] === "string" ? q["description"] : "";
+  if (description.length > 2000) throw badRequest('"description" is too long (max 2000)');
+  if (description) assertPlainText(description, { newlines: true });
+  const required = q["required"] === undefined ? true : q["required"];
+  if (typeof required !== "boolean") throw badRequest(`questions[${index}].required must be a boolean`);
+  const options = kind === "text" ? [] : parseOptionList(q["options"], `questions[${index}].options`);
+  if (kind === "text" && q["options"] !== undefined && Array.isArray(q["options"]) && q["options"].length > 0) {
+    throw badRequest(`questions[${index}] is free text and cannot have options`);
+  }
+  let showIf: ShowIfInput | null = null;
+  if (q["show_if"] !== undefined && q["show_if"] !== null) {
+    const raw = q["show_if"];
+    if (typeof raw !== "object" || Array.isArray(raw)) {
+      throw badRequest(`questions[${index}].show_if must be an object`);
+    }
+    const target = raw as Record<string, unknown>;
+    const targetQuestion = readOptionalId(target, "question_id");
+    const targetOption = readOptionalId(target, "option_id");
+    if (!targetQuestion || !targetOption) {
+      throw badRequest(`questions[${index}].show_if requires question_id and option_id`);
+    }
+    showIf = { question_id: targetQuestion, option_id: targetOption };
+  }
+  return {
+    id: readOptionalId(q, "id"),
+    prompt,
+    description,
+    image_key: readOptionalString(q, "image_key", 300),
+    kind,
+    required,
+    options,
+    show_if: showIf,
+  };
+}
+
+function finishParseQuestions(parsed: QuestionInput[]): QuestionInput[] {
   // Conditional display must reference an earlier single/multiple question
   // in the same payload, by the client-supplied ids of that question.
   parsed.forEach((question, index) => {
     if (!question.show_if) return;
     const targetIndex = parsed.findIndex((q) => q.id !== undefined && q.id === question.show_if?.question_id);
     if (targetIndex < 0 || targetIndex >= index) {
-      throw badRequest(`questions[${index}].show_if must reference an earlier question`);
+      throw badRequest(`questions[${index}].show_if must reference an earlier question`, { question_index: index });
     }
     const target = parsed[targetIndex];
     if (!target || (target.kind !== "single" && target.kind !== "multiple")) {
-      throw badRequest(`questions[${index}].show_if target must be a single or multiple question`);
+      throw badRequest(`questions[${index}].show_if target must be a single or multiple question`, { question_index: index });
     }
     if (!target.options.some((o) => o.id !== undefined && o.id === question.show_if?.option_id)) {
-      throw badRequest(`questions[${index}].show_if option does not belong to the target question`);
+      throw badRequest(`questions[${index}].show_if option does not belong to the target question`, { question_index: index });
     }
   });
   return parsed;
@@ -341,6 +365,7 @@ export function resolveAnswers(
   const resolved = new Map<string, AnswerInput>();
   for (const question of questions) {
     if (isHidden(question, resolved)) continue;
+    try {
     const row = rawByQuestion.get(question.id);
     if (!row) {
       if (question.required === 1) {
@@ -369,6 +394,12 @@ export function resolveAnswers(
       resolved.set(question.id, { question_id: question.id, option_ids: optionIds, text: null, scores: null });
     } else {
       resolved.set(question.id, validateChoice(question, readOptionIds(row["option_ids"]), qOptions));
+    }
+    } catch (err) {
+      // Attach the offending question so clients (embed UIs, the admin
+      // test tools) can place the error next to that question.
+      if (err instanceof ApiError && !err.details) err.details = { question_id: question.id };
+      throw err;
     }
   }
   return questions.filter((q) => resolved.has(q.id)).map((q) => resolved.get(q.id) as AnswerInput);
