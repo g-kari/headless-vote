@@ -4,6 +4,7 @@
 // No dependencies, so it runs from a copied skill folder.
 import { readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { windowsBrowserCommand } from "../kit/browser-opener.mjs";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { addClass, esc, find, hasClass, inner, kids, parseHtml, rawText, serialize, textOf, words } from "../kit/html.mjs";
@@ -520,8 +521,8 @@ const MOCK_CSS = `:host{all:initial;display:block}*,*::before,*::after{box-sizin
 
 /* ── CLI ── */
 function openFile(path) {
-  const [cmd, args] = process.platform === "darwin" ? ["open", [path]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", path]] : ["xdg-open", [path]];
-  spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
+  const [cmd, args] = process.platform === "darwin" ? ["open", [path]] : process.platform === "win32" ? windowsBrowserCommand(path) : ["xdg-open", [path]];
+  spawn(cmd, args, { detached: true, stdio: "ignore", shell: false }).unref();
 }
 
 function main() {

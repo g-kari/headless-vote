@@ -5,6 +5,7 @@
 // from a copied skill folder.
 import { lstatSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { windowsBrowserCommand } from "./browser-opener.mjs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { decode, esc, find, hasClass, inner, kids, parseHtml, serialize, textOf, words } from "./html.mjs";
@@ -223,8 +224,8 @@ export function renderPageForHost(html, { root, filename, sendBack = false, mode
 
 /* ── CLI ── */
 function openFile(path) {
-  const [cmd, args] = process.platform === "darwin" ? ["open", [path]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", path]] : ["xdg-open", [path]];
-  spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
+  const [cmd, args] = process.platform === "darwin" ? ["open", [path]] : process.platform === "win32" ? windowsBrowserCommand(path) : ["xdg-open", [path]];
+  spawn(cmd, args, { detached: true, stdio: "ignore", shell: false }).unref();
 }
 
 async function main() {

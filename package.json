@@ -20,7 +20,7 @@
     "lint": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
-    "test:security:node": "node scripts/security-regressions.mjs && node scripts/visual-explainer-response-security.mjs"
+    "test:security:node": "node scripts/security-regressions.mjs && node scripts/visual-explainer-response-security.mjs && node scripts/visual-explainer-opener-security.mjs"
   },
   "type": "module",
   "version": "0.1.0"
