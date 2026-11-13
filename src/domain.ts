@@ -169,6 +169,14 @@ export function isClosedForVoting(poll: PollRow, now = new Date()): boolean {
   return false;
 }
 
+/** Fail closed for unpublished polls and unknown visibility values. */
+export function canViewPublicResults(poll: PollRow, now = new Date()): boolean {
+  return poll.status !== "draft" && (
+    poll.results_visibility === "public" ||
+    (poll.results_visibility === "after_close" && isClosedForVoting(poll, now))
+  );
+}
+
 export interface QuestionResult {
   id: string;
   prompt: string;

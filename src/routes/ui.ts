@@ -11,7 +11,7 @@ import {
 import { listAuditEvents } from "../audit";
 import { listQuestionRows } from "../questions";
 import { computeResults, getPollRow, isClosedForVoting, listOptionRows, type PollResults } from "../domain";
-import { issueApiKey, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
+import { issueApiKey, limitKeyRotation, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
 import { addMember, listMembers, removeMember, setMemberRole } from "../members";
 import { tenantQuotas } from "../quotas";
 import { createWebhook, disableWebhook, listWebhooks } from "../webhooks";
@@ -335,6 +335,7 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
   assertSameOriginMutation(c);
   await readUrlEncodedForm(c);
   const actor = { kind: "session" as const, tenantId, sub: user.sub, role: "owner" as const };
+  await limitKeyRotation(c.env, tenantId);
   const existing = await listApiKeys(c.env, tenantId);
   for (const key of existing) {
     if (!key.revoked_at) await revokeApiKey(c.env, tenantId, key.id, actor);
