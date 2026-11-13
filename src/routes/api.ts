@@ -908,7 +908,7 @@ api.get("/polls/:pollId/og.svg", async (c) => {
         `<text x="70" y="${150 + i * 72}" font-size="56" font-weight="bold" fill="#ffffff">${escapeHtml(line)}</text>`,
     )
     .join("");
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630"><rect width="1200" height="630" fill="#ffffff"/><rect width="1200" height="${110 + questionLines.length * 72}" fill="${color}"/>${titleSvg}${detail}<text x="1130" y="600" font-size="24" fill="#555555" text-anchor="end">headless-vote</text></svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630"><rect width="1200" height="630" fill="#ffffff"/><rect width="1200" height="${110 + questionLines.length * 72}" fill="${color}"/>${titleSvg}${detail}<text x="1130" y="600" font-size="24" fill="#555555" text-anchor="end">Hyo</text></svg>`;
   c.header("content-type", "image/svg+xml");
   c.header("cache-control", "public, max-age=300");
   return c.body(svg);

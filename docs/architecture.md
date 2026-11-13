@@ -1,6 +1,6 @@
 # Architecture
 
-English summary: headless-vote keeps polls, ballots, and authorization in the core. Authentication, email, object storage, the rate-limit counter, webhook delivery, and analytics time series sit behind small interfaces in `src/platform`. `createPlatform` reads configuration and returns the adapters for this process. Swapping a provider does not change how a vote is stored.
+English summary: Hyo keeps polls, ballots, and authorization in the core. Authentication, email, object storage, the rate-limit counter, webhook delivery, and analytics time series sit behind small interfaces in `src/platform`. `createPlatform` reads configuration and returns the adapters for this process. Swapping a provider does not change how a vote is stored.
 
 投票のルール（設問、票、権限、上限）はコアにあります。ホストに依存する処理は `src/platform` のインターフェースの後ろにあります。`createPlatform` が設定を読んで、そのプロセスで使うアダプタを返します。
 

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 560" role="img" aria-label="headless-vote architecture" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 560" role="img" aria-label="Hyo architecture" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
   <rect width="980" height="560" fill="#f6f7fb"/>
   <defs>
     <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -22,7 +22,7 @@
   <!-- worker -->
   <rect x="400" y="120" width="250" height="270" rx="14" fill="#ececff" stroke="#5b5bd6" stroke-width="2"/>
   <text x="525" y="152" text-anchor="middle" font-size="18" font-weight="700" fill="#171a26">Cloudflare Worker</text>
-  <text x="525" y="176" text-anchor="middle" font-size="13" fill="#5b6172">headless-vote（Hono）</text>
+  <text x="525" y="176" text-anchor="middle" font-size="13" fill="#5b6172">Hyo（Hono）</text>
   <rect x="425" y="195" width="200" height="52" rx="9" fill="#ffffff" stroke="#d9dce8"/>
   <text x="525" y="227" text-anchor="middle" font-size="14" fill="#171a26">管理画面（UI）</text>
   <rect x="425" y="260" width="200" height="52" rx="9" fill="#ffffff" stroke="#d9dce8"/>
