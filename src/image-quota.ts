@@ -1,5 +1,6 @@
 import { nowIso } from "./domain";
-import { ApiError } from "./errors";
+import { randomId } from "./crypto";
+import { ApiError, notFound } from "./errors";
 import { createObjectStore } from "./platform/objects";
 import type { Env } from "./types";
 
@@ -43,8 +44,8 @@ export async function getImageUsage(env: Env, tenantId: string): Promise<ImageUs
 
 /**
  * Atomically reserve both dimensions before writing to R2. Never release a
- * reservation on a put error: a timeout may mean the object was stored. No D1
- * accounting write is needed after a successful put. An operator may reconcile
+ * reservation on a put error: a timeout may mean the object was stored. A durable upload intent keeps
+ * deletion cleanup alive until the object store confirms completion. An operator may reconcile
  * conservative overcounts against R2 only while uploads for the tenant are
  * paused and all in-flight requests have completed. Never delete/reset the
  * accounting row or lower its counters while uploads are running.
@@ -66,5 +67,28 @@ export async function putImageWithQuota(
   if (reserved.meta.changes !== 1) {
     throw new ApiError(429, "IMAGE_QUOTA_EXCEEDED", "Image count or storage quota reached for this workspace (500 images / 500 MiB total)");
   }
+  // Register before issuing an external write. A deleted tenant cannot start a
+  // late upload after its cleanup job has already drained. Do not expire intents:
+  // a timeout or worker termination cannot prove that R2 stopped writing.
+  const intent = randomId();
+  const registered = await env.DB.prepare(
+    `INSERT INTO image_upload_intents (id, tenant_id)
+     SELECT ?1, id FROM tenants WHERE id = ?2`,
+  ).bind(intent, tenantId).run();
+  if (!registered.success) throw new Error("Could not register image upload");
+  if (registered.meta.changes !== 1) throw notFound("Workspace not found");
   await createObjectStore(env).put(key, data, contentType);
+  // Refresh a deleted tenant's cleanup generation before releasing its intent,
+  // in one transaction. A cleaner that captured an empty prefix before this put
+  // cannot acknowledge the new generation, even if the request stops here.
+  // Failed/uncertain D1 completion leaves either the intent or the refreshed job.
+  const completed = await env.DB.batch([
+    env.DB.prepare(`INSERT INTO object_cleanup (tenant_id, created_at, generation)
+      SELECT ?1, ?2, lower(hex(randomblob(16)))
+      WHERE NOT EXISTS (SELECT 1 FROM tenants WHERE id = ?1)
+      ON CONFLICT(tenant_id) DO UPDATE SET generation = excluded.generation,
+        created_at = excluded.created_at`).bind(tenantId, nowIso()),
+    env.DB.prepare("DELETE FROM image_upload_intents WHERE id = ?1").bind(intent),
+  ]);
+  if (completed.some((result) => !result.success)) throw new Error("Could not complete image upload");
 }

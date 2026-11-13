@@ -1,5 +1,7 @@
 import { env } from "cloudflare:test";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { deleteWorkspace } from "../src/account";
+import { drainObjectCleanup } from "../src/object-cleanup";
 import { getImageUsage, MAX_IMAGE_BYTES_PER_TENANT, putImageWithQuota } from "../src/image-quota";
 import type { Env } from "../src/types";
 import { applySchema } from "./fixtures";
@@ -14,6 +16,7 @@ function gate() {
 
 async function seed(count: number, bytes: number): Promise<string> {
   const id = crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO tenants (id, name, api_key_hash, created_at) VALUES (?1, 'images', ?1, 'test')").bind(id).run();
   await env.DB.prepare(
     "INSERT INTO tenant_image_usage (tenant_id, image_count, total_bytes, updated_at) VALUES (?1, ?2, ?3, 'test')",
   ).bind(id, count, bytes).run();
@@ -148,7 +151,7 @@ describe("image quota reservation", () => {
   });
 
   it("supports the memory adapter without calling R2", async () => {
-    const id = crypto.randomUUID();
+    const id = await seed(0, 0);
     const bindings = { ...env, OBJECT_STORE: "memory", IMAGES: {
       list: async () => { throw new Error("R2 must not be called"); },
       put: async () => { throw new Error("R2 must not be called"); },
@@ -158,7 +161,109 @@ describe("image quota reservation", () => {
     expect(await usage(id)).toEqual({ image_count: 1, total_bytes: 10 });
   });
 
-  it("needs no D1 write after R2 succeeds", async () => {
+  for (const failure of ["put response", "D1 after put"]) {
+    it(`retries deleted-workspace cleanup after a late object write and lost ${failure}`, async () => {
+      const id = await seed(0, 0);
+      const key = `t/${id}/${crypto.randomUUID()}.png`;
+      const entered = gate();
+      const finish = gate();
+      let stored = false;
+      const bindings = {
+        ...env, OBJECT_STORE: "r2",
+        IMAGES: {
+          async put() {
+            entered.release();
+            await finish.promise;
+            const object = await env.IMAGES.put(key, new Uint8Array([1]));
+            stored = true;
+            if (failure === "put response") throw new Error("Stored but response lost");
+            return object;
+          },
+        } as unknown as R2Bucket,
+        DB: {
+          prepare(sql: string) {
+            if (stored && failure === "D1 after put") throw new Error("D1 unavailable");
+            return env.DB.prepare(sql);
+          },
+        } as unknown as D1Database,
+      } as Env;
+      const upload = putImageWithQuota(bindings, id, key, new Uint8Array([1]), "image/png")
+        .then(() => null, (error: unknown) => error);
+      await entered.promise;
+      try {
+        await deleteWorkspace(env, id);
+        expect(await env.IMAGES.head(key)).toBeNull();
+        // The initial empty sweep cannot retire a job with a pending upload.
+        expect(await env.DB.prepare("SELECT tenant_id FROM object_cleanup WHERE tenant_id = ?1").bind(id).first()).not.toBeNull();
+      } finally { finish.release(); }
+      expect(await upload).toBeInstanceOf(Error);
+      expect(await env.IMAGES.head(key)).not.toBeNull();
+      await drainObjectCleanup(env, 100);
+      expect(await env.IMAGES.head(key)).toBeNull();
+      expect(await env.DB.prepare("SELECT tenant_id FROM object_cleanup WHERE tenant_id = ?1").bind(id).first()).not.toBeNull();
+    });
+  }
+
+  it("refreshes the cleanup generation before releasing a confirmed late upload", async () => {
+    const id = await seed(0, 0);
+    const key = `t/${id}/${crypto.randomUUID()}.png`;
+    const putEntered = gate();
+    const finishPut = gate();
+    const listCaptured = gate();
+    const finishList = gate();
+    const uploadEnv = { ...env, OBJECT_STORE: "r2", IMAGES: {
+      async put() {
+        putEntered.release();
+        await finishPut.promise;
+        return env.IMAGES.put(key, new Uint8Array([1]));
+      },
+    } as unknown as R2Bucket } as Env;
+    const upload = putImageWithQuota(uploadEnv, id, key, new Uint8Array([1]), "image/png");
+    await putEntered.promise;
+    await deleteWorkspace(env, id);
+    const before = await env.DB.prepare("SELECT generation FROM object_cleanup WHERE tenant_id = ?1")
+      .bind(id).first<{ generation: string }>();
+    const cleanupEnv = { ...env, OBJECT_STORE: "r2", IMAGES: {
+      async list(options: R2ListOptions) {
+        const page = await env.IMAGES.list(options);
+        if (options.prefix === `t/${id}/`) {
+          listCaptured.release();
+          await finishList.promise;
+        }
+        return page;
+      },
+      async delete(keys: string[]) { await env.IMAGES.delete(keys); },
+    } as unknown as R2Bucket } as Env;
+    const cleanup = drainObjectCleanup(cleanupEnv, 100);
+    try {
+      await listCaptured.promise;
+      finishPut.release();
+      // Call only the helper: simulate termination before API post-upload code.
+      await upload;
+      expect(await env.DB.prepare("SELECT id FROM image_upload_intents WHERE tenant_id = ?1").bind(id).first()).toBeNull();
+      const after = await env.DB.prepare("SELECT generation FROM object_cleanup WHERE tenant_id = ?1")
+        .bind(id).first<{ generation: string }>();
+      expect(after?.generation).toBeTruthy();
+      expect(after?.generation).not.toBe(before?.generation);
+    } finally { finishPut.release(); finishList.release(); }
+    await cleanup;
+    expect(await env.IMAGES.head(key)).not.toBeNull();
+    expect(await env.DB.prepare("SELECT tenant_id FROM object_cleanup WHERE tenant_id = ?1").bind(id).first()).not.toBeNull();
+    await drainObjectCleanup(env, 100);
+    expect(await env.IMAGES.head(key)).toBeNull();
+    expect(await env.DB.prepare("SELECT tenant_id FROM object_cleanup WHERE tenant_id = ?1").bind(id).first()).toBeNull();
+  });
+
+  it("does not issue a late put after the tenant was already deleted", async () => {
+    const id = await seed(0, 0);
+    await deleteWorkspace(env, id);
+    const { bindings, put } = bucket();
+    await expect(putImageWithQuota(bindings, id, `t/${id}/late.png`, new Uint8Array([1]), "image/png"))
+      .rejects.toMatchObject({ status: 404 });
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("retains a durable intent when D1 is unavailable after R2 succeeds", async () => {
     const id = await seed(1, 100);
     const { bindings, put } = bucket();
     let stored = false;
@@ -170,7 +275,8 @@ describe("image quota reservation", () => {
     } as unknown as D1Database;
     put.mockImplementation(async () => { stored = true; return { key: "stored" }; });
     await expect(putImageWithQuota(bindings, id, `t/${id}/ok.png`, new ArrayBuffer(10), "image/png"))
-      .resolves.toBeUndefined();
+      .rejects.toThrow("Database unavailable after upload");
+    expect(await env.DB.prepare("SELECT id FROM image_upload_intents WHERE tenant_id = ?1").bind(id).first()).not.toBeNull();
     expect(await usage(id)).toEqual({ image_count: 2, total_bytes: 110 });
   });
 });
