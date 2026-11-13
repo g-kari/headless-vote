@@ -2551,12 +2551,17 @@ ui.get("/docs", async (c) => {
   // width. The spec lives in public/openapi.yaml and the Redoc bundle is
   // vendored at public/redoc.standalone.js; /docs gets a dedicated CSP
   // variant in security.ts for Redoc's runtime styles and markdown.
+  // This page is light-scheme ONLY: Redoc renders its light theme (dark
+  // text, no opaque background of its own), so the page must not opt into
+  // the dark scheme — a "light dark" color-scheme makes dark-mode browsers
+  // paint the default canvas dark and the body text becomes unreadable.
+  // Keep the meta at "light" and the explicit body background/color.
   const body = `<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="light">
 <title>API 仕様書 | Hyo</title>
 <meta name="description" content="Hyo の API 仕様書（OpenAPI / Redoc）">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -2564,7 +2569,8 @@ ui.get("/docs", async (c) => {
 <link rel="icon" href="/favicon-16x16.png" type="image/png" sizes="16x16">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style nonce="${escapeHtml(nonce)}">
-  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#fff;color:#12161c}
+  #redoc{background:#fff}
   .docs-bar{display:flex;align-items:center;gap:1rem;padding:.6rem 1rem;border-bottom:2px solid #111;background:#fff}
   .docs-bar .brand{font-weight:800;font-size:1.15rem;color:#111;text-decoration:none}
   .docs-bar .brand span{color:#1e4fd8}
@@ -2573,7 +2579,8 @@ ui.get("/docs", async (c) => {
   .docs-bar nav a:hover{background:#1e4fd8;color:#fff}
   .try{border-bottom:2px solid #111;padding:1rem;max-width:1080px;margin:0 auto}
   .try h2{font-size:1.15rem;margin:.2rem 0 .6rem}
-  .try-note{color:#454f5c;font-size:.9rem;max-width:75ch}
+  .try-note{color:#39424e;font-size:.9rem;max-width:75ch}
+  .try input::placeholder,.try textarea::placeholder{color:#39424e;opacity:1}
   .try label{display:block;font-weight:600;margin:.7rem 0 .3rem}
   .try input[type=text],.try input[type=password],.try select,.try textarea{width:100%;padding:.55rem .7rem;border:1.5px solid #77808e;font:inherit;background:#fff;color:#12161c;box-sizing:border-box}
   .try-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 1rem}
@@ -2620,7 +2627,10 @@ ui.get("/docs", async (c) => {
     pathInMiddlePanel: true,
     menuToggle: true,
     theme: {
-      colors: { primary: { main: "#1e4fd8" } },
+      colors: {
+        primary: { main: "#1e4fd8" },
+        text: { primary: "#12161c", secondary: "#39424e" },
+      },
       typography: {
         fontFamily: "system-ui, -apple-system, 'Segoe UI', sans-serif",
         headings: { fontFamily: "inherit" },
