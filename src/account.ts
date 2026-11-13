@@ -1,13 +1,14 @@
+import { accountById } from "./accounts";
 import { deleteLocalAccount } from "./platform/auth-local";
 import { drainObjectCleanup } from "./object-cleanup";
 import type { Env } from "./types";
 
-export async function listMemberships(env: Env, sub: string) {
+export async function listMemberships(env: Env, accountId: string) {
   const res = await env.DB.prepare(
     `SELECT t.id, t.name, t.plan, t.created_at, m.role
      FROM tenant_members AS m JOIN tenants AS t ON t.id = m.tenant_id
-     WHERE m.user_sub = ?1 ORDER BY t.created_at ASC`,
-  ).bind(sub).all<{ id: string; name: string; plan: string; created_at: string; role: string }>();
+     WHERE m.account_id = ?1 ORDER BY t.created_at ASC`,
+  ).bind(accountId).all<{ id: string; name: string; plan: string; created_at: string; role: string }>();
   return res.results;
 }
 
@@ -38,26 +39,41 @@ export async function deleteWorkspace(env: Env, tenantId: string): Promise<void>
 }
 
 /** Delete only workspaces for which this user is still the sole owner. */
-export async function deleteAccountData(env: Env, sub: string): Promise<{ deleted_workspaces: string[] }> {
-  const memberships = await listMemberships(env, sub);
+export async function deleteAccountData(env: Env, accountId: string): Promise<{ deleted_workspaces: string[] }> {
+  const account = await accountById(env, accountId);
+  const memberships = await listMemberships(env, accountId);
   const deleted: string[] = [];
   for (const membership of memberships) {
     const results = await env.DB.batch([
       env.DB.prepare(`INSERT INTO object_cleanup (tenant_id, created_at, generation)
         SELECT id, ?3, lower(hex(randomblob(16))) FROM tenants WHERE id = ?1
-        AND EXISTS (SELECT 1 FROM tenant_members WHERE tenant_id = ?1 AND user_sub = ?2 AND role = 'owner')
-        AND NOT EXISTS (SELECT 1 FROM tenant_members WHERE tenant_id = ?1 AND user_sub != ?2 AND role = 'owner')
+        AND EXISTS (SELECT 1 FROM tenant_members WHERE tenant_id = ?1 AND account_id = ?2 AND role = 'owner')
+        AND NOT EXISTS (SELECT 1 FROM tenant_members WHERE tenant_id = ?1 AND account_id != ?2 AND role = 'owner')
         ON CONFLICT(tenant_id) DO UPDATE SET generation = excluded.generation`)
-        .bind(membership.id, sub, new Date().toISOString()),
+        .bind(membership.id, accountId, new Date().toISOString()),
       ...deletedWorkspaceCleanup(env, membership.id),
-      env.DB.prepare(`DELETE FROM tenant_members WHERE tenant_id = ?1 AND user_sub = ?2
+      env.DB.prepare(`DELETE FROM tenant_members WHERE tenant_id = ?1 AND account_id = ?2
         AND (role != 'owner' OR EXISTS (SELECT 1 FROM tenant_members AS other
-          WHERE other.tenant_id = ?1 AND other.user_sub != ?2 AND other.role = 'owner'))`)
-        .bind(membership.id, sub),
+          WHERE other.tenant_id = ?1 AND other.account_id != ?2 AND other.role = 'owner'))`)
+        .bind(membership.id, accountId),
     ]);
     if (Number(results[4]?.meta.changes ?? 0) === 1) deleted.push(membership.id);
   }
-  await deleteLocalAccount(env, sub);
+  // Remove the account itself: pending invites for its email, its session
+  // epochs, its local credentials (if any), and finally the subject mapping
+  // row, so no trace of the IdP subject remains in Hyo.
+  const cleanup: D1PreparedStatement[] = [];
+  if (account?.email) {
+    cleanup.push(
+      env.DB.prepare("DELETE FROM member_invites WHERE email = ?1").bind(account.email),
+    );
+  }
+  cleanup.push(
+    env.DB.prepare("DELETE FROM session_epochs WHERE account_id = ?1").bind(accountId),
+  );
+  await env.DB.batch(cleanup);
+  if (account) await deleteLocalAccount(env, account.subject);
+  await env.DB.prepare("DELETE FROM accounts WHERE id = ?1").bind(accountId).run();
   await drainObjectCleanup(env);
   return { deleted_workspaces: deleted };
 }

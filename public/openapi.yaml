@@ -925,9 +925,13 @@ paths:
                   members:
                     type: array
                     items: { $ref: "#/components/schemas/Member" }
+                  invites:
+                    type: array
+                    items: { $ref: "#/components/schemas/MemberInvite" }
     post:
       tags: [メンバー]
-      summary: メンバーを追加（オーナー）
+      summary: メンバーを追加・メールで招待（オーナー）
+      description: account_id 指定は既存アカウントを即時に追加します。email 指定は、既存アカウントなら即時に追加し、未登録なら招待として保留し初回ログイン時に参加します。認証プロバイダの sub は受け付けません。
       parameters:
         - $ref: "#/components/parameters/tenantId"
       requestBody:
@@ -936,19 +940,20 @@ paths:
           application/json:
             schema:
               type: object
-              required: [user_sub]
               properties:
-                user_sub: { type: string, description: 追加するユーザーの sub（識別子） }
+                account_id: { type: string, format: uuid, description: 追加するアカウントの内部 ID（アカウント画面に表示） }
+                email: { type: string, format: email, description: 招待するメールアドレス }
                 role: { type: string, enum: [owner, member], default: member }
       responses:
         "201":
-          description: 追加されたメンバー
+          description: 追加されたメンバー、または保留された招待
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   member: { $ref: "#/components/schemas/Member" }
+                  invite: { $ref: "#/components/schemas/MemberInvite" }
         "400": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
     patch:
@@ -963,9 +968,9 @@ paths:
           application/json:
             schema:
               type: object
-              required: [user_sub, role]
+              required: [account_id, role]
               properties:
-                user_sub: { type: string }
+                account_id: { type: string, format: uuid }
                 role: { type: string, enum: [owner, member] }
       responses:
         "200":
@@ -990,12 +995,38 @@ paths:
           application/json:
             schema:
               type: object
-              required: [user_sub]
+              required: [account_id]
               properties:
-                user_sub: { type: string }
+                account_id: { type: string, format: uuid }
       responses:
         "200":
           description: 削除結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed: { type: boolean }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/member-invites:
+    delete:
+      tags: [メンバー]
+      summary: メール招待を取り消し（オーナー）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200":
+          description: 取消結果
           content:
             application/json:
               schema:
@@ -1414,8 +1445,15 @@ components:
     Member:
       type: object
       properties:
-        user_sub: { type: string }
+        account_id: { type: string, format: uuid }
         email: { type: string, nullable: true }
+        name: { type: string, nullable: true }
+        role: { type: string, enum: [owner, member] }
+        created_at: { type: string, format: date-time }
+    MemberInvite:
+      type: object
+      properties:
+        email: { type: string, format: email }
         role: { type: string, enum: [owner, member] }
         created_at: { type: string, format: date-time }
     Webhook:

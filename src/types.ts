@@ -117,16 +117,20 @@ export type ApiScope = "read" | "write";
 
 export type AdminPrincipal =
   | { kind: "api_key"; tenantId: string; keyId: string; prefix: string; scope: ApiScope }
-  | { kind: "session"; tenantId: string; sub: string; role: "owner" | "member" };
+  | { kind: "session"; tenantId: string; accountId: string; role: "owner" | "member" };
 
-/** A signed-in user (admin UI session). The subject comes from the configured auth provider. */
+/**
+ * A signed-in user (admin UI session). Identified by the Hyo-internal
+ * account id; the identity provider's `sub` never appears here (it stays
+ * in the server-side accounts mapping, see src/accounts.ts).
+ */
 export interface SessionUser {
   kind: "session";
   sessionVersion?: number;
   /** OIDC session epoch at issue time; bumped server-side to revoke all sessions. */
   sessionEpoch?: number;
   authProvider?: "local" | "oidc";
-  sub: string;
+  accountId: string;
   name?: string;
   email?: string;
   exp: number;

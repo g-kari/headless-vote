@@ -110,7 +110,7 @@ export async function touchApiKey(env: Env, keyId: string): Promise<void> {
 export async function provisionTenant(
   env: Env,
   name: string,
-  ownerSub: string | null,
+  ownerAccountId: string | null,
 ): Promise<{ tenantId: string; apiKey: string }> {
   assertPlainText(name);
   // Shared by API and UI provisioning; keep the global abuse ceiling from main.
@@ -128,17 +128,17 @@ export async function provisionTenant(
        VALUES (?1, ?2, '初期キー', ?3, ?4, 'write', ?5)`,
     ).bind(randomId(), tenantId, hash, keyPrefix(apiKey), now),
   ];
-  if (ownerSub) {
+  if (ownerAccountId) {
     stmts.push(
       env.DB.prepare(
-        "INSERT INTO tenant_members (tenant_id, user_sub, role, created_at) VALUES (?1, ?2, 'owner', ?3)",
-      ).bind(tenantId, ownerSub, now),
+        "INSERT INTO tenant_members (tenant_id, account_id, role, created_at) VALUES (?1, ?2, 'owner', ?3)",
+      ).bind(tenantId, ownerAccountId, now),
     );
   }
   await env.DB.batch(stmts);
   await recordAudit(env, {
     tenantId,
-    actor: ownerSub ? `session:${ownerSub.slice(0, 80)}` : "bootstrap",
+    actor: ownerAccountId ? `session:${ownerAccountId}` : "bootstrap",
     action: "tenant.create",
     detail: name.slice(0, 80),
   });

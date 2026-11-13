@@ -2,7 +2,7 @@ import { Hono, type Context } from "hono";
 import { deleteAccountData, deleteWorkspace, listMemberships } from "../account";
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
-import { bearerToken, getSessionUser, optionalVoterSub, requireAdmin } from "../auth";
+import { bearerToken, getSessionUser, optionalVoterIdentity, requireAdmin } from "../auth";
 import { ballotCount, hashVoterKey, upsertBallot } from "../ballots";
 import { addTenantOrigin, listTenantOrigins, isAllowedTenantOrigin, removeTenantOrigin } from "../cors";
 import { randomId } from "../crypto";
@@ -26,7 +26,7 @@ import {
 import { putImageWithQuota } from "../image-quota";
 import { ApiError, badRequest, conflict, forbidden, notFound, unauthorized } from "../errors";
 import { findActiveApiKey, issueApiKey, limitKeyRotation, listApiKeys, provisionTenant, publicKey, revokeApiKey, rotatePresentedKey } from "../keys";
-import { addMember, listMembers, removeMember, setMemberRole } from "../members";
+import { addMember, cancelInvite, inviteMemberByEmail, listInvites, listMembers, removeMember, setMemberRole } from "../members";
 import { assertDailyVoteQuota, tenantQuotas } from "../quotas";
 import {
   ballotDocument,
@@ -780,7 +780,7 @@ api.get("/polls/:pollId/results", async (c) => {
 api.get("/polls/:pollId/ballot", async (c) => {
   await rateLimitByIp(c, "ballot-read", 600, 60);
   const poll = await loadPublicPoll(c.env, c.req.param("pollId"));
-  const sub = await optionalVoterSub(c);
+  const sub = await optionalVoterIdentity(c);
   if (poll.require_login === 1 && !sub) {
     throw unauthorized("LOGIN_REQUIRED", "This poll requires voters to log in");
   }
@@ -875,7 +875,7 @@ api.post("/polls/:pollId/vote", async (c) => {
   }
 
   // Voter identity: a verified login wins over an anonymous voter token.
-  const sub = await optionalVoterSub(c);
+  const sub = await optionalVoterIdentity(c);
   if (sub && !bearerToken(c)) {
     const origin = c.req.header("origin");
     const site = c.req.header("sec-fetch-site");
@@ -1240,26 +1240,38 @@ api.get("/tenants/:tenantId/polls/:pollId/analytics", async (c) => {
 api.get("/tenants/:tenantId/members", async (c) => {
   const tenantId = c.req.param("tenantId");
   await requireAdmin(c, tenantId, "read");
-  return c.json({ members: await listMembers(c.env, tenantId) });
+  return c.json({
+    members: await listMembers(c.env, tenantId),
+    invites: await listInvites(c.env, tenantId),
+  });
 });
 
 api.post("/tenants/:tenantId/members", async (c) => {
   const tenantId = c.req.param("tenantId");
   const admin = await requireAdmin(c, tenantId, "write", "owner");
   const body = await jsonBody(c);
-  const sub = body["user_sub"];
-  if (typeof sub !== "string") throw badRequest('"user_sub" must be a string');
-  const member = await addMember(c.env, tenantId, sub, body["role"] ?? "member", admin);
-  return c.json({ member }, 201);
+  const accountId = body["account_id"];
+  const email = body["email"];
+  if (typeof accountId === "string") {
+    const member = await addMember(c.env, tenantId, accountId, body["role"] ?? "member", admin);
+    return c.json({ member }, 201);
+  }
+  if (typeof email === "string") {
+    const outcome = await inviteMemberByEmail(c.env, tenantId, email, body["role"] ?? "member", admin);
+    return outcome.kind === "member"
+      ? c.json({ member: outcome.member }, 201)
+      : c.json({ invite: outcome.invite }, 201);
+  }
+  throw badRequest('"account_id" or "email" must be a string');
 });
 
 api.patch("/tenants/:tenantId/members", async (c) => {
   const tenantId = c.req.param("tenantId");
   const admin = await requireAdmin(c, tenantId, "write", "owner");
   const body = await jsonBody(c);
-  const sub = body["user_sub"];
-  if (typeof sub !== "string") throw badRequest('"user_sub" must be a string');
-  await setMemberRole(c.env, tenantId, sub, body["role"], admin);
+  const accountId = body["account_id"];
+  if (typeof accountId !== "string") throw badRequest('"account_id" must be a string');
+  await setMemberRole(c.env, tenantId, accountId, body["role"], admin);
   return c.json({ updated: true });
 });
 
@@ -1267,9 +1279,19 @@ api.delete("/tenants/:tenantId/members", async (c) => {
   const tenantId = c.req.param("tenantId");
   const admin = await requireAdmin(c, tenantId, "write", "owner");
   const body = await jsonBody(c);
-  const sub = body["user_sub"];
-  if (typeof sub !== "string") throw badRequest('"user_sub" must be a string');
-  await removeMember(c.env, tenantId, sub, admin);
+  const accountId = body["account_id"];
+  if (typeof accountId !== "string") throw badRequest('"account_id" must be a string');
+  await removeMember(c.env, tenantId, accountId, admin);
+  return c.json({ removed: true });
+});
+
+api.delete("/tenants/:tenantId/member-invites", async (c) => {
+  const tenantId = c.req.param("tenantId");
+  const admin = await requireAdmin(c, tenantId, "write", "owner");
+  const body = await jsonBody(c);
+  const email = body["email"];
+  if (typeof email !== "string") throw badRequest('"email" must be a string');
+  await cancelInvite(c.env, tenantId, email, admin);
   return c.json({ removed: true });
 });
 
@@ -1318,13 +1340,13 @@ api.get("/me", async (c) => {
   const user = await getSessionUser(c);
   if (!user) throw unauthorized("UNAUTHORIZED", "Sign in required");
   return c.json({
-    profile: { sub: user.sub, email: user.email, name: user.name },
+    profile: { account_id: user.accountId, email: user.email, name: user.name },
     auth: "oidc",
     password: null,
     note: selectAuthProvider(c.env.AUTH_PROVIDER).capabilities.localPasswords
       ? "This deployment stores passwords. Email confirmation and password reset use the configured email adapter."
       : "Sign-in is delegated to the configured identity provider. This app stores no password.",
-    workspaces: await listMemberships(c.env, user.sub),
+    workspaces: await listMemberships(c.env, user.accountId),
   });
 });
 
@@ -1334,8 +1356,8 @@ api.get("/me/export", async (c) => {
   c.header("content-disposition", 'attachment; filename="account.json"');
   c.header("cache-control", "private, no-store");
   return c.json({
-    profile: { sub: user.sub, email: user.email, name: user.name },
-    workspaces: await listMemberships(c.env, user.sub),
+    profile: { account_id: user.accountId, email: user.email, name: user.name },
+    workspaces: await listMemberships(c.env, user.accountId),
     note: "Secrets, voter tokens, and free-text answers are omitted.",
   });
 });
@@ -1348,7 +1370,7 @@ api.delete("/me", async (c) => {
   if (body["confirm"] !== "delete my data") {
     throw badRequest('Send {"confirm":"delete my data"} to delete this app\'s copy of your data');
   }
-  const result = await deleteAccountData(c.env, user.sub);
+  const result = await deleteAccountData(c.env, user.accountId);
   return c.json({ deleted: true, ...result, idp_account: "unchanged" });
 });
 

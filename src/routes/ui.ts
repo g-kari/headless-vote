@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import { deleteAccountData, deleteWorkspace, listMemberships } from "../account";
+import { subjectForAccount } from "../accounts";
 import { selectAuthProvider } from "../platform";
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { bumpSessionEpoch, clearSessionCookie, getSessionUser, isTenantMember, listTenantsForUser, memberRole } from "../auth";
@@ -21,7 +22,7 @@ import {
 import { listQuestionRows } from "../questions";
 import { computeResults, getPollRow, isClosedForVoting, listOptionRows, type PollResults } from "../domain";
 import { issueApiKey, limitKeyRotation, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
-import { addMember, listMembers, removeMember, setMemberRole } from "../members";
+import { addMember, cancelInvite, inviteMemberByEmail, listInvites, listMembers, removeMember, setMemberRole } from "../members";
 import { tenantQuotas } from "../quotas";
 import { createWebhook, disableWebhook, listWebhooks } from "../webhooks";
 import { ApiError } from "../errors";
@@ -52,7 +53,7 @@ async function requireMember(
   if (!id) return null;
   const user = await getSessionUser(c as never);
   if (!user) return null;
-  if (!(await isTenantMember(c.env, id, user.sub))) return null;
+  if (!(await isTenantMember(c.env, id, user.accountId))) return null;
   return user;
 }
 
@@ -62,11 +63,11 @@ async function requireOwnerUser(
 ): Promise<SessionUser | Response> {
   const user = await requireMember(c, tenantId);
   if (!user) return c.redirect("/admin", 302);
-  const role = await memberRole(c.env, tenantId, user.sub);
+  const role = await memberRole(c.env, tenantId, user.accountId);
   if (role !== "owner") {
     return c.html(layout({
       title: "権限がありません",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: `<h1>権限がありません</h1><p>メンバーの管理、API キー、Webhook、許可オリジン、ワークスペースの削除はオーナーだけが実行できます。</p>`,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -92,13 +93,13 @@ async function adminIpUiGuard(
   const tenantId = normalizeUuid(c.req.param("tenantId") ?? "");
   if (tenantId) {
     const user = await getSessionUser(c);
-    if (user && (await isTenantMember(c.env, tenantId, user.sub))) {
+    if (user && (await isTenantMember(c.env, tenantId, user.accountId))) {
       const clientIp = clientIpOf(c);
       if (!(await isAdminIpAllowed(c.env, tenantId, clientIp))) {
         return c.html(
           layout({
             title: "IP 制限によりアクセスできません",
-            userEmail: user.email ?? user.sub,
+            userEmail: user.email ?? user.name ?? user.accountId,
             body: `<h1>このワークスペースは IP 制限が有効です</h1>
               <p class="lead">現在のアクセス元 IP（<code>${escapeHtml(clientIp || "不明")}</code>）は、このワークスペースの管理画面の許可リストに含まれていません。</p>
               <p class="muted">許可されたネットワークからアクセスし直してください。許可リストの変更は、許可済み IP からオーナーが設定画面で行えます。</p>
@@ -148,7 +149,7 @@ ui.get("/", async (c) => {
   return c.html(
     layout({
       title: "投票 SaaS",
-      userEmail: user?.email ?? user?.sub ?? null,
+      userEmail: user?.email ?? user?.name ?? user?.accountId ?? null,
       body,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -168,7 +169,7 @@ ui.get("/admin", async (c) => {
     return c.html(layout({ title: "管理画面", userEmail: null, body, origin: originOf(c), nonce: c.get("cspNonce") ?? "" }));
   }
 
-  const tenants = await listTenantsForUser(c.env, user.sub);
+  const tenants = await listTenantsForUser(c.env, user.accountId);
   const rows = tenants
     .map(
       (t) => `<li>
@@ -191,7 +192,7 @@ ui.get("/admin", async (c) => {
   return c.html(
     layout({
       title: "ワークスペース",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -210,7 +211,7 @@ ui.post("/admin/workspaces", async (c) => {
     return c.html(
       layout({
         title: "エラー",
-        userEmail: user.email ?? user.sub,
+        userEmail: user.email ?? user.name ?? user.accountId,
         body: `<h1>名前を確認してください</h1><p class="muted">ワークスペース名は1〜120文字で入力してください。</p><p><a href="/admin">戻る</a></p>`,
         origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -218,7 +219,7 @@ ui.post("/admin/workspaces", async (c) => {
       400,
     );
   }
-  const { tenantId, apiKey } = await provisionTenant(c.env, name, user.sub);
+  const { tenantId, apiKey } = await provisionTenant(c.env, name, user.accountId);
   const body = `
     <h1>ワークスペースを作成しました</h1>
     <section class="section">
@@ -231,7 +232,7 @@ ui.post("/admin/workspaces", async (c) => {
   return c.html(
     layout({
       title: "ワークスペースを作成しました",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -276,7 +277,7 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
   )
     .bind(tenantId)
     .all<PollRow>();
-  const role = await memberRole(c.env, tenantId, user.sub);
+  const role = await memberRole(c.env, tenantId, user.accountId);
   const notifications = await c.env.DB.prepare(
     "SELECT id, message, created_at, read_at FROM app_notifications WHERE tenant_id = ?1 ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 10",
   )
@@ -369,7 +370,7 @@ ui.get("/admin/workspaces/:tenantId", async (c) => {
   return c.html(
     layout({
       title: tenant.name,
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -384,7 +385,7 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
   if (user instanceof Response) return user;
   assertSameOriginMutation(c);
   await readUrlEncodedForm(c);
-  const actor = { kind: "session" as const, tenantId, sub: user.sub, role: "owner" as const };
+  const actor = { kind: "session" as const, tenantId, accountId: user.accountId, role: "owner" as const };
   await limitKeyRotation(c.env, tenantId);
   const existing = await listApiKeys(c.env, tenantId);
   for (const key of existing) {
@@ -402,7 +403,7 @@ ui.post("/admin/workspaces/:tenantId/rotate-key", async (c) => {
   return c.html(
     layout({
       title: "API キーを再発行しました",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -423,7 +424,7 @@ ui.post("/admin/workspaces/:tenantId/api-keys", async (c) => {
     const issued = await issueApiKey(c.env, tenantId, name, scope, {
       kind: "session",
       tenantId,
-      sub: user.sub,
+      accountId: user.accountId,
       role: "owner",
     });
     const body = `
@@ -435,7 +436,7 @@ ui.post("/admin/workspaces/:tenantId/api-keys", async (c) => {
       </section>`;
     return c.html(layout({
       title: "API キーを発行しました",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -444,7 +445,7 @@ ui.post("/admin/workspaces/:tenantId/api-keys", async (c) => {
     if (!(err instanceof ApiError)) throw err;
     return c.html(layout({
       title: "エラー",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: `<h1>キーを発行できません</h1><p class="muted">${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}">戻る</a></p>`,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -461,7 +462,7 @@ ui.post("/admin/workspaces/:tenantId/api-keys/revoke", async (c) => {
   const form = await readUrlEncodedForm(c);
   const keyId = String(form.get("key_id") ?? "");
   if (!normalizeUuid(keyId)) return c.redirect(`/admin/workspaces/${tenantId}`, 302);
-  await revokeApiKey(c.env, tenantId, keyId, { kind: "session", tenantId, sub: user.sub, role: "owner" });
+  await revokeApiKey(c.env, tenantId, keyId, { kind: "session", tenantId, accountId: user.accountId, role: "owner" });
   return c.redirect(`/admin/workspaces/${tenantId}`, 303);
 });
 
@@ -599,18 +600,32 @@ async function settingsExtras(
 ) {
   const quotas = await tenantQuotas(env, tenantId);
   const members = await listMembers(env, tenantId);
+  const invites = await listInvites(env, tenantId);
   const hooks = await listWebhooks(env, tenantId);
   const tid = escapeHtml(tenantId);
   const memberItems = members
-    .map((member) => `<li><code>${escapeHtml(member.user_sub)}</code> ${member.role === "owner" ? "オーナー" : "メンバー"}
+    .map((member) => {
+      const label = member.name || member.email
+        ? `${escapeHtml(member.name ?? "")}${member.name && member.email ? " " : ""}${member.email ? `&lt;${escapeHtml(member.email)}&gt;` : ""} <code>${escapeHtml(member.account_id)}</code>`
+        : `<code>${escapeHtml(member.account_id)}</code>`;
+      return `<li>${label} ${member.role === "owner" ? "オーナー" : "メンバー"}
       ${owner ? `<form method="post" action="/admin/workspaces/${tid}/members/role" style="display:inline">
-        <input type="hidden" name="user_sub" value="${escapeHtml(member.user_sub)}">
+        <input type="hidden" name="account_id" value="${escapeHtml(member.account_id)}">
         <input type="hidden" name="role" value="${member.role === "owner" ? "member" : "owner"}">
         <button class="btn small" type="submit">${member.role === "owner" ? "メンバーにする" : "オーナーにする"}</button>
       </form>
       <form method="post" action="/admin/workspaces/${tid}/members/remove" style="display:inline">
-        <input type="hidden" name="user_sub" value="${escapeHtml(member.user_sub)}">
+        <input type="hidden" name="account_id" value="${escapeHtml(member.account_id)}">
         <button class="btn small danger" type="submit">外す</button>
+      </form>` : ""}
+    </li>`;
+    })
+    .join("");
+  const inviteItems = invites
+    .map((invite) => `<li>${escapeHtml(invite.email)} ${invite.role === "owner" ? "オーナー" : "メンバー"}（招待中・初回ログインで参加）
+      ${owner ? `<form method="post" action="/admin/workspaces/${tid}/members/invite-remove" style="display:inline">
+        <input type="hidden" name="email" value="${escapeHtml(invite.email)}">
+        <button class="btn small danger" type="submit">招待を取り消す</button>
       </form>` : ""}
     </li>`)
     .join("");
@@ -689,10 +704,12 @@ document.getElementById('branding-form').addEventListener('submit', async (ev) =
     </section>`,
     quotas: `<h2>利用上限</h2><section class="section"><p>プラン <strong>${escapeHtml(quotas.plan)}</strong>。投票 ${quotas.polls} 件、有効な API キー ${quotas.keys} 個、Webhook ${quotas.webhooks} 件、1 日の投票送信 ${quotas.votesPerDay} 件まで。上限はワークスペースに保存され、自分では引き上げられません。</p></section>`,
     members: `<h2>メンバー</h2><section class="section">${memberItems ? `<ul>${memberItems}</ul>` : `<p class="muted">メンバーはいません。</p>`}
+      ${inviteItems ? `<h3>招待中</h3><ul>${inviteItems}</ul>` : ""}
       ${owner ? `<form method="post" action="/admin/workspaces/${tid}/members" aria-labelledby="member-heading">
-        <h3 id="member-heading">利用者 ID（sub）で追加</h3>
-        <label for="member-sub">sub</label>
-        <input id="member-sub" name="user_sub" type="text" required maxlength="256" autocomplete="off" spellcheck="false">
+        <h3 id="member-heading">アカウント ID またはメールアドレスで追加</h3>
+        <label for="member-identifier">アカウント ID / メールアドレス</label>
+        <input id="member-identifier" name="identifier" type="text" required maxlength="256" autocomplete="off" spellcheck="false">
+        <p class="muted small">アカウント ID は、追加したい人のアカウント画面に表示される Hyo 内部の ID です。メールアドレスで追加すると、そのアドレスのアカウントが既にあれば即時に参加し、まだ無ければ招待として保留され、相手の初回ログイン時に参加します。招待メールはこのアプリから送りません。</p>
         <label for="member-role">役割</label>
         <select id="member-role" name="role"><option value="member" selected>メンバー</option><option value="owner">オーナー</option></select>
         <div class="actions"><button class="btn" type="submit">追加する</button></div>
@@ -720,11 +737,11 @@ ui.get("/admin/workspaces/:tenantId/settings", async (c) => {
     .first<{ name: string }>();
   if (!tenant) return c.redirect("/admin", 302);
   const origins = await listTenantOrigins(c.env, tenantId);
-  const owner = (await memberRole(c.env, tenantId, user.sub)) === "owner";
+  const owner = (await memberRole(c.env, tenantId, user.accountId)) === "owner";
   return c.html(
     layout({
       title: "設定",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: settingsBody(tenantId, tenant.name, origins, null, owner, await settingsExtras(c.env, tenantId, owner, c.get("cspNonce") ?? "", { currentIp: clientIpOf(c) })),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -750,7 +767,7 @@ ui.post("/admin/workspaces/:tenantId/origins", async (c) => {
       return c.html(
         layout({
           title: "設定",
-          userEmail: user.email ?? user.sub,
+          userEmail: user.email ?? user.name ?? user.accountId,
           body: settingsBody(tenantId, tenant?.name ?? "", origins, err.message, true, await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "", { currentIp: clientIpOf(c) })),
           origin: originOf(c),
           nonce: c.get("cspNonce") ?? "",
@@ -794,7 +811,7 @@ ui.post("/admin/workspaces/:tenantId/ip-restriction", async (c) => {
     return c.html(
       layout({
         title: "設定",
-        userEmail: user.email ?? user.sub,
+        userEmail: user.email ?? user.name ?? user.accountId,
         body: settingsBody(
           tenantId,
           tenant?.name ?? "",
@@ -839,7 +856,7 @@ ui.post("/admin/workspaces/:tenantId/ip-restriction", async (c) => {
   await saveIpRestriction(c.env, tenantId, entries);
   await recordAudit(c.env, {
     tenantId,
-    actor: actorLabel({ kind: "session", tenantId, sub: user.sub, role: "owner" }),
+    actor: actorLabel({ kind: "session", tenantId, accountId: user.accountId, role: "owner" }),
     action: "admin_ip_restriction.update",
     detail: entries.length > 0 ? `entries=${entries.length}` : "restriction cleared",
   });
@@ -860,7 +877,7 @@ ui.post("/admin/workspaces/:tenantId/delete", async (c) => {
     const origins = await listTenantOrigins(c.env, tenantId);
     return c.html(layout({
       title: "設定",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: settingsBody(tenantId, tenant?.name ?? "", origins, "ワークスペース名が一致しません。", true, await settingsExtras(c.env, tenantId, true, c.get("cspNonce") ?? "", { currentIp: clientIpOf(c) })),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -895,7 +912,7 @@ ui.get("/admin/workspaces/:tenantId/audit", async (c) => {
     </section>`;
   return c.html(layout({
     title: "操作履歴",
-    userEmail: user.email ?? user.sub,
+    userEmail: user.email ?? user.name ?? user.accountId,
     body,
     origin: originOf(c),
     nonce: c.get("cspNonce") ?? "",
@@ -915,7 +932,7 @@ ui.get("/admin/workspaces/:tenantId/analytics", async (c) => {
     <section class="section">${seriesTable(days)}</section>`;
   return c.html(layout({
     title: "投票の推移",
-    userEmail: user.email ?? user.sub,
+    userEmail: user.email ?? user.name ?? user.accountId,
     body,
     origin: originOf(c),
     nonce: c.get("cspNonce") ?? "",
@@ -938,7 +955,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/analytics", async (c) => {
     <section class="section">${seriesTable(days)}</section>`;
   return c.html(layout({
     title: "投票の推移",
-    userEmail: user.email ?? user.sub,
+    userEmail: user.email ?? user.name ?? user.accountId,
     body,
     origin: originOf(c),
     nonce: c.get("cspNonce") ?? "",
@@ -953,18 +970,49 @@ ui.post("/admin/workspaces/:tenantId/members", async (c) => {
   assertSameOriginMutation(c);
   const form = await readUrlEncodedForm(c);
   try {
-    await addMember(c.env, tenantId, String(form.get("user_sub") ?? ""), form.get("role") === "owner" ? "owner" : "member", {
-      kind: "session",
+    const identifier = String(form.get("identifier") ?? "").trim();
+    const role = form.get("role") === "owner" ? "owner" : "member";
+    const actor = {
+      kind: "session" as const,
       tenantId,
-      sub: user.sub,
-      role: "owner",
+      accountId: user.accountId,
+      role: "owner" as const,
+    };
+    if (identifier.includes("@")) {
+      await inviteMemberByEmail(c.env, tenantId, identifier, role, actor);
+    } else {
+      await addMember(c.env, tenantId, identifier, role, actor);
+    }
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    return c.html(layout({
+      title: "設定",
+      userEmail: user.email ?? user.name ?? user.accountId,
+      body: `<h1>メンバーを追加できません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
+      origin: originOf(c),
+      nonce: c.get("cspNonce") ?? "",
+    }), 400);
+  }
+  return c.redirect(`/admin/workspaces/${tenantId}/settings`, 303);
+});
+
+ui.post("/admin/workspaces/:tenantId/members/invite-remove", async (c) => {
+  const tenantId = routeTenant(c);
+  if (!tenantId) return c.redirect("/admin", 302);
+  const user = await requireOwnerUser(c, tenantId);
+  if (user instanceof Response) return user;
+  assertSameOriginMutation(c);
+  const form = await readUrlEncodedForm(c);
+  try {
+    await cancelInvite(c.env, tenantId, String(form.get("email") ?? ""), {
+      kind: "session", tenantId, accountId: user.accountId, role: "owner",
     });
   } catch (err) {
     if (!(err instanceof ApiError)) throw err;
     return c.html(layout({
       title: "設定",
-      userEmail: user.email ?? user.sub,
-      body: `<h1>メンバーを追加できません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
+      userEmail: user.email ?? user.name ?? user.accountId,
+      body: `<h1>招待を取り消せません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }), 400);
@@ -980,14 +1028,14 @@ ui.post("/admin/workspaces/:tenantId/members/role", async (c) => {
   assertSameOriginMutation(c);
   const form = await readUrlEncodedForm(c);
   try {
-    await setMemberRole(c.env, tenantId, String(form.get("user_sub") ?? ""), form.get("role"), {
-      kind: "session", tenantId, sub: user.sub, role: "owner",
+    await setMemberRole(c.env, tenantId, String(form.get("account_id") ?? ""), form.get("role"), {
+      kind: "session", tenantId, accountId: user.accountId, role: "owner",
     });
   } catch (err) {
     if (!(err instanceof ApiError)) throw err;
     return c.html(layout({
       title: "設定",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: `<h1>役割を変更できません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -1004,14 +1052,14 @@ ui.post("/admin/workspaces/:tenantId/members/remove", async (c) => {
   assertSameOriginMutation(c);
   const form = await readUrlEncodedForm(c);
   try {
-    await removeMember(c.env, tenantId, String(form.get("user_sub") ?? ""), {
-      kind: "session", tenantId, sub: user.sub, role: "owner",
+    await removeMember(c.env, tenantId, String(form.get("account_id") ?? ""), {
+      kind: "session", tenantId, accountId: user.accountId, role: "owner",
     });
   } catch (err) {
     if (!(err instanceof ApiError)) throw err;
     return c.html(layout({
       title: "設定",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: `<h1>メンバーを外せません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -1041,7 +1089,7 @@ ui.post("/admin/workspaces/:tenantId/webhooks", async (c) => {
       </section>`;
     return c.html(layout({
       title: "Webhook を追加しました",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -1050,7 +1098,7 @@ ui.post("/admin/workspaces/:tenantId/webhooks", async (c) => {
     if (!(err instanceof ApiError)) throw err;
     return c.html(layout({
       title: "設定",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: `<h1>Webhook を追加できません</h1><p>${escapeHtml(err.message)}</p><p><a href="/admin/workspaces/${escapeHtml(tenantId)}/settings">戻る</a></p>`,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -1073,7 +1121,7 @@ ui.post("/admin/workspaces/:tenantId/webhooks/disable", async (c) => {
 ui.get("/admin/account", async (c) => {
   const user = await getSessionUser(c);
   if (!user) return c.redirect("/admin", 302);
-  const memberships = await listMemberships(c.env, user.sub);
+  const memberships = await listMemberships(c.env, user.accountId);
   const rows = memberships
     .map((m) => `<tr><td>${escapeHtml(m.name)}</td><td>${m.role === "owner" ? "オーナー" : "メンバー"}</td><td>${escapeHtml(m.plan)}</td></tr>`)
     .join("");
@@ -1083,7 +1131,8 @@ ui.get("/admin/account", async (c) => {
       <h2>プロフィール</h2>
       <p>名前: ${escapeHtml(user.name ?? "未設定")}</p>
       <p>メール: ${escapeHtml(user.email ?? "未設定")}</p>
-      <p>sub: <code>${escapeHtml(user.sub)}</code></p>
+      <p>アカウント ID: <code>${escapeHtml(user.accountId)}</code></p>
+      <p class="muted small">Hyo 内部のアカウント ID です。ワークスペースへ招待してもらうときに使います。ログイン先の認証プロバイダの識別子は Hyo の画面や API には表示しません。</p>
       <p class="muted">${selectAuthProvider(c.env.AUTH_PROVIDER).capabilities.localPasswords
         ? "このデプロイはメールとパスワードを保存します。確認と再設定のリンクは、設定したメール送信アダプタから届きます。"
         : `${escapeHtml(selectAuthProvider(c.env.AUTH_PROVIDER).label(c.env))} でログインしています。このアプリはパスワードを保存しないため、メール確認とパスワード再設定は認証プロバイダ側の機能です。`}</p>
@@ -1111,7 +1160,7 @@ ui.get("/admin/account", async (c) => {
     </section>`;
   return c.html(layout({
     title: "アカウント",
-    userEmail: user.email ?? user.sub,
+    userEmail: user.email ?? user.name ?? user.accountId,
     body,
     origin: originOf(c),
     nonce: c.get("cspNonce") ?? "",
@@ -1122,15 +1171,19 @@ ui.post("/admin/account/revoke-sessions", async (c) => {
   const user = await getSessionUser(c);
   if (!user) return c.redirect("/admin", 302);
   assertSameOriginMutation(c);
-  if (user.sub.startsWith("local:")) {
+  if (user.authProvider === "local") {
     // Local accounts version their sessions on the user row instead.
-    await c.env.DB.prepare(
-      "UPDATE local_users SET session_version = session_version + 1 WHERE id = ?1",
-    )
-      .bind(user.sub.slice("local:".length))
-      .run();
+    const subject = await subjectForAccount(c.env, user.accountId);
+    const localId = subject?.startsWith("local:") ? subject.slice("local:".length) : null;
+    if (localId) {
+      await c.env.DB.prepare(
+        "UPDATE local_users SET session_version = session_version + 1 WHERE id = ?1",
+      )
+        .bind(localId)
+        .run();
+    }
   } else {
-    await bumpSessionEpoch(c.env, user.sub);
+    await bumpSessionEpoch(c.env, user.accountId);
   }
   c.header("Set-Cookie", clearSessionCookie(c.req.url));
   return c.redirect("/admin", 303);
@@ -1144,13 +1197,13 @@ ui.post("/admin/account/delete", async (c) => {
   if (String(form.get("confirm") ?? "") !== "delete my data") {
     return c.html(layout({
       title: "アカウント",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: `<h1>削除できません</h1><p>確認の文字列が一致しません。</p><p><a href="/admin/account">戻る</a></p>`,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
     }), 400);
   }
-  await deleteAccountData(c.env, user.sub);
+  await deleteAccountData(c.env, user.accountId);
   return c.redirect("/", 303);
 });
 
@@ -1520,7 +1573,7 @@ ui.get("/admin/workspaces/:tenantId/polls/new", async (c) => {
   return c.html(
     layout({
       title: "新しい投票を作る",
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body: pollFormBody({ tenantId, poll: null, questions: [], nonce: c.get("cspNonce") ?? "" }),
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",
@@ -1715,7 +1768,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
   return c.html(
     layout({
       title: poll.question,
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body,
       origin,
       nonce: c.get("cspNonce") ?? "",
@@ -2053,7 +2106,7 @@ ui.get("/admin/workspaces/:tenantId/polls/:pollId/results", async (c) => {
   return c.html(
     layout({
       title: `結果: ${poll.question}`,
-      userEmail: user.email ?? user.sub,
+      userEmail: user.email ?? user.name ?? user.accountId,
       body,
       origin: originOf(c),
       nonce: c.get("cspNonce") ?? "",

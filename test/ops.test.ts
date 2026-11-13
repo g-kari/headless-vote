@@ -26,6 +26,32 @@ function auth(apiKey: string): Record<string, string> {
   return { authorization: `Bearer ${apiKey}`, "content-type": "application/json" };
 }
 
+/** Seed an accounts-mapping row for a subject and return its internal id. */
+async function seedAccount(subject: string): Promise<string> {
+  const existing = await env.DB.prepare("SELECT id FROM accounts WHERE subject = ?1")
+    .bind(subject)
+    .first<{ id: string }>();
+  if (existing) return existing.id;
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO accounts (id, subject, email, name, created_at, last_seen_at) VALUES (?1, ?2, NULL, NULL, ?3, ?3)",
+  )
+    .bind(id, subject, now)
+    .run();
+  return id;
+}
+
+async function seedMembership(tenantId: string, subject: string, role: string): Promise<string> {
+  const accountId = await seedAccount(subject);
+  await env.DB.prepare(
+    "INSERT INTO tenant_members (tenant_id, account_id, role, created_at) VALUES (?1, ?2, ?3, ?4)",
+  )
+    .bind(tenantId, accountId, role, new Date().toISOString())
+    .run();
+  return accountId;
+}
+
 async function publishedPoll(tenant: { id: string; apiKey: string }) {
   const created = await SELF.fetch(`${BASE}/api/v1/tenants/${tenant.id}/polls`, {
     method: "POST",
@@ -150,28 +176,25 @@ describe("roles, quotas, and account data", () => {
       body: JSON.stringify({ name: "読", scope: "read" }),
     });
     const readKey = ((await read.json()) as { api_key: string }).api_key;
+    const memberAccountId = await seedAccount("member-sub");
     const denied = await SELF.fetch(`${BASE}/api/v1/tenants/${tenant.id}/members`, {
       method: "POST",
       headers: auth(readKey),
-      body: JSON.stringify({ user_sub: "member-sub", role: "member" }),
+      body: JSON.stringify({ account_id: memberAccountId, role: "member" }),
     });
     expect(denied.status).toBe(403);
 
     const added = await SELF.fetch(`${BASE}/api/v1/tenants/${tenant.id}/members`, {
       method: "POST",
       headers: auth(tenant.apiKey),
-      body: JSON.stringify({ user_sub: "member-sub", role: "member" }),
+      body: JSON.stringify({ account_id: memberAccountId, role: "member" }),
     });
     expect(added.status).toBe(201);
-    await env.DB.prepare(
-      "INSERT INTO tenant_members (tenant_id, user_sub, role, created_at) VALUES (?1, 'only-owner', 'owner', ?2)",
-    )
-      .bind(tenant.id, new Date().toISOString())
-      .run();
+    const onlyOwnerId = await seedMembership(tenant.id, "only-owner", "owner");
     const demote = await SELF.fetch(`${BASE}/api/v1/tenants/${tenant.id}/members`, {
       method: "PATCH",
       headers: auth(tenant.apiKey),
-      body: JSON.stringify({ user_sub: "only-owner", role: "member" }),
+      body: JSON.stringify({ account_id: onlyOwnerId, role: "member" }),
     });
     expect(demote.status).toBe(409);
 
@@ -212,11 +235,7 @@ describe("roles, quotas, and account data", () => {
     const tenantId = /\/admin\/workspaces\/([0-9a-f-]{36})/.exec(html)?.[1];
     expect(tenantId).toBeTruthy();
 
-    await env.DB.prepare(
-      "INSERT INTO tenant_members (tenant_id, user_sub, role, created_at) VALUES (?1, 'plain-member', 'member', ?2)",
-    )
-      .bind(tenantId, new Date().toISOString())
-      .run();
+    await seedMembership(tenantId as string, "plain-member", "member");
     const memberSession = await loginAs("plain-member", "member@example.com");
     const settings = await SELF.fetch(`${BASE}/admin/workspaces/${tenantId}/settings`, {
       headers: { cookie: `__Host-hv_session=${memberSession}` },
