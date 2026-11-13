@@ -13,6 +13,9 @@ export const ASSET_PATHS = new Set([
   "/apple-touch-icon.png",
   "/logo.svg",
   "/ogp.png",
+  "/openapi.yaml",
+  "/redoc.standalone.js",
+  "/redoc.standalone.js.LICENSE.txt",
 ]);
 
 const UUID_RE =
@@ -298,7 +301,7 @@ export function applySecurityHeaders(c: AppContext, opts?: { html?: boolean }): 
   if (new URL(c.req.url).protocol === "https:") {
     c.header("Strict-Transport-Security", "max-age=31536000");
   }
-  c.header("Content-Security-Policy", contentSecurityPolicy(nonce, html));
+  c.header("Content-Security-Policy", contentSecurityPolicy(nonce, html, path === "/docs"));
   c.header(
     "Cross-Origin-Resource-Policy",
     embed || ASSET_PATHS.has(path) ? "cross-origin" : "same-origin",
@@ -328,9 +331,31 @@ function isEmbedPath(pathname: string): boolean {
   );
 }
 
-function contentSecurityPolicy(nonce: string, html: boolean): string {
+function contentSecurityPolicy(nonce: string, html: boolean, docs = false): string {
   if (!html) {
     return "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+  }
+  if (docs) {
+    // The /docs page renders the repo-managed OpenAPI spec with the vendored
+    // Redoc bundle. Redoc injects runtime <style> elements (styled-components)
+    // and renders markdown through innerHTML, so this single page relaxes
+    // style-src and omits require-trusted-types-for. It serves only
+    // first-party static content (the spec and the bundle); every other page
+    // keeps the strict policy below.
+    return [
+      "default-src 'none'",
+      `script-src 'nonce-${nonce}' 'strict-dynamic'`,
+      `style-src 'nonce-${nonce}' 'unsafe-inline'`,
+      "style-src-attr 'unsafe-inline'",
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      "worker-src blob:",
+      "child-src blob:",
+      "form-action 'self'",
+      "base-uri 'none'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+    ].join("; ");
   }
   const script = nonce
     ? `script-src 'nonce-${nonce}' 'strict-dynamic'`

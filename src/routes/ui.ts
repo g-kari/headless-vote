@@ -1613,117 +1613,63 @@ function resultsSections(results: PollResults, poll: PollRow): string {
 
 
 ui.get("/docs", async (c) => {
-  const origin = originOf(c);
   const nonce = c.get("cspNonce") ?? "";
-  const user = await getSessionUser(c);
-  const body = `
-    <h1>API 仕様書</h1>
-    <p class="lead">Hyo の公開 API と管理 API の使い方です。ベース URL は <code>${escapeHtml(origin)}</code>、形式は JSON です。</p>
-    <h2>認証</h2>
-    <section class="section">
-      <p>管理 API は次のどちらかで認証します。</p>
-      <ul>
-        <li>API キー: <code>Authorization: Bearer hv_...</code>。キーはワークスペース作成時に発行され、<code>read</code>（参照・書き出し）と <code>write</code>（作成・更新・失効）の 2 つの権限があります。キーの追加発行・失効・ローテーションは管理 API と設定画面から行えます。</li>
-        <li>管理画面のログインセッション（Cookie）。画面と同じ操作を fetch で呼べます。</li>
-      </ul>
-      <p>公開 API（投票の取得・投票・結果・自分の票・QR・共有画像）は認証不要です。投票にログインが必須の投票では、投票だけログインセッションが必要です。</p>
-    </section>
-    <h2>公開 API</h2>
-    <section class="section">
-      <ul>
-        <li><code>GET /api/v1/polls/:pollId</code> — 投票と設問（形式・表示条件を含む）を取得</li>
-        <li><code>POST /api/v1/polls/:pollId/vote</code> — 投票する（下の形式）</li>
-        <li><code>GET /api/v1/polls/:pollId/results</code> — 設問ごとの集計。公開範囲が「締切後」や「非公開」の投票では 403</li>
-        <li><code>GET /api/v1/polls/:pollId/ballot?voter_token=...</code> — 自分の票の控えと変更可否</li>
-        <li><code>GET /api/v1/polls/:pollId/qr.svg</code> — 結果ページへの QR コード（SVG）</li>
-        <li><code>GET /api/v1/polls/:pollId/og.svg</code> — 共有用画像（SVG、ブランド色を反映）</li>
-        <li><code>GET /polls/:pollId/results-page</code> — 人間向けの結果ページ（10 秒ごとに自動更新）</li>
-      </ul>
-      <h3>投票のリクエスト</h3>
-      <pre>${escapeHtml(`POST /api/v1/polls/<pollId>/vote
-{
-  "voter_token": "stable-id-for-this-voter",
-  "answers": [
-    { "question_id": "<id>", "option_ids": ["<option id>"] },
-    { "question_id": "<id>", "text": "自由記述の回答" },
-    { "question_id": "<id>", "scores": { "<option id>": 5 } }
-  ]
-}`)}</pre>
-      <p class="muted small">voter_token は投票者を識別する安定した文字列（8〜128 文字）で、同じトークンの再投票は前の票を上書きします。設問の形式は single（1 つだけ）、multiple（複数可）、text（自由記述）、ranking（option_ids の並びが順位）、score（選択肢ごとに 0〜5 点）です。表示条件（show_if）が付いた設問は、条件を満たさない回答では送らなくて構いません。確認ステップ必須の投票では <code>confirm: true</code> が必要です。</p>
-    </section>
-    <h2>管理 API</h2>
-    <section class="section">
-      <ul>
-        <li><code>POST /api/v1/tenants</code> — ワークスペース作成（API キーを返す）</li>
-        <li><code>POST /api/v1/tenants/:id/polls</code> — 投票作成（questions 配列で複数設問、最大 20 問）</li>
-        <li><code>PATCH /api/v1/tenants/:id/polls/:pollId</code> — 投票の編集</li>
-        <li><code>POST /api/v1/tenants/:id/polls/:pollId/status</code> — 公開・締切（published / closed）</li>
-        <li><code>POST /api/v1/tenants/:id/polls/:pollId/duplicate</code> — 投票の複製（下書きとして）</li>
-        <li><code>GET /api/v1/tenants/:id/polls/:pollId/results</code> — 管理用の集計</li>
-        <li><code>GET /api/v1/tenants/:id/polls/:pollId/export?format=csv|json</code> — 書き出し</li>
-        <li><code>GET /api/v1/tenants/:id/polls/:pollId/analytics</code> — 日別の投票推移</li>
-        <li><code>POST /api/v1/tenants/:id/templates</code> / <code>GET /api/v1/tenants/:id/templates</code> / <code>POST /api/v1/tenants/:id/templates/:templateId/polls</code> / <code>DELETE /api/v1/tenants/:id/templates/:templateId</code> — テンプレート</li>
-        <li><code>GET /api/v1/tenants/:id/api-keys</code>、<code>POST</code>、<code>POST /api/v1/tenants/:id/api-keys/:keyId/revoke</code>、<code>POST /api/v1/tenants/:id/rotate-key</code> — キー管理</li>
-        <li><code>PATCH /api/v1/tenants/:id/branding</code> — ブランド色とロゴ（オーナー）</li>
-        <li><code>GET /api/v1/tenants/:id/notifications</code>、<code>POST /api/v1/tenants/:id/notifications/:notificationId/read</code> — 通知</li>
-        <li><code>GET /api/v1/tenants/:id/audit</code> — 操作履歴</li>
-        <li><code>GET /api/v1/tenants/:id/export</code> — ワークスペースの書き出し</li>
-      </ul>
-      <h3>サンプル（JavaScript）</h3>
-      <pre>${escapeHtml(`const base = "${origin}";
-const key = "hv_..."; // write キー
-const created = await fetch(base + "/api/v1/tenants/<tenantId>/polls", {
-  method: "POST",
-  headers: { "content-type": "application/json", authorization: "Bearer " + key },
-  body: JSON.stringify({
-    question: "好きな季節は？",
-    questions: [
-      { prompt: "季節", kind: "single", options: [{ label: "春" }, { label: "夏" }, { label: "秋" }, { label: "冬" }] },
-      { prompt: "理由", kind: "text", required: false },
-    ],
-  }),
-}).then((r) => r.json());`)}</pre>
-    </section>
-    <h2>Webhook</h2>
-    <section class="section">
-      <p>イベントは <code>vote.cast</code>、<code>poll.published</code>、<code>poll.closed</code>、<code>poll.updated</code>、<code>poll.closing_soon</code>（締切 48 時間以内に 1 回）です。本文は JSON（<code>id</code>、<code>type</code>、<code>created_at</code>、<code>tenant_id</code>、<code>data</code>）で、ヘッダー <code>X-Headless-Vote-Event</code> と署名 <code>X-Headless-Vote-Signature: v1=&lt;hex&gt;</code>（本文全体の HMAC-SHA256）が付きます。検証サンプル:</p>
-      <pre>${escapeHtml(`import { createHmac, timingSafeEqual } from "node:crypto";
-
-function verify(secret, rawBody, signatureHeader) {
-  const expected = "v1=" + createHmac("sha256", secret)
-    .update(rawBody)
-    .digest("hex");
-  const a = Buffer.from(expected);
-  const b = Buffer.from(signatureHeader);
-  return a.length === b.length && timingSafeEqual(a, b);
-}`)}</pre>
-      <p class="muted small">配送結果（HTTP ステータス）はサーバ側に記録されます。本文の <code>id</code> がイベントごとの一意な ID なので、受け側での重複判定に使えます。URL は公開前に検証され、プライベートアドレス宛ては送られません。</p>
-    </section>
-    <h2>埋め込みと CORS</h2>
-    <section class="section">
-      <p>別サイトのブラウザから公開 API を読む場合は、そのオリジンをワークスペース設定の許可リストに追加してください。各投票の管理画面に、設問形式に応じた埋め込み用スニペットを用意しています。</p>
-    </section>
-    <h2>主なエラーコード</h2>
-    <section class="section">
-      <ul>
-        <li><code>POLL_NOT_OPEN</code>（409）— 開始日時より前</li>
-        <li><code>POLL_CLOSED</code>（409）— 締切済み</li>
-        <li><code>CONFIRM_REQUIRED</code>（409）— 確認ステップ必須の投票で confirm が無い</li>
-        <li><code>LOGIN_REQUIRED</code>（401）— ログイン必須の投票</li>
-        <li><code>OPTIONS_LOCKED</code>（409）— 投票が入った後の設問・選択肢の構造変更</li>
-        <li><code>QUOTA_EXCEEDED</code>（409）— 件数や 1 日の上限</li>
-        <li><code>RATE_LIMITED</code>（429）— 短時間の大量リクエスト</li>
-      </ul>
-    </section>`;
-  return c.html(
-    layout({
-      title: "API 仕様書",
-      userEmail: user?.email ?? user?.sub ?? null,
-      body,
-      origin,
-      nonce,
-    }),
-  );
+  // Standalone page (not the shared layout): Redoc needs the full viewport
+  // width. The spec lives in public/openapi.yaml and the Redoc bundle is
+  // vendored at public/redoc.standalone.js; /docs gets a dedicated CSP
+  // variant in security.ts for Redoc's runtime styles and markdown.
+  const body = `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>API 仕様書 | Hyo</title>
+<meta name="description" content="Hyo の API 仕様書（OpenAPI / Redoc）">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon-32x32.png" type="image/png" sizes="32x32">
+<link rel="icon" href="/favicon-16x16.png" type="image/png" sizes="16x16">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<style nonce="${escapeHtml(nonce)}">
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+  .docs-bar{display:flex;align-items:center;gap:1rem;padding:.6rem 1rem;border-bottom:2px solid #111;background:#fff}
+  .docs-bar .brand{font-weight:800;font-size:1.15rem;color:#111;text-decoration:none}
+  .docs-bar .brand span{color:#1e4fd8}
+  .docs-bar nav{margin-left:auto;display:flex;gap:.5rem}
+  .docs-bar nav a{color:#1e4fd8;text-decoration:none;font-weight:600;border:1.5px solid #1e4fd8;padding:.3rem .8rem}
+  .docs-bar nav a:hover{background:#1e4fd8;color:#fff}
+</style>
+</head>
+<body>
+<header class="docs-bar">
+  <a class="brand" href="/">Hyo <span>API 仕様書</span></a>
+  <nav>
+    <a href="/openapi.yaml">OpenAPI (YAML)</a>
+    <a href="/admin">管理画面</a>
+  </nav>
+</header>
+<div id="redoc"></div>
+<script nonce="${escapeHtml(nonce)}" src="/redoc.standalone.js"></script>
+<script nonce="${escapeHtml(nonce)}">
+  Redoc.init("/openapi.yaml", {
+    hideHostname: false,
+    expandResponses: "200,201",
+    pathInMiddlePanel: true,
+    menuToggle: true,
+    theme: {
+      colors: { primary: { main: "#1e4fd8" } },
+      typography: {
+        fontFamily: "system-ui, -apple-system, 'Segoe UI', sans-serif",
+        headings: { fontFamily: "inherit" },
+      },
+      sidebar: { backgroundColor: "#f6f7f9", textColor: "#1a1d21" },
+      rightPanel: { backgroundColor: "#23272e" },
+    },
+  }, document.getElementById("redoc"));
+</script>
+</body>
+</html>`;
+  return c.html(body);
 });
 
 ui.get("/polls/:pollId/results-page", async (c) => {

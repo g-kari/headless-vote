@@ -1,0 +1,1385 @@
+openapi: 3.0.3
+info:
+  title: Hyo API
+  version: 1.0.0
+  description: |
+    Hyo（投票 SaaS）の公開 API と管理 API の仕様です。形式は JSON です（QR コードと共有画像のみ SVG）。
+
+    ## 認証
+
+    管理 API は次のどちらかで認証します。
+
+    - **API キー**: `Authorization: Bearer hv_...`。キーはワークスペース作成時に発行され、`read`（参照・書き出し）と `write`（作成・更新・失効）の 2 つの権限があります。キーの追加発行・失効・ローテーションは管理 API と設定画面から行えます。一部の操作（キーの発行・失効、ブランド設定、メンバー管理、Webhook 管理、オリジン管理、ワークスペース削除）はオーナーのみ実行できます。
+    - **管理画面のログインセッション（Cookie）**。画面と同じ操作を fetch で呼べます。
+
+    公開 API（投票の取得・投票・結果・自分の票・QR・共有画像）は認証不要です。投票にログインが必須の投票では、投票だけログインセッションが必要です。
+
+    ## 投票について
+
+    - `voter_token` は投票者を識別する安定した文字列（8〜128 文字）で、同じトークンの再投票は前の票を上書きします（1 人 1 票）。
+    - 設問の形式は `single`（1 つだけ）、`multiple`（複数可）、`text`（自由記述）、`ranking`（`option_ids` の並びが順位）、`score`（選択肢ごとに 0〜5 点）です。
+    - 表示条件（`show_if`）が付いた設問は、条件を満たさない回答では送らなくて構いません。
+    - 確認ステップ必須の投票では、投票リクエストに `confirm: true` が必要です。
+    - 旧形式の投票（設問が 1 つだけの投票）では、`answers` の代わりにトップレベルの `option_ids` でも投票できます。
+
+    ## サンプル（JavaScript）
+
+    ```js
+    const base = "https://vote.0g0.xyz";
+    const key = "hv_..."; // write キー
+    const created = await fetch(base + "/api/v1/tenants/<tenantId>/polls", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer " + key },
+      body: JSON.stringify({
+        question: "好きな季節は？",
+        questions: [
+          { prompt: "季節", kind: "single", options: [{ label: "春" }, { label: "夏" }, { label: "秋" }, { label: "冬" }] },
+          { prompt: "理由", kind: "text", required: false },
+        ],
+      }),
+    }).then((r) => r.json());
+    ```
+
+    ## Webhook
+
+    イベントは `vote.cast`、`poll.published`、`poll.closed`、`poll.updated`、`poll.closing_soon`（締切 48 時間以内に 1 回）です。本文は JSON（`id`、`type`、`created_at`、`tenant_id`、`data`）で、ヘッダー `X-Headless-Vote-Event` と署名 `X-Headless-Vote-Signature: v1=<hex>`（本文全体の HMAC-SHA256）が付きます。本文の `id` がイベントごとの一意な ID なので、受け側での重複判定に使えます。URL は公開前に検証され、プライベートアドレス宛ては送られません。配送結果（HTTP ステータス）はサーバ側に記録されます。
+
+    署名の検証サンプル:
+
+    ```js
+    import { createHmac, timingSafeEqual } from "node:crypto";
+
+    function verify(secret, rawBody, signatureHeader) {
+      const expected = "v1=" + createHmac("sha256", secret)
+        .update(rawBody)
+        .digest("hex");
+      const a = Buffer.from(expected);
+      const b = Buffer.from(signatureHeader);
+      return a.length === b.length && timingSafeEqual(a, b);
+    }
+    ```
+
+    ## 埋め込みと CORS
+
+    別サイトのブラウザから公開 API を読む場合は、そのオリジンをワークスペース設定の許可リスト（オリジン API）に追加してください。各投票の管理画面に、設問形式に応じた埋め込み用スニペットを用意しています。
+
+    ## 主なエラーコード
+
+    エラーは `{ "error": { "code": "...", "message": "..." } }` の形式で返ります。
+
+    - `POLL_NOT_OPEN`（409）— 開始日時より前
+    - `POLL_CLOSED`（409）— 締切済み
+    - `CONFIRM_REQUIRED`（409）— 確認ステップ必須の投票で confirm が無い
+    - `LOGIN_REQUIRED`（401）— ログイン必須の投票
+    - `OPTIONS_LOCKED`（409）— 投票が入った後の設問・選択肢の構造変更
+    - `QUOTA_EXCEEDED`（409）— 件数や 1 日の上限
+    - `RATE_LIMITED`（429）— 短時間の大量リクエスト
+  contact:
+    name: Hyo
+    url: https://vote.0g0.xyz/
+servers:
+  - url: https://vote.0g0.xyz
+    description: 本番
+tags:
+  - name: 公開 API
+    description: 認証不要の投票・結果 API
+  - name: ワークスペース
+    description: ワークスペースの作成・設定・削除
+  - name: 投票管理
+    description: 投票の作成・編集・集計（管理 API）
+  - name: API キー
+    description: API キーの発行・失効・ローテーション
+  - name: テンプレート
+    description: 投票テンプレート
+  - name: メンバー
+    description: ワークスペースのメンバーと役割
+  - name: Webhook
+    description: Webhook エンドポイントの管理
+  - name: 通知・履歴・分析
+    description: 通知、操作履歴、利用量、投票推移
+  - name: アカウント
+    description: ログイン中のユーザー自身の操作
+  - name: システム
+    description: ヘルスチェック
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+paths:
+  /api/v1/health:
+    get:
+      tags: [システム]
+      summary: ヘルスチェック
+      security: []
+      responses:
+        "200":
+          description: 正常
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  service: { type: string }
+              example: { ok: true, service: headless-vote }
+  /api/v1/polls/{pollId}:
+    get:
+      tags: [公開 API]
+      summary: 投票と設問を取得
+      description: 投票と設問（形式・表示条件を含む）を返します。下書きの投票は 404 です。
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "200":
+          description: 投票
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poll: { $ref: "#/components/schemas/Poll" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/polls/{pollId}/vote:
+    post:
+      tags: [公開 API]
+      summary: 投票する
+      description: |
+        投票します。同じ `voter_token` の再投票は前の票を上書きします。
+        ログイン必須の投票ではログインセッションが必要です。
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/pollId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VoteRequest" }
+            example:
+              voter_token: stable-id-for-this-voter
+              answers:
+                - question_id: "<id>"
+                  option_ids: ["<option id>"]
+                - question_id: "<id>"
+                  text: 自由記述の回答
+                - question_id: "<id>"
+                  scores: { "<option id>": 5 }
+      responses:
+        "200":
+          description: 受け付けた票と最新の集計
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vote: { $ref: "#/components/schemas/Ballot" }
+                  results: { $ref: "#/components/schemas/Results" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /api/v1/polls/{pollId}/results:
+    get:
+      tags: [公開 API]
+      summary: 結果を取得（公開）
+      description: 設問ごとの集計を返します。公開範囲が「締切後」で未締切、または「非公開」の投票では 403 です。自由記述の本文は含まれません。
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "200":
+          description: 集計
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results: { $ref: "#/components/schemas/Results" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/polls/{pollId}/ballot:
+    get:
+      tags: [公開 API]
+      summary: 自分の票の控えを取得
+      description: 自分の票の控えと、変更できるかどうかを返します。
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/pollId"
+        - name: voter_token
+          in: query
+          required: true
+          schema: { type: string }
+          description: 投票時に使った voter_token
+      responses:
+        "200":
+          description: 控え
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ballot: { $ref: "#/components/schemas/Ballot" }
+                  can_change: { type: boolean }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/polls/{pollId}/qr.svg:
+    get:
+      tags: [公開 API]
+      summary: 結果ページへの QR コード（SVG）
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "200":
+          description: SVG 画像
+          content:
+            image/svg+xml:
+              schema: { type: string }
+  /api/v1/polls/{pollId}/og.svg:
+    get:
+      tags: [公開 API]
+      summary: 共有用画像（SVG）
+      description: ワークスペースのブランド色を反映した共有用画像です。
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "200":
+          description: SVG 画像
+          content:
+            image/svg+xml:
+              schema: { type: string }
+  /polls/{pollId}/results-page:
+    get:
+      tags: [公開 API]
+      summary: 人間向けの結果ページ（HTML）
+      description: ブラウザ向けの結果ページです。10 秒ごとに結果を取得し、画面内の数値とバーをその場で更新します。
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "200":
+          description: HTML ページ
+          content:
+            text/html:
+              schema: { type: string }
+  /api/v1/tenants:
+    post:
+      tags: [ワークスペース]
+      summary: ワークスペースを作成
+      description: ワークスペースを作成し、write 権限の API キーを 1 回だけ返します。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 120 }
+            example: { name: イベント投票 }
+      responses:
+        "201":
+          description: 作成されたワークスペースと API キー
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                  api_key: { type: string, description: 発行された API キー（この応答でのみ表示） }
+        "400": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}:
+    delete:
+      tags: [ワークスペース]
+      summary: ワークスペースを削除（オーナー）
+      description: ワークスペースと配下の投票・画像を削除します。確認のためワークスペース名を送ってください。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, description: 確認用のワークスペース名 }
+      responses:
+        "200":
+          description: 削除結果
+          content:
+            application/json:
+              schema: { type: object }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/branding:
+    patch:
+      tags: [ワークスペース]
+      summary: ブランド色とロゴを設定（オーナー）
+      description: 公開結果ページと共有用画像に使うアクセント色とロゴです。ロゴは画像アップロードで得たキーを指定します。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                brand_color: { type: string, nullable: true, pattern: "^#[0-9a-fA-F]{6}$", description: "#RRGGBB、または null で解除" }
+                brand_logo_key: { type: string, nullable: true, description: 画像キー、または null で解除 }
+      responses:
+        "200":
+          description: 反映後のブランド設定
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      brand_color: { type: string, nullable: true }
+                      brand_logo_key: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/images:
+    post:
+      tags: [ワークスペース]
+      summary: 画像をアップロード
+      description: 画像バイナリをそのまま送ります。対応形式は PNG / JPEG / WebP / GIF です。返る `key` を、選択肢の `image_key` やブランドロゴに使います。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          image/png:
+            schema: { type: string, format: binary }
+          image/jpeg:
+            schema: { type: string, format: binary }
+          image/webp:
+            schema: { type: string, format: binary }
+          image/gif:
+            schema: { type: string, format: binary }
+      responses:
+        "201":
+          description: アップロードされた画像
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: { type: string }
+                  url: { type: string, format: uri }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/origins:
+    get:
+      tags: [ワークスペース]
+      summary: 許可オリジン一覧
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 許可リスト
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  origins:
+                    type: array
+                    items: { type: string }
+    post:
+      tags: [ワークスペース]
+      summary: 許可オリジンを追加（オーナー）
+      description: 別サイトのブラウザから公開 API を読むための CORS 許可リストに追加します。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [origin]
+              properties:
+                origin: { type: string, example: "https://example.com" }
+      responses:
+        "200":
+          description: 追加済みだった場合
+          content:
+            application/json:
+              schema: { type: object }
+        "201":
+          description: 追加された場合
+          content:
+            application/json:
+              schema: { type: object }
+        "400": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [ワークスペース]
+      summary: 許可オリジンを削除（オーナー）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [origin]
+              properties:
+                origin: { type: string }
+      responses:
+        "200":
+          description: 削除結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed: { type: boolean }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/export:
+    get:
+      tags: [ワークスペース]
+      summary: ワークスペースを書き出し
+      description: ワークスペースの全データ（投票・設問・票・設定）を JSON で返します（read 権限）。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 書き出しデータ
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/tenants/{tenantId}/quotas:
+    get:
+      tags: [ワークスペース]
+      summary: 利用量と上限を取得
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 利用量
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/tenants/{tenantId}/rotate-key:
+    post:
+      tags: [API キー]
+      summary: API キーをローテーション
+      description: 提示した write キーを失効させ、新しい write キーを 1 回だけ返します。提示したキー自身で認証します（セッション不可）。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 新しい API キー
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_key: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/api-keys:
+    get:
+      tags: [API キー]
+      summary: API キー一覧
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: キー一覧（秘密は含みません）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/ApiKey" }
+    post:
+      tags: [API キー]
+      summary: API キーを発行（オーナー）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scope]
+              properties:
+                name: { type: string, maxLength: 80 }
+                scope: { type: string, enum: [read, write] }
+      responses:
+        "201":
+          description: 発行されたキー
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_key: { $ref: "#/components/schemas/ApiKey" }
+                  key: { type: string, description: キーの秘密（この応答でのみ表示） }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/api-keys/{keyId}/revoke:
+    post:
+      tags: [API キー]
+      summary: API キーを失効（オーナー）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - name: keyId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 失効結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked: { type: boolean }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls:
+    get:
+      tags: [投票管理]
+      summary: 投票一覧
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 投票一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  polls:
+                    type: array
+                    items: { $ref: "#/components/schemas/Poll" }
+    post:
+      tags: [投票管理]
+      summary: 投票を作成
+      description: "`questions` 配列で複数設問（最大 20 問）を作れます。`questions` を省略すると `options` から単一設問の投票になります。作成直後は下書き（draft）です。"
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PollCreate" }
+            example:
+              question: 好きな季節は？
+              questions:
+                - prompt: 季節
+                  kind: single
+                  options: [{ label: 春 }, { label: 夏 }, { label: 秋 }, { label: 冬 }]
+                - prompt: 理由
+                  kind: text
+                  required: false
+      responses:
+        "201":
+          description: 作成された投票
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poll: { $ref: "#/components/schemas/Poll" }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls/{pollId}:
+    get:
+      tags: [投票管理]
+      summary: 投票を取得（管理用）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "200":
+          description: 投票
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poll: { $ref: "#/components/schemas/Poll" }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [投票管理]
+      summary: 投票を編集
+      description: |
+        設定と設問を編集します。票が入った投票では設問・選択肢の構造は変更できません（`OPTIONS_LOCKED`）。
+        `expected_updated_at` を送ると、他の編集と競合した場合に 409 を返します。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - $ref: "#/components/parameters/pollId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PollPatch" }
+      responses:
+        "200":
+          description: 編集後の投票
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poll: { $ref: "#/components/schemas/Poll" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls/{pollId}/status:
+    post:
+      tags: [投票管理]
+      summary: 投票の状態を変更
+      description: "`published` で公開、`closed` で締切します。"
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - $ref: "#/components/parameters/pollId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [published, closed] }
+      responses:
+        "200":
+          description: 変更後の投票
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poll: { $ref: "#/components/schemas/Poll" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls/{pollId}/duplicate:
+    post:
+      tags: [投票管理]
+      summary: 投票を複製
+      description: 設問と設定をコピーして下書きとして複製します。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "201":
+          description: 複製された投票
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poll: { $ref: "#/components/schemas/Poll" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls/{pollId}/results:
+    get:
+      tags: [投票管理]
+      summary: 結果を取得（管理用）
+      description: 公開範囲にかかわらず集計を返します。自由記述の本文も含まれます。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "200":
+          description: 集計
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results: { $ref: "#/components/schemas/Results" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls/{pollId}/export:
+    get:
+      tags: [投票管理]
+      summary: 投票データを書き出し
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - $ref: "#/components/parameters/pollId"
+        - name: format
+          in: query
+          schema: { type: string, enum: [csv, json], default: json }
+      responses:
+        "200":
+          description: 書き出しデータ
+          content:
+            application/json:
+              schema: { type: object }
+            text/csv:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/polls/{pollId}/analytics:
+    get:
+      tags: [通知・履歴・分析]
+      summary: 日別の投票推移（投票ごと）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - $ref: "#/components/parameters/pollId"
+      responses:
+        "200":
+          description: 日別件数
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/tenants/{tenantId}/analytics:
+    get:
+      tags: [通知・履歴・分析]
+      summary: 日別の投票推移（ワークスペース全体）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 日別件数
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/tenants/{tenantId}/templates:
+    get:
+      tags: [テンプレート]
+      summary: テンプレート一覧
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: テンプレート一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  templates:
+                    type: array
+                    items: { $ref: "#/components/schemas/Template" }
+    post:
+      tags: [テンプレート]
+      summary: テンプレートを作成
+      description: 既存の投票（`source_poll_id`）または設問定義からテンプレートを作ります。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                source_poll_id: { type: string, format: uuid }
+                question: { type: string }
+                description: { type: string, nullable: true }
+                questions:
+                  type: array
+                  items: { $ref: "#/components/schemas/QuestionInput" }
+      responses:
+        "201":
+          description: 作成されたテンプレート
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  template: { $ref: "#/components/schemas/Template" }
+        "400": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/templates/{templateId}/polls:
+    post:
+      tags: [テンプレート]
+      summary: テンプレートから投票を作成
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - name: templateId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                question: { type: string, description: 見出しの上書き（省略時はテンプレートのもの） }
+      responses:
+        "201":
+          description: 作成された投票（下書き）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  poll: { $ref: "#/components/schemas/Poll" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/templates/{templateId}:
+    delete:
+      tags: [テンプレート]
+      summary: テンプレートを削除
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - name: templateId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 削除結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: boolean }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/members:
+    get:
+      tags: [メンバー]
+      summary: メンバー一覧
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: メンバー一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: "#/components/schemas/Member" }
+    post:
+      tags: [メンバー]
+      summary: メンバーを追加（オーナー）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_sub]
+              properties:
+                user_sub: { type: string, description: 追加するユーザーの sub（識別子） }
+                role: { type: string, enum: [owner, member], default: member }
+      responses:
+        "201":
+          description: 追加されたメンバー
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  member: { $ref: "#/components/schemas/Member" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [メンバー]
+      summary: メンバーの役割を変更（オーナー）
+      description: 最後のオーナーは降格できません。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_sub, role]
+              properties:
+                user_sub: { type: string }
+                role: { type: string, enum: [owner, member] }
+      responses:
+        "200":
+          description: 変更結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated: { type: boolean }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [メンバー]
+      summary: メンバーを削除（オーナー）
+      description: 最後のオーナーは削除できません。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_sub]
+              properties:
+                user_sub: { type: string }
+      responses:
+        "200":
+          description: 削除結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed: { type: boolean }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/webhooks:
+    get:
+      tags: [Webhook]
+      summary: Webhook 一覧
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: Webhook 一覧（秘密は含みません）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhooks:
+                    type: array
+                    items: { $ref: "#/components/schemas/Webhook" }
+    post:
+      tags: [Webhook]
+      summary: Webhook を作成（オーナー）
+      description: |
+        イベント発生時に JSON を POST します。署名の検証方法は仕様書の冒頭（Webhook の節）を見てください。
+        `events` を省略すると全イベントが対象です。作成応答でのみ署名用の `secret` が表示されます。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+                events:
+                  type: array
+                  items:
+                    type: string
+                    enum: [vote.cast, poll.published, poll.closed, poll.updated, poll.closing_soon]
+      responses:
+        "201":
+          description: 作成された Webhook と署名シークレット
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhook: { $ref: "#/components/schemas/Webhook" }
+                  secret: { type: string, description: 署名用シークレット（この応答でのみ表示） }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/webhooks/{webhookId}/disable:
+    post:
+      tags: [Webhook]
+      summary: Webhook を無効化（オーナー）
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - name: webhookId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 無効化結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  disabled: { type: boolean }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/notifications:
+    get:
+      tags: [通知・履歴・分析]
+      summary: 通知一覧
+      description: 締切間近などの通知を新しい順に最大 50 件返します。
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 通知一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notifications:
+                    type: array
+                    items: { $ref: "#/components/schemas/Notification" }
+  /api/v1/tenants/{tenantId}/notifications/{notificationId}/read:
+    post:
+      tags: [通知・履歴・分析]
+      summary: 通知を既読にする
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+        - name: notificationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 既読結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/tenants/{tenantId}/audit:
+    get:
+      tags: [通知・履歴・分析]
+      summary: 操作履歴
+      parameters:
+        - $ref: "#/components/parameters/tenantId"
+      responses:
+        "200":
+          description: 操作履歴
+          content:
+            application/json:
+              schema: { type: object }
+  /api/v1/me:
+    get:
+      tags: [アカウント]
+      summary: 自分のアカウント情報を取得
+      description: ログインセッションが必要です。
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: アカウント情報
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [アカウント]
+      summary: アカウントを削除
+      description: ログインセッションが必要です。所有するワークスペースの扱いは応答と画面の案内に従います。
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: 削除結果
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /api/v1/me/export:
+    get:
+      tags: [アカウント]
+      summary: 自分のデータを書き出し
+      description: ログインセッションが必要です。
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: 書き出しデータ
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+components:
+  parameters:
+    tenantId:
+      name: tenantId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: ワークスペース ID
+    pollId:
+      name: pollId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: 投票 ID
+  responses:
+    Error:
+      description: エラー
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "API キー（hv_...）。read キーは参照と書き出しのみ、write キーは作成・更新もできます。"
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: hv_session
+      description: 管理画面のログインセッション Cookie。
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: POLL_CLOSED }
+            message: { type: string }
+      required: [error]
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        scope: { type: string, enum: [read, write] }
+        prefix: { type: string, description: キーの先頭部分（識別用） }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: string, format: date-time, nullable: true }
+    Option:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: string }
+        image_url: { type: string, nullable: true }
+    OptionInput:
+      type: object
+      properties:
+        id: { type: string, format: uuid, description: 既存選択肢の維持に使う（省略時は新規） }
+        label: { type: string, maxLength: 200 }
+        image_key: { type: string, nullable: true, description: 画像アップロードで得たキー }
+    ShowIf:
+      type: object
+      description: 表示条件。この設問は、指定した設問で指定した選択肢が選ばれたときだけ表示されます。
+      properties:
+        question_id: { type: string, format: uuid }
+        option_id: { type: string, format: uuid }
+      required: [question_id, option_id]
+    Question:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        prompt: { type: string }
+        kind: { type: string, enum: [single, multiple, text, ranking, score] }
+        required: { type: boolean }
+        position: { type: integer }
+        show_if: { allOf: [{ $ref: "#/components/schemas/ShowIf" }], nullable: true }
+        options:
+          type: array
+          items: { $ref: "#/components/schemas/Option" }
+    QuestionInput:
+      type: object
+      properties:
+        id: { type: string, format: uuid, description: 既存設問の維持に使う（省略時は新規） }
+        prompt: { type: string, maxLength: 300 }
+        kind: { type: string, enum: [single, multiple, text, ranking, score], default: single }
+        required: { type: boolean, default: true }
+        show_if: { allOf: [{ $ref: "#/components/schemas/ShowIf" }], nullable: true }
+        options:
+          type: array
+          maxItems: 50
+          items: { $ref: "#/components/schemas/OptionInput" }
+    Poll:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        question: { type: string, description: 見出し }
+        description: { type: string, nullable: true }
+        image_url: { type: string, nullable: true }
+        status: { type: string, enum: [draft, published, closed] }
+        allow_multiple: { type: boolean, description: 旧形式の複数選択フラグ }
+        require_login: { type: boolean }
+        opens_at: { type: string, format: date-time, nullable: true }
+        closes_at: { type: string, format: date-time, nullable: true }
+        results_visibility: { type: string, enum: [public, after_close, admin_only] }
+        ip_single_vote: { type: boolean, description: 同一接続元からの匿名投票を 1 回までに制限 }
+        confirm_required: { type: boolean, description: 投票前に確認ステップを必須にする }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        options:
+          type: array
+          description: 全設問の選択肢（設問ごとの内訳は questions を参照）
+          items: { $ref: "#/components/schemas/Option" }
+        questions:
+          type: array
+          items: { $ref: "#/components/schemas/Question" }
+    PollSettings:
+      type: object
+      properties:
+        question: { type: string, maxLength: 300 }
+        description: { type: string, nullable: true, maxLength: 2000 }
+        image_key: { type: string, nullable: true }
+        require_login: { type: boolean }
+        opens_at: { type: string, format: date-time, nullable: true }
+        closes_at: { type: string, format: date-time, nullable: true }
+        results_visibility: { type: string, enum: [public, after_close, admin_only] }
+        ip_single_vote: { type: boolean }
+        confirm_required: { type: boolean }
+    PollCreate:
+      allOf:
+        - $ref: "#/components/schemas/PollSettings"
+        - type: object
+          properties:
+            options:
+              type: array
+              maxItems: 50
+              description: questions を省略した場合の選択肢
+              items: { $ref: "#/components/schemas/OptionInput" }
+            questions:
+              type: array
+              maxItems: 20
+              items: { $ref: "#/components/schemas/QuestionInput" }
+    PollPatch:
+      allOf:
+        - $ref: "#/components/schemas/PollSettings"
+        - type: object
+          properties:
+            options:
+              type: array
+              maxItems: 50
+              items: { $ref: "#/components/schemas/OptionInput" }
+            questions:
+              type: array
+              maxItems: 20
+              items: { $ref: "#/components/schemas/QuestionInput" }
+            expected_updated_at: { type: string, format: date-time, description: 楽観ロック用。現在の updated_at と一致しないと 409 }
+    Answer:
+      type: object
+      properties:
+        question_id: { type: string, format: uuid }
+        option_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: single / multiple の回答。ranking では並び順が順位
+        text: { type: string, description: text 形式の回答 }
+        scores:
+          type: object
+          description: score 形式の回答（選択肢 ID → 0〜5 点）
+          additionalProperties: { type: number }
+    VoteRequest:
+      type: object
+      properties:
+        voter_token: { type: string, minLength: 8, maxLength: 128, description: 投票者を識別する安定した文字列 }
+        answers:
+          type: array
+          items: { $ref: "#/components/schemas/Answer" }
+        option_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: 旧形式（単一設問の投票）向けの簡易指定
+        confirm: { type: boolean, description: 確認ステップ必須の投票で必要 }
+    Ballot:
+      type: object
+      properties:
+        poll_id: { type: string, format: uuid }
+        option_ids:
+          type: array
+          items: { type: string, format: uuid }
+        answers:
+          type: array
+          items: { $ref: "#/components/schemas/Answer" }
+        voter: { type: string, description: anonymous または user }
+    OptionResults:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: string }
+        image_url: { type: string, nullable: true }
+        votes: { type: integer }
+        points: { type: number, description: ranking の合計ポイント }
+        average_rank: { type: number, nullable: true, description: ranking の平均順位 }
+        average_score: { type: number, nullable: true, description: score の平均点 }
+    QuestionResults:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        prompt: { type: string }
+        kind: { type: string, enum: [single, multiple, text, ranking, score] }
+        required: { type: boolean }
+        position: { type: integer }
+        response_count: { type: integer }
+        options:
+          type: array
+          items: { $ref: "#/components/schemas/OptionResults" }
+        texts:
+          type: array
+          items: { type: string }
+          description: 自由記述の回答（管理用のみ。公開 API では含まれません）
+    Results:
+      type: object
+      properties:
+        poll_id: { type: string, format: uuid }
+        status: { type: string, enum: [draft, published, closed] }
+        opens_at: { type: string, format: date-time, nullable: true }
+        closes_at: { type: string, format: date-time, nullable: true }
+        total_voters: { type: integer }
+        total_votes: { type: integer }
+        options:
+          type: array
+          items: { $ref: "#/components/schemas/OptionResults" }
+        questions:
+          type: array
+          items: { $ref: "#/components/schemas/QuestionResults" }
+    Template:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        question: { type: string }
+        description: { type: string, nullable: true }
+        questions:
+          type: array
+          items: { $ref: "#/components/schemas/Question" }
+        created_at: { type: string, format: date-time }
+    Member:
+      type: object
+      properties:
+        user_sub: { type: string }
+        email: { type: string, nullable: true }
+        role: { type: string, enum: [owner, member] }
+        created_at: { type: string, format: date-time }
+    Webhook:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        events:
+          type: array
+          items:
+            type: string
+            enum: [vote.cast, poll.published, poll.closed, poll.updated, poll.closing_soon]
+        disabled_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    Notification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        poll_id: { type: string, format: uuid, nullable: true }
+        kind: { type: string }
+        message: { type: string }
+        created_at: { type: string, format: date-time }
+        read_at: { type: string, format: date-time, nullable: true }
