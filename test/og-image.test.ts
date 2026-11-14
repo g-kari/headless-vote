@@ -193,6 +193,55 @@ describe("share image (og.svg)", () => {
     expect(svg).toContain(`${"選".repeat(34)}…`);
   });
 
+  it("says results are private (not 'revealed after close') for admin_only polls", async () => {
+    const t = await createTenant("共有画像・非公開");
+    const poll = await createPoll(t, {
+      question: "内緒のアンケート",
+      results_visibility: "admin_only",
+      options: [{ label: "はい" }, { label: "いいえ" }],
+    });
+    await publish(t, poll.id);
+    const svg = await ogSvg(poll.id);
+    expect(svg).toContain("結果は非公開です");
+    expect(svg).not.toContain("締切後に公開");
+    expect(svg).not.toContain("投票者数");
+  });
+
+  it("keeps admin_only results private in the share image even after closing", async () => {
+    const t = await createTenant("共有画像・非公開終了後");
+    const poll = await createPoll(t, {
+      question: "終了後も内緒",
+      results_visibility: "admin_only",
+      options: [{ label: "はい" }, { label: "いいえ" }],
+    });
+    await publish(t, poll.id);
+    const close = await SELF.fetch(`${BASE}/api/v1/tenants/${t.id}/polls/${poll.id}/status`, {
+      method: "POST",
+      headers: auth(t),
+      body: JSON.stringify({ status: "closed" }),
+    });
+    expect(close.status).toBe(200);
+    const svg = await ogSvg(poll.id);
+    expect(svg).toContain("結果は非公開です");
+    expect(svg).not.toContain("締切後に公開");
+    expect(svg).not.toContain("投票者数");
+  });
+
+  it("keeps the 'revealed after close' note for after_close polls still open", async () => {
+    const t = await createTenant("共有画像・締切後公開");
+    const poll = await createPoll(t, {
+      question: "締切後に見せます",
+      results_visibility: "after_close",
+      closes_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      options: [{ label: "はい" }, { label: "いいえ" }],
+    });
+    await publish(t, poll.id);
+    const svg = await ogSvg(poll.id);
+    expect(svg).toContain("結果は締切後に公開されます");
+    expect(svg).not.toContain("結果は非公開です");
+    expect(svg).not.toContain("投票者数");
+  });
+
   it("darkens the light-scheme accent on branded pages (results-page bars/buttons)", async () => {
     const t = await createTenant("共有画像・白ブランド画面");
     await SELF.fetch(`${BASE}/api/v1/tenants/${t.id}/branding`, {
