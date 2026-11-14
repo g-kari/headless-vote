@@ -9,6 +9,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import * as z from "zod/v4";
 import { prepareRenderedHtml, readSourcePath, renderPageForHost, reportLine, reportPage } from "../kit/render.mjs";
+import { windowsBrowserCommand } from "../kit/browser-opener.mjs";
 import { lookAt, lookLines } from "../kit/look.mjs";
 
 const serverPath = fileURLToPath(import.meta.url);
@@ -164,7 +165,7 @@ function assertHtmlDocument(html) {
 
 function runOpener(command, args, openTarget) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true, shell: false });
     let settled = false;
 
     const settle = (result) => {
@@ -205,7 +206,10 @@ function runOpener(command, args, openTarget) {
 async function openInBrowser(path) {
   if (process.platform === "darwin") return await runOpener("open", [path], "browser");
   if (process.platform === "linux") return await runOpener("xdg-open", [path], "browser");
-  if (process.platform === "win32") return await runOpener("cmd", ["/c", "start", "", path], "browser");
+  if (process.platform === "win32") {
+    const [command, args] = windowsBrowserCommand(path);
+    return await runOpener(command, args, "browser");
+  }
   return { openAttempted: false, openStatus: "unsupported", openTarget: "browser" };
 }
 

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { prepareRenderedHtml, readSourcePath, renderPageForHost, reportLine, reportPage } from "./kit/render.mjs";
+import { windowsBrowserCommand } from "./kit/browser-opener.mjs";
 import { lookAt, lookLines } from "./kit/look.mjs";
 import { copyOnlyFeedback } from "./kit/copy-feedback.mjs";
 
@@ -212,7 +213,7 @@ type WindowListener = { closed: AbortSignal };
 
 function runOpener(command: string, args: string[], openTarget: OpenTarget, listener?: WindowListener): Promise<OpenResult> {
   return new Promise<OpenResult>((resolve) => {
-    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true, shell: false });
     if (listener) {
       // Page stdout is deliberately ignored: it is not proof of a reader action.
       const closeWindow = () => { child.kill(); };
@@ -259,7 +260,10 @@ function runOpener(command: string, args: string[], openTarget: OpenTarget, list
 async function openInBrowser(path: string): Promise<OpenResult> {
   if (process.platform === "darwin") return await runOpener("open", [path], "browser");
   if (process.platform === "linux") return await runOpener("xdg-open", [path], "browser");
-  if (process.platform === "win32") return await runOpener("cmd", ["/c", "start", "", path], "browser");
+  if (process.platform === "win32") {
+    const [command, args] = windowsBrowserCommand(path);
+    return await runOpener(command, args, "browser");
+  }
   return { openAttempted: false, openStatus: "unsupported", openTarget: "browser" };
 }
 
