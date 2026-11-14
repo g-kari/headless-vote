@@ -29,7 +29,7 @@ jobs:
         env:
           WRANGLER_SEND_METRICS: "false"
       - name: Retain verified deployment bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: worker-bundle
           path: dist/worker/index.js
