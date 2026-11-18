@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS polls (
   closes_at TEXT,
   results_visibility TEXT NOT NULL DEFAULT 'public',
   ip_single_vote INTEGER NOT NULL DEFAULT 0,
+  dedup_level TEXT NOT NULL DEFAULT 'token',
   confirm_required INTEGER NOT NULL DEFAULT 0,
   passphrase_hash TEXT,
   reminder_enabled INTEGER NOT NULL DEFAULT 0,

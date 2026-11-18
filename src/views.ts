@@ -183,6 +183,7 @@ input:user-invalid,textarea:user-invalid,select:user-invalid{border-color:var(--
   dialog[open]{animation:dialog-in .18s ease-out}
   dialog[open]::backdrop{animation:fade-in .18s ease-out}
   .step.current .dot{animation:pulse 1.6s ease-in-out infinite}
+  .dedup-flow .badge{animation:fade-in .3s ease-out both;animation-delay:var(--d,0s)}
 }
 @keyframes page-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 @keyframes grow-x{from{transform:scaleX(0)}to{transform:scaleX(1)}}

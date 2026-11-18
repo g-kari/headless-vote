@@ -1,4 +1,4 @@
-import { ensureVoterKeysHashed } from "./ballots";
+import { dedupLevelOf, ensureVoterKeysHashed } from "./ballots";
 import { ApiError, badRequest } from "./errors";
 import { TEXT_KINDS, listQuestionRows, parseBallotDocument, questionConfig } from "./questions";
 import { assertPlainText, readBodyLimited } from "./security";
@@ -127,6 +127,7 @@ export function pollToJson(
     closes_at: poll.closes_at,
     results_visibility: poll.results_visibility,
     ip_single_vote: poll.ip_single_vote === 1,
+    dedup_level: dedupLevelOf(poll),
     confirm_required: poll.confirm_required === 1,
     // Only the fact that a passphrase is set is exposed; the stored hash
     // (and of course the passphrase itself) never leaves the server.

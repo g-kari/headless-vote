@@ -3,7 +3,7 @@ import { deleteAccountData, deleteWorkspace, listMemberships } from "../account"
 import { pollSubmissionSeries, workspaceSubmissionSeries } from "../analytics";
 import { actorLabel, listAuditEvents, recordAudit } from "../audit";
 import { bearerToken, getSessionUser, optionalVoterIdentity, requireAdmin } from "../auth";
-import { ballotCount, hashVoterKey, upsertBallot } from "../ballots";
+import { ballotCount, dedupLevelOf, hashVoterKey, upsertBallot, type DedupLevel } from "../ballots";
 import { bestTextOn, readableOnWhite } from "../color";
 import { addTenantOrigin, listTenantOrigins, isAllowedTenantOrigin, removeTenantOrigin } from "../cors";
 import { randomId } from "../crypto";
@@ -304,6 +304,21 @@ function parseResultsVisibility(raw: unknown): string {
   throw badRequest('"results_visibility" must be public, after_close, or admin_only');
 }
 
+/** Anonymous-vote dedup level (KAZAMI-306 #11): token / ip / browser. */
+function parseDedupLevel(raw: unknown): DedupLevel {
+  if (raw === "token" || raw === "ip" || raw === "browser") return raw;
+  throw badRequest('"dedup_level" must be token, ip, or browser', { field: "dedup_level" });
+}
+
+/**
+ * Level for a create/import body: an explicit dedup_level wins; the legacy
+ * ip_single_vote flag maps to "ip"; the default is "token".
+ */
+function dedupLevelFromBody(body: Record<string, unknown>): DedupLevel {
+  if (body["dedup_level"] !== undefined) return parseDedupLevel(body["dedup_level"]);
+  return optBool(body, "ip_single_vote") ? "ip" : "token";
+}
+
 /** Reminder lead time in hours (1-720); falls back when not provided. */
 function readLeadHours(body: Record<string, unknown>, fallback: number): number {
   const raw = body["reminder_lead_hours"];
@@ -341,7 +356,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
   const closesAt = optIsoDate(body, "closes_at");
   assertSchedule(opensAt, closesAt);
   const resultsVisibility = parseResultsVisibility(body["results_visibility"]);
-  const ipSingleVote = optBool(body, "ip_single_vote");
+  const dedupLevel = dedupLevelFromBody(body);
   const confirmRequired = optBool(body, "confirm_required");
   const passphrase = readPassphrase(body);
   const reminderEnabled = optBool(body, "reminder_enabled");
@@ -356,7 +371,7 @@ api.post("/tenants/:tenantId/polls", async (c) => {
       image_key: imageKey,
       require_login: requireLogin,
       results_visibility: resultsVisibility,
-      ip_single_vote: ipSingleVote,
+      dedup_level: dedupLevel,
       confirm_required: confirmRequired,
       passphrase_hash: passphrase ? await hashPassphrase(c.env, passphrase) : null,
       reminder_enabled: reminderEnabled,
@@ -444,7 +459,7 @@ api.post("/tenants/:tenantId/polls/import-csv", async (c) => {
   const closesAt = optIsoDate(body, "closes_at");
   assertSchedule(opensAt, closesAt);
   const resultsVisibility = parseResultsVisibility(body["results_visibility"]);
-  const ipSingleVote = optBool(body, "ip_single_vote");
+  const dedupLevel = dedupLevelFromBody(body);
   const confirmRequired = optBool(body, "confirm_required");
   const passphrase = readPassphrase(body);
   const reminderEnabled = optBool(body, "reminder_enabled");
@@ -458,7 +473,7 @@ api.post("/tenants/:tenantId/polls/import-csv", async (c) => {
       image_key: imageKey,
       require_login: requireLogin,
       results_visibility: resultsVisibility,
-      ip_single_vote: ipSingleVote,
+      dedup_level: dedupLevel,
       confirm_required: confirmRequired,
       passphrase_hash: passphrase ? await hashPassphrase(c.env, passphrase) : null,
       reminder_enabled: reminderEnabled,
@@ -480,7 +495,7 @@ interface PollSpec {
   image_key: string | null;
   require_login: boolean;
   results_visibility: string;
-  ip_single_vote: boolean;
+  dedup_level: DedupLevel;
   confirm_required: boolean;
   passphrase_hash: string | null;
   reminder_enabled: boolean;
@@ -517,8 +532,8 @@ async function createPollRecord(
   const now = nowIso();
   const revision = randomId();
   const insertPoll = c.env.DB.prepare(
-    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, results_visibility, ip_single_vote, confirm_required, passphrase_hash, reminder_enabled, reminder_lead_hours, created_at, updated_at, revision)
-     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?12, ?13, ?14, ?15, ?16, ?17, ?10, ?10, ?11
+    `INSERT INTO polls (id, tenant_id, question, description, image_key, status, allow_multiple, require_login, opens_at, closes_at, results_visibility, ip_single_vote, dedup_level, confirm_required, passphrase_hash, reminder_enabled, reminder_lead_hours, created_at, updated_at, revision)
+     SELECT ?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7, ?8, ?9, ?12, ?13, ?18, ?14, ?15, ?16, ?17, ?10, ?10, ?11
      WHERE (SELECT COUNT(*) FROM polls WHERE tenant_id = ?2) <
        (SELECT quota_polls FROM tenants WHERE id = ?2)`,
   ).bind(
@@ -534,11 +549,13 @@ async function createPollRecord(
     now,
     revision,
     spec.results_visibility,
-    spec.ip_single_vote ? 1 : 0,
+    // ip_single_vote stays in sync with the level for existing readers.
+    spec.dedup_level !== "token" ? 1 : 0,
     spec.confirm_required ? 1 : 0,
     spec.passphrase_hash,
     spec.reminder_enabled ? 1 : 0,
     spec.reminder_lead_hours,
+    spec.dedup_level,
   );
   const [created] = await c.env.DB.batch([
     insertPoll,
@@ -578,7 +595,7 @@ async function specFromPoll(c: { env: Env }, source: PollRow): Promise<PollSpec>
     image_key: source.image_key,
     require_login: source.require_login === 1,
     results_visibility: source.results_visibility,
-    ip_single_vote: source.ip_single_vote === 1,
+    dedup_level: dedupLevelOf(source),
     confirm_required: source.confirm_required === 1,
     // A passphrase is a shared secret for voters: a duplicate or template
     // copy starts without one and the admin sets a fresh passphrase.
@@ -632,7 +649,8 @@ api.post("/tenants/:tenantId/templates", async (c) => {
     image_key: spec.image_key,
     require_login: spec.require_login,
     results_visibility: spec.results_visibility,
-    ip_single_vote: spec.ip_single_vote,
+    ip_single_vote: spec.dedup_level !== "token",
+    dedup_level: spec.dedup_level,
     confirm_required: spec.confirm_required,
     reminder_enabled: spec.reminder_enabled,
     reminder_lead_hours: spec.reminder_lead_hours,
@@ -679,6 +697,7 @@ api.post("/tenants/:tenantId/templates/:templateId/polls", async (c) => {
     require_login: boolean;
     results_visibility: string;
     ip_single_vote: boolean;
+    dedup_level?: string;
     confirm_required: boolean;
     reminder_enabled?: boolean;
     reminder_lead_hours?: number;
@@ -695,7 +714,13 @@ api.post("/tenants/:tenantId/templates/:templateId/polls", async (c) => {
     image_key: stored.image_key,
     require_login: stored.require_login,
     results_visibility: stored.results_visibility,
-    ip_single_vote: stored.ip_single_vote,
+    // Templates saved before dedup levels existed only carry ip_single_vote.
+    dedup_level:
+      stored.dedup_level === "ip" || stored.dedup_level === "browser" || stored.dedup_level === "token"
+        ? stored.dedup_level
+        : stored.ip_single_vote
+          ? "ip"
+          : "token",
     confirm_required: stored.confirm_required,
     passphrase_hash: null,
     reminder_enabled: stored.reminder_enabled ?? false,
@@ -811,8 +836,15 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     body["results_visibility"] !== undefined
       ? parseResultsVisibility(body["results_visibility"])
       : poll.results_visibility;
-  const ipSingleVote =
-    body["ip_single_vote"] !== undefined ? optBool(body, "ip_single_vote") : poll.ip_single_vote === 1;
+  const dedupLevel =
+    body["dedup_level"] !== undefined
+      ? parseDedupLevel(body["dedup_level"])
+      : body["ip_single_vote"] !== undefined
+        ? optBool(body, "ip_single_vote")
+          ? "ip"
+          : "token"
+        : dedupLevelOf(poll);
+  const ipSingleVote = dedupLevel !== "token";
   const confirmRequired =
     body["confirm_required"] !== undefined
       ? optBool(body, "confirm_required")
@@ -840,7 +872,11 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
 
   const cast = await ballotCount(c.env, poll.id);
   if (cast > 0) {
-    if (allowMultiple !== (poll.allow_multiple === 1) || requireLogin !== (poll.require_login === 1)) {
+    if (
+      allowMultiple !== (poll.allow_multiple === 1) ||
+      requireLogin !== (poll.require_login === 1) ||
+      dedupLevel !== dedupLevelOf(poll)
+    ) {
       throw conflict(
         "RULES_LOCKED",
         "Voting rules cannot be changed after votes have been cast",
@@ -889,7 +925,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     `UPDATE polls SET question = ?1, description = ?2, image_key = ?3,
      allow_multiple = ?4, require_login = ?5, opens_at = ?6, closes_at = ?7, updated_at = ?8,
      revision = ?9, results_visibility = ?13, ip_single_vote = ?14, confirm_required = ?15,
-     passphrase_hash = ?16, reminder_enabled = ?17, reminder_lead_hours = ?18
+     passphrase_hash = ?16, reminder_enabled = ?17, reminder_lead_hours = ?18, dedup_level = ?19
      WHERE id = ?10 AND revision = ?11 AND status != 'closed'
        AND (?12 = 0 OR NOT EXISTS (SELECT 1 FROM vote_ballots WHERE poll_id = ?10))`,
   ).bind(
@@ -911,6 +947,7 @@ api.patch("/tenants/:tenantId/polls/:pollId", async (c) => {
     passphraseHash,
     reminderEnabled ? 1 : 0,
     reminderLeadHours,
+    dedupLevel,
   );
 
   const [updatedPoll] = await c.env.DB.batch([
@@ -1218,6 +1255,7 @@ api.post("/polls/:pollId/vote", async (c) => {
   const mergeToken = typeof presented === "string" ? presented.trim() : "";
   await upsertBallot(c.env, poll, voterKey, ballotDocument(answers), sub !== null, {
     ip: c.req.header("cf-connecting-ip"),
+    userAgent: c.req.header("user-agent"),
     anonymousToken: sub && mergeToken.length >= 8 && mergeToken.length <= 128 ? mergeToken : undefined,
   });
   await dispatchWebhooks(c.env, poll.tenant_id, "vote.cast", {

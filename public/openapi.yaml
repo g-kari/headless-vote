@@ -1415,7 +1415,8 @@ components:
         opens_at: { type: string, format: date-time, nullable: true }
         closes_at: { type: string, format: date-time, nullable: true }
         results_visibility: { type: string, enum: [public, after_close, admin_only] }
-        ip_single_vote: { type: boolean, description: 同一接続元からの匿名投票を 1 回までに制限 }
+        ip_single_vote: { type: boolean, description: 同一接続元からの匿名投票を 1 回までに制限（dedup_level が ip / browser のとき true） }
+        dedup_level: { type: string, enum: [token, ip, browser], description: "匿名投票の重複防止レベル。token=トークンごとに1票（既定）、ip=接続元ごとに1票、browser=接続元とブラウザの組み合わせごとに1票。厳密な1人1票は require_login で担保します" }
         confirm_required: { type: boolean, description: 投票前に確認ステップを必須にする }
         passphrase_required: { type: boolean, description: 合言葉が設定されていて、投票時に passphrase が必要かどうか。合言葉そのものやハッシュは返しません }
         reminder_enabled: { type: boolean, description: 締切リマインド（管理者通知＋Webhook）が有効か }
@@ -1439,7 +1440,8 @@ components:
         opens_at: { type: string, format: date-time, nullable: true }
         closes_at: { type: string, format: date-time, nullable: true }
         results_visibility: { type: string, enum: [public, after_close, admin_only] }
-        ip_single_vote: { type: boolean }
+        ip_single_vote: { type: boolean, description: 旧形式の指定方法。dedup_level 未指定のときだけ使われ、true は dedup_level=ip と同じです }
+        dedup_level: { type: string, enum: [token, ip, browser], description: 匿名投票の重複防止レベル。指定時は ip_single_vote より優先されます }
         confirm_required: { type: boolean }
         passphrase: { type: string, minLength: 4, maxLength: 128, writeOnly: true, description: 投票の合言葉。サーバーにはハッシュ化して保存され、読み取りでは返しません }
         reminder_enabled: { type: boolean, description: 締切リマインドを有効にする。closes_at の設定が必要 }

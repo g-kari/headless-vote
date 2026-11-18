@@ -9,6 +9,28 @@ function pepper(env: Env): string {
   return env.VOTER_KEY_SECRET || env.SESSION_SECRET;
 }
 
+/**
+ * Anonymous-vote dedup level (KAZAMI-306 #11): how strongly repeat ballots
+ * from the same person are rejected on an anonymous poll.
+ * - "token": one ballot per voter token (the historical default).
+ * - "ip": one ballot per client IP.
+ * - "browser": one ballot per client IP + browser (User-Agent) pair.
+ * Strict one-person-one-vote is not promised by any of these; polls that
+ * need it use require_login, where the voter key is the account.
+ */
+export type DedupLevel = "token" | "ip" | "browser";
+
+/**
+ * Effective level for a stored poll. The dedup_level column wins; rows that
+ * only carry the legacy flag (ip_single_vote = 1, pre-0021 data or direct
+ * fixtures) read as "ip".
+ */
+export function dedupLevelOf(poll: PollRow): DedupLevel {
+  if (poll.dedup_level === "browser") return "browser";
+  if (poll.dedup_level === "ip" || poll.ip_single_vote === 1) return "ip";
+  return "token";
+}
+
 export async function hashVoterKey(env: Env, raw: string): Promise<string> {
   const secret = pepper(env);
   const mac = await hmacSha256Base64Url(secret, `headless-vote/voter/v1\0${raw}`);
@@ -85,18 +107,28 @@ export async function ballotCount(env: Env, pollId: string): Promise<number> {
 /** Replace this voter's selection in one statement (no delete/insert race). */
 export async function upsertBallot(
   env: Env, poll: PollRow, rawVoterKey: string, document: string, authenticated: boolean,
-  identity: { ip?: string; anonymousToken?: string } = {},
+  identity: { ip?: string; userAgent?: string; anonymousToken?: string } = {},
 ): Promise<void> {
   await ensureVoterKeysHashed(env);
   const stored = await hashVoterKey(env, rawVoterKey);
   const mergeOwner = authenticated && identity.anonymousToken
     ? await hashVoterKey(env, `anon:${identity.anonymousToken}`) : null;
+  const level = dedupLevelOf(poll);
+  const ipConstrained = level !== "token";
   const ip = identity.ip?.trim();
-  if (poll.ip_single_vote === 1 && !ip) {
+  if (ipConstrained && !ip) {
     throw badRequest("A trusted client IP is required for this poll");
   }
-  // The IP is a uniqueness constraint, never an authorization credential.
-  const ipKey = ip ? await hashVoterKey(env, `poll-ip:${poll.id}:${ip}`) : null;
+  // The IP (and, at the browser level, the User-Agent) is a uniqueness
+  // constraint, never an authorization credential. Only HMACs are stored.
+  const ipKey = ip
+    ? await hashVoterKey(
+      env,
+      level === "browser"
+        ? `poll-ip-ua:${poll.id}:${ip}\n${identity.userAgent?.trim() ?? ""}`
+        : `poll-ip:${poll.id}:${ip}`,
+    )
+    : null;
   const legacyIpKey = ip ? await hashVoterKey(env, `ip:${await sha256Hex(ip)}`) : null;
   const legacyUnknownKey = await hashVoterKey(env, `ip:${await sha256Hex("unknown")}`);
   const eventId = randomId();
@@ -119,7 +151,7 @@ export async function upsertBallot(
       AND (SELECT COUNT(*) FROM vote_events e JOIN polls ep ON ep.id = e.poll_id
         WHERE ep.tenant_id = p.tenant_id AND e.created_at >= ?6) < t.quota_votes_per_day`)
       .bind(eventId, now, poll.id, poll.revision, authenticated ? 1 : 0, start,
-        poll.ip_single_vote, legacyIpKey, legacyUnknownKey, ipKey, stored, mergeOwner),
+        ipConstrained ? 1 : 0, legacyIpKey, legacyUnknownKey, ipKey, stored, mergeOwner),
     // D1 batch is transactional: a contender observes the winning owner before
     // it can reserve an event. All mutations below require that reservation.
     env.DB.prepare(`UPDATE poll_ip_ballot_owners SET owner_key = ?1
@@ -129,7 +161,7 @@ export async function upsertBallot(
     env.DB.prepare(`INSERT INTO poll_ip_ballot_owners (poll_id, ip_key, owner_key)
       SELECT ?1, ?2, ?3 WHERE ?4 = 1 AND EXISTS (SELECT 1 FROM vote_events WHERE id = ?5)
       ON CONFLICT(poll_id, ip_key) DO UPDATE SET owner_key = excluded.owner_key`)
-      .bind(poll.id, ipKey, stored, poll.ip_single_vote, eventId),
+      .bind(poll.id, ipKey, stored, ipConstrained ? 1 : 0, eventId),
     env.DB.prepare(`INSERT INTO vote_ballots (poll_id, voter_key, option_ids, updated_at)
       SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM vote_events WHERE id = ?5)
       ON CONFLICT(poll_id, voter_key) DO UPDATE SET
