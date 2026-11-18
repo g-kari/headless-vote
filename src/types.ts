@@ -43,6 +43,12 @@ export interface Env {
    */
   IP_LIST_ENCRYPTION_KEY?: string;
   /**
+   * Optional hard cap on the total number of workspaces (tenants) that may
+   * exist, enforced when a workspace is provisioned. A positive integer as a
+   * string; unset or invalid values fall back to the built-in default.
+   */
+  MAX_TENANTS?: string;
+  /**
    * Canonical origin of this deployment, for example "https://vote.example.com".
    * Login is rejected on any other host (http localhost is still allowed).
    */

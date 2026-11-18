@@ -4,6 +4,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { assertPinnedOidcUrl } from "../src/oidc";
 import { rateLimit } from "../src/security";
 import { applySchema, signTestJwt, TEST_CLIENT_ID, TEST_ISSUER } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 
 const BASE = "https://vote.test";
 
@@ -227,7 +228,7 @@ describe("admin HTML injection and request limits", () => {
 
     const tRes = await SELF.fetch(`${BASE}/api/v1/tenants`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
       body: JSON.stringify({ name: "サイズ" }),
     });
     const t = (await tRes.json()) as { tenant: { id: string }; api_key: string };
@@ -251,7 +252,7 @@ describe("vote integrity and uploads", () => {
   it("stores an HMAC of the voter token and locks voting rules after a vote", async () => {
     const tRes = await SELF.fetch(`${BASE}/api/v1/tenants`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
       body: JSON.stringify({ name: "完全性" }),
     });
     const t = (await tRes.json()) as { tenant: { id: string }; api_key: string };
@@ -338,7 +339,7 @@ describe("vote integrity and uploads", () => {
   it("rejects non-image bytes, path traversal, and alg=none tokens", async () => {
     const tRes = await SELF.fetch(`${BASE}/api/v1/tenants`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
       body: JSON.stringify({ name: "画像検証" }),
     });
     const t = (await tRes.json()) as { tenant: { id: string }; api_key: string };

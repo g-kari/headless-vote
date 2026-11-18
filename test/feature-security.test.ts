@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import { notifyClosingSoon } from "../src/notifications";
 import { applySchema } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 
 const BASE = "https://vote.test";
 beforeAll(async () => { await applySchema(env.DB); });
@@ -9,7 +10,7 @@ beforeAll(async () => { await applySchema(env.DB); });
 async function setup(visibility: string, kind = "single", closesAt?: string) {
   const tenantResponse = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name: "Feature security regression" }),
   });
   expect(tenantResponse.status).toBe(201);

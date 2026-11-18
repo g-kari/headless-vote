@@ -64,11 +64,11 @@ API キーは SHA-256 ハッシュで保存します。平文は保存しませ�
 `RULES_LOCKED`（409、投票後はログイン必須・複数選択を変更不可）、
 `CONCURRENT_UPDATE`（409）、`PAYLOAD_TOO_LARGE`（413）。
 
-### テナント管理（要 API キー、作成のみ認証不要）
+### テナント管理（要 API キー、作成のみログインセッション）
 
 | メソッド | パス | 内容 |
 |---|---|---|
-| POST | `/tenants` | テナント作成。API キーを返す（1 回だけ） |
+| POST | `/tenants` | テナント作成。ログイン必須で、作成者がオーナーになります。API キーを返す（1 回だけ）。テナント総数には上限があります（`MAX_TENANTS`、既定 1000） |
 | POST | `/tenants/:tenantId/rotate-key` | API キーの再発行 |
 | GET | `/tenants/:tenantId/api-keys` | キー一覧（秘密は含まない） |
 | POST | `/tenants/:tenantId/api-keys` | キー発行。`{ "name", "scope": "read" \| "write" }`。平文は 1 回だけ |

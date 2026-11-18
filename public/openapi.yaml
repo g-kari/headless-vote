@@ -295,8 +295,9 @@ paths:
     post:
       tags: [ワークスペース]
       summary: ワークスペースを作成
-      description: ワークスペースを作成し、write 権限の API キーを 1 回だけ返します。
-      security: []
+      description: ワークスペースを作成し、write 権限の API キーを 1 回だけ返します。ログインセッションが必須で、作成者がワークスペースのオーナーになります。ワークスペースの総数には上限があります。
+      security:
+        - cookieAuth: []
       requestBody:
         required: true
         content:
@@ -322,7 +323,9 @@ paths:
                       name: { type: string }
                   api_key: { type: string, description: 発行された API キー（この応答でのみ表示） }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
         "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
   /api/v1/tenants/{tenantId}:
     delete:
       tags: [ワークスペース]

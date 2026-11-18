@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { assertWebhookUrl, signWebhookBody } from "../src/webhooks";
 import { applySchema } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 
 const BASE = "https://vote.test";
 const ISSUER = "https://idp.example.test";
@@ -14,7 +15,7 @@ beforeAll(async () => {
 async function createTenant(name = "運用") {
   const res = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name }),
   });
   expect(res.status).toBe(201);
@@ -191,6 +192,11 @@ describe("roles, quotas, and account data", () => {
     });
     expect(added.status).toBe(201);
     const onlyOwnerId = await seedMembership(tenant.id, "only-owner", "owner");
+    // API-created tenants are owned by the fixture session creator; this
+    // scenario needs the seeded account to be the sole owner.
+    await env.DB.prepare("DELETE FROM tenant_members WHERE tenant_id = ?1 AND account_id != ?2")
+      .bind(tenant.id, onlyOwnerId)
+      .run();
     const demote = await SELF.fetch(`${BASE}/api/v1/tenants/${tenant.id}/members`, {
       method: "PATCH",
       headers: auth(tenant.apiKey),
