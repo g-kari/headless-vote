@@ -1,8 +1,12 @@
 // A state machine read from code: the <script type="text/plain" model> child of a <ve-flow> (references/machines.md).
 // The model runs in a child process, so the render stays synchronous, a reducer edited since the last render is read fresh
 // (a long-lived host would keep the first import of it), and a step that never returns is cut off by the timeout.
+// The child is a sandbox (see sandboxArgs): the Node permission model confines it to reading the repo and this kit,
+// with no filesystem writes, child processes, workers, or addons, an empty environment, and the network primitives
+// switched off by model-guard.mjs. A model walks states; it does not need any of those.
 import { spawnSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { checkAt, fileReader } from "./files.mjs";
 import { esc, rawText } from "./html.mjs";
@@ -22,6 +26,24 @@ const message = (e) => String(e?.message ?? e).split("\n")[0];
 // Node 22.18+ strips TypeScript types by default; 22.6–22.17 need the flag
 const [major, minor] = process.versions.node.split(".").map(Number);
 const STRIP = !process.features.typescript && (major > 22 || (major === 22 && minor >= 6)) ? ["--experimental-strip-types"] : [];
+// The permission model is --permission on Node 23.5+, --experimental-permission before that (22.13+).
+// Without it there is no sandbox, and a model does not run at all rather than run with the host's privileges.
+const PERMISSION = major >= 24 || (major === 23 && minor >= 5) ? "--permission"
+  : (major === 22 && minor >= 13) || major === 23 ? "--experimental-permission" : null;
+
+/** The flags that confine the model child: read only the repo and this kit (imports of repo code keep working),
+ * write nothing, spawn nothing, no workers or addons. model-guard.mjs rides along for the network, which the
+ * permission model does not govern. Null when this Node has no permission model. */
+function sandboxArgs(realRoot) {
+  if (!PERMISSION) return null;
+  const kit = dirname(fileURLToPath(import.meta.url));
+  return [
+    PERMISSION,
+    `--allow-fs-read=${realRoot}`,
+    `--allow-fs-read=${kit}`,
+    "--import", pathToFileURL(join(kit, "model-guard.mjs")).href,
+  ];
+}
 
 /** Splits a model script into its imports (paths as written, from the repo root) and the rest, which keeps its line count. */
 function parseModel(text) {
@@ -46,8 +68,11 @@ export function loadModel({ text, root, timeoutMs = 10_000, cap = 2000 }) {
   if (errors.length) return { errors };
 
   const input = `${lines.join(" ")} let init, events, rules, state;\n${body}\nexport default { init, events, rules, state };`;
-  // SIGKILL, because a model's own SIGTERM handler would outlive the timeout
-  const run = spawnSync(process.execPath, [...STRIP, fileURLToPath(import.meta.url), String(cap)], { cwd: realRoot, input, timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 64 << 20 });
+  const sandbox = sandboxArgs(realRoot);
+  if (!sandbox) return { errors: [`models run only in the sandbox, which needs Node 22.13 or later for the permission model; this is ${process.version}. Upgrade Node, or draw the machine without a model`] };
+  // SIGKILL, because a model's own SIGTERM handler would outlive the timeout.
+  // The environment is empty, so a model cannot read the host's secrets from process.env.
+  const run = spawnSync(process.execPath, [...sandbox, ...STRIP, fileURLToPath(import.meta.url), String(cap)], { cwd: realRoot, input, timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 64 << 20, env: {} });
   if (run.error?.code === "ETIMEDOUT") return { errors: [`the model did not finish in ${timeoutMs / 1000} s; a step that never returns, or an import that waits on I/O`] };
   if (run.error) return { errors: [`the model could not run: ${run.error.message}`] };
   // Node exits 13 when a top-level await never settles; its warning points at the kit's own line, not the model's

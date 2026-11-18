@@ -96,7 +96,7 @@ Each names the line it is about (`line 12 <script>:` for the model) and stops th
 | `the walk has 20 states and 38 arrows, and 19 are not drawn; set auto, or model less` | 6 or more states nobody drew; one error instead of a line each |
 | `auto draws the whole walk; remove the nodes, or drop auto` | `auto` lays out every state itself |
 
-**Trust:** the model script is your own code, run as Node with your permissions, as the repo's tests are. The import check catches a wrong path, or a secrets-named file, in its `import … from` lines, nothing more; it is not a sandbox.
+**Trust:** the model script is a page author's code, and it now runs confined: a child Node process under the runtime permission model, with filesystem reads limited to the repository and the kit's own directory, no filesystem writes, no child processes, no worker threads, no addons, an empty environment, and the network switched off (a preload removes `net`, `fetch`, `WebSocket` and friends). A model that reaches past those limits fails the walk with the denial as its error; on a Node too old for the permission model the model does not run at all. The import check above still applies first — it catches a wrong path, or a secrets-named file, in the model's `import … from` lines. Confinement covers the model script; imported repository modules run inside the same confined process.
 
 **MCP:** a model runs the repo's code, so the MCP server runs one only when it is started with `VISUAL_EXPLAINER_RUN_MODELS=1`; otherwise the model is an error that names the variable. Pi and the command line run models as they run the repo's tests.
 
