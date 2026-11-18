@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applySchema } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 
 const BASE = "https://vote.test";
 
@@ -12,7 +13,7 @@ beforeAll(async () => {
 async function tenant() {
   const res = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name: "印刷テスト" }),
   });
   expect(res.status).toBe(201);

@@ -1,6 +1,6 @@
 import { actorLabel, recordAudit } from "./audit";
 import { randomId, randomToken, sha256Hex } from "./crypto";
-import { badRequest, notFound, unauthorized } from "./errors";
+import { ApiError, badRequest, notFound, unauthorized } from "./errors";
 import { tenantQuotas } from "./quotas";
 import { assertPlainText, rateLimit } from "./security";
 import type { AdminPrincipal, ApiScope, Env, TenantRow } from "./types";
@@ -107,6 +107,15 @@ export async function touchApiKey(env: Env, keyId: string): Promise<void> {
     .run();
 }
 
+/** Built-in ceiling on the total number of tenants when MAX_TENANTS is unset. */
+export const DEFAULT_MAX_TENANTS = 1000;
+
+/** Hard cap on the total number of tenants that may exist (KAZAMI-306 #10). */
+export function maxTenants(env: Env): number {
+  const parsed = Number.parseInt(env.MAX_TENANTS ?? "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TENANTS;
+}
+
 export async function provisionTenant(
   env: Env,
   name: string,
@@ -119,23 +128,39 @@ export async function provisionTenant(
   const apiKey = randomToken("hvk");
   const now = new Date().toISOString();
   const hash = await sha256Hex(apiKey);
+  // Total-tenant cap: the conditional insert is the atomic gate, so
+  // concurrent provisioning cannot slip past the ceiling. The key and
+  // membership inserts only run when the tenant row actually landed, so a
+  // rejected attempt writes nothing at all.
+  const tenantInsert = env.DB.prepare(
+    `INSERT INTO tenants (id, name, api_key_hash, created_at)
+     SELECT ?1, ?2, ?3, ?4 WHERE (SELECT COUNT(*) FROM tenants) < ?5`,
+  ).bind(tenantId, name, hash, now, maxTenants(env));
   const stmts = [
-    env.DB.prepare(
-      "INSERT INTO tenants (id, name, api_key_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-    ).bind(tenantId, name, hash, now),
+    tenantInsert,
     env.DB.prepare(
       `INSERT INTO api_keys (id, tenant_id, name, key_hash, key_prefix, scope, created_at)
-       VALUES (?1, ?2, '初期キー', ?3, ?4, 'write', ?5)`,
+       SELECT ?1, ?2, '初期キー', ?3, ?4, 'write', ?5
+       WHERE EXISTS (SELECT 1 FROM tenants WHERE id = ?2)`,
     ).bind(randomId(), tenantId, hash, keyPrefix(apiKey), now),
   ];
   if (ownerAccountId) {
     stmts.push(
       env.DB.prepare(
-        "INSERT INTO tenant_members (tenant_id, account_id, role, created_at) VALUES (?1, ?2, 'owner', ?3)",
+        `INSERT INTO tenant_members (tenant_id, account_id, role, created_at)
+         SELECT ?1, ?2, 'owner', ?3
+         WHERE EXISTS (SELECT 1 FROM tenants WHERE id = ?1)`,
       ).bind(tenantId, ownerAccountId, now),
     );
   }
-  await env.DB.batch(stmts);
+  const [inserted] = await env.DB.batch(stmts);
+  if (inserted?.meta.changes !== 1) {
+    throw new ApiError(
+      503,
+      "TENANT_LIMIT_REACHED",
+      "Workspace creation is unavailable because the service has reached its workspace limit",
+    );
+  }
   await recordAudit(env, {
     tenantId,
     actor: ownerAccountId ? `session:${ownerAccountId}` : "bootstrap",

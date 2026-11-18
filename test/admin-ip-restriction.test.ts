@@ -1,6 +1,7 @@
 import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import { applySchema } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 import {
   decryptIpEntries,
   encryptIpEntries,
@@ -157,7 +158,7 @@ describe("encrypted storage", () => {
 async function createTenant(): Promise<{ tenantId: string; apiKey: string }> {
   const res = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name: "IP制限テスト" }),
   });
   expect(res.status).toBe(201);

@@ -1,6 +1,7 @@
 import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import { applySchema } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 import { upsertBallot } from "../src/ballots";
 import { getPollRow } from "../src/domain";
 import { newSessionCookieForToken } from "../src/auth";
@@ -106,7 +107,7 @@ describe("atomic voting boundaries", () => {
 
   it("atomically enforces poll creation quota", async () => {
     const response = await SELF.fetch(`${BASE}/api/v1/tenants`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "poll-quota" }),
+      method: "POST", headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) }, body: JSON.stringify({ name: "poll-quota" }),
     });
     const data = await response.json() as { tenant: { id: string }; api_key: string };
     await env.DB.prepare("UPDATE tenants SET quota_polls = 1 WHERE id = ?1").bind(data.tenant.id).run();

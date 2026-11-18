@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applySchema, signTestJwt } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 
 const BASE = "https://vote.test";
 
@@ -14,7 +15,7 @@ async function createTenantWithPoll(
 ): Promise<{ pollId: string; optionIds: string[] }> {
   const tRes = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name: "ログイン投票テスト" }),
   });
   const t = (await tRes.json()) as { tenant: { id: string }; api_key: string };

@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applySchema } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 import { parseAllowedOrigin } from "../src/cors";
 
 const BASE = "https://vote.test";
@@ -18,7 +19,7 @@ async function createPublishedPoll(): Promise<{
 }> {
   const tRes = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name: "CORS テナント" }),
   });
   expect(tRes.status).toBe(201);

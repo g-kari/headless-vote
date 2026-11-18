@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applySchema } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 import { bestTextOn, contrastRatio, readableOnWhite } from "../src/color";
 import { shareTextWidth, wrapShareText } from "../src/routes/api";
 
@@ -19,7 +20,7 @@ interface Tenant {
 async function createTenant(name: string): Promise<Tenant> {
   const res = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name }),
   });
   expect(res.status).toBe(201);

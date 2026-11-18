@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applySchema } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 
 const BASE = "https://vote.test";
 
@@ -46,7 +47,7 @@ function sessionHeaders(session: string): Record<string, string> {
 async function createTenant(name: string) {
   const res = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name }),
   });
   expect(res.status).toBe(201);

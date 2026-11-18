@@ -167,12 +167,21 @@ function fitShareLabel(label: string, fontSize: number, maxWidth: number): strin
 /* Tenants                                                             */
 /* ------------------------------------------------------------------ */
 
-/** Self-serve tenant creation (SaaS onboarding). The API key is shown once. */
+/**
+ * Self-serve tenant creation (SaaS onboarding). A verified login session is
+ * required (KAZAMI-306 #10): the creator is recorded as the workspace owner,
+ * so a workspace is never provisioned for an anonymous caller. The total
+ * number of workspaces is capped inside provisionTenant. The API key is
+ * shown once.
+ */
 api.post("/tenants", async (c) => {
   await rateLimitByIp(c, "tenant-create", 80, 3600);
+  assertSameOriginMutation(c);
+  const user = await getSessionUser(c);
+  if (!user) throw unauthorized("UNAUTHORIZED", "Login is required to create a workspace");
   const body = await jsonBody(c);
   const name = reqString(body, "name", { max: 120 });
-  const { tenantId, apiKey } = await provisionTenant(c.env, name, null);
+  const { tenantId, apiKey } = await provisionTenant(c.env, name, user.accountId);
   return c.json(
     { tenant: { id: tenantId, name }, api_key: apiKey },
     201,

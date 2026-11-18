@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applySchema, signTestJwt, TEST_CLIENT_ID } from "./fixtures";
+import { fixtureSessionHeaders } from "./session";
 
 /**
  * Parity tests for the countermeasures that existed only in PR #4
@@ -26,7 +27,7 @@ interface TenantInfo {
 async function createTenant(name: string): Promise<TenantInfo> {
   const res = await SELF.fetch(`${BASE}/api/v1/tenants`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(await fixtureSessionHeaders()) },
     body: JSON.stringify({ name }),
   });
   expect(res.status).toBe(201);
