@@ -85,6 +85,8 @@ export interface PollRow {
   closes_at: string | null;
   results_visibility: string;
   ip_single_vote: number;
+  /** Anonymous-vote dedup level: "token" | "ip" | "browser" (migration 0021). */
+  dedup_level: string;
   confirm_required: number;
   passphrase_hash: string | null;
   reminder_enabled: number;

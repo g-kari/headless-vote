@@ -21,6 +21,7 @@ import {
 } from "../ip-restriction";
 import { SAMPLE_QUESTIONS_CSV } from "../csv-import";
 import { listQuestionRows, questionConfig } from "../questions";
+import { dedupLevelOf } from "../ballots";
 import { computeResults, getPollRow, isClosedForVoting, listOptionRows, type PollResults } from "../domain";
 import { issueApiKey, limitKeyRotation, listApiKeys, provisionTenant, revokeApiKey } from "../keys";
 import { addMember, cancelInvite, inviteMemberByEmail, listInvites, listMembers, removeMember, setMemberRole } from "../members";
@@ -2082,7 +2083,7 @@ async function submitPoll(ev) {
       image_key: document.getElementById('poll-image-key').value || null,
       require_login: document.getElementById('require-login').checked,
       results_visibility: document.getElementById('results-visibility').value,
-      ip_single_vote: document.getElementById('ip-single-vote').checked,
+      dedup_level: document.querySelector('input[name="dedup-level"]:checked').value,
       confirm_required: document.getElementById('confirm-required').checked,
       opens_at: document.getElementById('opens-at').value ? new Date(document.getElementById('opens-at').value).toISOString() : null,
       closes_at: document.getElementById('closes-at').value ? new Date(document.getElementById('closes-at').value).toISOString() : null,
@@ -2157,6 +2158,7 @@ function pollFormBody(opts: {
   nonce: string;
 }): string {
   const p = opts.poll;
+  const dedupLevel = p ? dedupLevelOf(p) : "token";
   const closesLocal = p?.closes_at ? escapeHtml(p.closes_at.slice(0, 16)) : "";
   const seed = safeJsonForScript(opts.questions);
   return `
@@ -2197,10 +2199,26 @@ function pollFormBody(opts: {
         <option value="after_close" ${p?.results_visibility === "after_close" ? "selected" : ""}>締切後に公開</option>
         <option value="admin_only" ${p?.results_visibility === "admin_only" ? "selected" : ""}>公開しない（管理者のみ）</option>
       </select>
+      <label>重複投票の防止レベル <span class="hint">匿名投票で、同じ人の二重投票をどこまで防ぐかです。右へ行くほど厳しくなります。</span></label>
+      <div class="dedup-flow" aria-hidden="true" style="display:flex;align-items:center;gap:.45rem;flex-wrap:wrap">
+        <span class="badge" style="--d:0s">トークン</span><span>→</span>
+        <span class="badge" style="--d:.08s">IP</span><span>→</span>
+        <span class="badge" style="--d:.16s">IP＋ブラウザ</span>
+      </div>
       <div class="check">
-        <input id="ip-single-vote" type="checkbox" ${p?.ip_single_vote === 1 ? "checked" : ""}>
-        <label for="ip-single-vote" style="margin:0"><span>同じ接続元からは1票だけにする</span>
-        <small>オンにすると、匿名票はブラウザではなく接続元（IP）で1票に制限されます。同じネットワークの別人はまとめられる点に注意してください。</small></label>
+        <input type="radio" name="dedup-level" id="dedup-token" value="token" ${dedupLevel === "token" ? "checked" : ""}>
+        <label for="dedup-token" style="margin:0"><span>トークンで制限（緩い）</span>
+        <small>ブラウザに保存したトークンごとに1票です。端末やブラウザを変えると、もう一度投票できます。</small></label>
+      </div>
+      <div class="check">
+        <input type="radio" name="dedup-level" id="dedup-ip" value="ip" ${dedupLevel === "ip" ? "checked" : ""}>
+        <label for="dedup-ip" style="margin:0"><span>IPでも制限（中）</span>
+        <small>同じ接続元（IP）からは1票だけです。同じネットワークの別人はまとめられる点に注意してください。</small></label>
+      </div>
+      <div class="check">
+        <input type="radio" name="dedup-level" id="dedup-browser" value="browser" ${dedupLevel === "browser" ? "checked" : ""}>
+        <label for="dedup-browser" style="margin:0"><span>IP＋ブラウザ情報でも制限（強い）</span>
+        <small>接続元とブラウザの組み合わせごとに1票です。同じネットワークでもブラウザが違えば投票できます。厳密な1人1票が必要な場合は「ログイン必須にする」を使ってください。</small></label>
       </div>
       <div class="check">
         <input id="confirm-required" type="checkbox" ${p?.confirm_required === 1 ? "checked" : ""}>
