@@ -3,6 +3,7 @@
 // follows, every stepper step, and a contact sheet of the first screen, the figures, and the steps. playwright-core is an optional peer.
 import { createRequire } from "node:module";
 import { readdirSync, rmSync, writeFileSync } from "node:fs";
+import { installNetPolicy } from "./net-policy.mjs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -247,8 +248,9 @@ function toSheets(rows) {
   return sheets;
 }
 
-async function drawSheets(browser, sheets, outBase) {
+async function drawSheets(browser, sheets, outBase, guard) {
   const page = await browser.newPage({ viewport: { width: SHEET_W, height: SHEET_H } });
+  if (guard) await guard(page);
   const paths = [];
   try {
     for (const [n, rows] of sheets.entries()) {
@@ -275,6 +277,10 @@ export async function lookAt(file, { sheet = true } = {}) {
   const { browser } = got;
   const path = resolve(file), url = pathToFileURL(path).href;
   const result = { file: path, errors: [], widths: {}, problems: [], sheets: [], omitted: 0 };
+  // KAZAMI-306 #8: every page in this check runs under the kit net policy —
+  // pinned assets are served locally, any other http(s) request is blocked.
+  const policies = [];
+  const guard = async (page) => { policies.push(await installNetPolicy(page)); };
   const geometry = new Map();
   const note = (list, step) => {
     for (const { where, what } of list) {
@@ -287,9 +293,10 @@ export async function lookAt(file, { sheet = true } = {}) {
     // as a reader opens it, at each width
     for (const width of WIDTHS) {
       const page = await browser.newPage({ viewport: { width, height: 900 } });
+      await guard(page);
       page.on("console", (m) => {
         if (m.type() !== "error") return;
-        // an offline or blocked fetch from another origin (the kit's web font) is the host's situation, not the page's
+        // a fetch the net policy blocked is reported once, as a policy problem below, not again as a console error
         if (/^Failed to load resource: net::/.test(m.text()) && !m.location().url.startsWith("file:")) return;
         result.errors.push(`console at ${width}px: ${m.text()}`);
       });
@@ -306,6 +313,7 @@ export async function lookAt(file, { sheet = true } = {}) {
     const items = [];
     try {
       const page = await context.newPage();
+      await guard(page);
       await page.goto(url, { waitUntil: "load", timeout: 15000 });
       await page.evaluate(fontsReady);
       await page.waitForTimeout(200);
@@ -372,6 +380,7 @@ export async function lookAt(file, { sheet = true } = {}) {
         const dark = await browser.newContext({ viewport: { width: 1280, height: 900 }, reducedMotion: "reduce", colorScheme: "dark" });
         try {
           const d = await dark.newPage();
+          await guard(d);
           await d.goto(url, { waitUntil: "load" });
           await d.evaluate(fontsReady);
           await d.waitForTimeout(200);
@@ -390,7 +399,7 @@ export async function lookAt(file, { sheet = true } = {}) {
       const own = new RegExp(`^${basename(outBase).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.sheet(?:-\\d+)?\\.png$`);
       for (const f of readdirSync(dirname(path))) if (own.test(f)) rmSync(join(dirname(path), f));
       const { sheets, omitted } = layout(items);
-      result.sheets = await drawSheets(browser, sheets, outBase);
+      result.sheets = await drawSheets(browser, sheets, outBase, guard);
       result.omitted = omitted;
     }
   } catch (e) {
@@ -402,7 +411,10 @@ export async function lookAt(file, { sheet = true } = {}) {
 
   const at = result.widths;
   const shapes = [...geometry].map(([key, steps]) => (steps.length ? `${key} (step${steps.length > 1 ? "s" : ""} ${steps.join(", ")})` : key));
+  result.external = [...new Set(policies.flatMap((p) => p.blocked))];
+  result.pinnedServed = [...new Set(policies.flatMap((p) => p.served))].length;
   result.problems = [
+    ...result.external.map((u) => `external request blocked by the kit net policy: ${u} (pin it ahead of time with kit/vendor/fetch-vendor.mjs, or remove the reference)`),
     ...result.errors,
     ...WIDTHS.filter((w) => at[w].overflow).map((w) => `the page scrolls sideways at ${w}px`),
     ...WIDTHS.filter((w) => at[w].small).map((w) => `a diagram label renders at ${at[w].smallest.px}px at ${w}px ("${at[w].smallest.text}"); keep labels at ${MIN_LABEL}px or more`),
