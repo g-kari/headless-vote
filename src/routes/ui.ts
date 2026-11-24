@@ -2065,6 +2065,7 @@ function showServerError(message, details) {
 const pollForm = document.getElementById('poll-form');
 const saveButton = pollForm.querySelector('button[type="submit"]');
 let savingPoll = false;
+let verifyCreateBeforeRetry = false;
 function editorSnapshot() {
   return JSON.stringify(Array.from(pollForm.querySelectorAll('input, select, textarea'), (el) => {
     if (el.type === 'file') return el.files ? el.files.length : 0;
@@ -2075,11 +2076,20 @@ function editorSnapshot() {
 }
 async function submitPoll(ev) {
   ev.preventDefault();
-  if (savingPoll) return;
+  if (savingPoll || verifyCreateBeforeRetry) return;
   const questions = validateForm();
   if (!questions) return;
   savingPoll = true;
   let leaving = false;
+  let saveDispatched = false;
+  function showUnconfirmedSave() {
+    if (!POLL_ID) {
+      verifyCreateBeforeRetry = true;
+      showServerError('下書きが作成されたか確認できません。この画面からの再送は止めました。別タブでワークスペースを開き、先に下書きがあるか確認してください。入力はこの画面に残っています。');
+      return;
+    }
+    showServerError('保存結果を確認できません。入力は残っています。別タブで保存済みの内容を確認してから、必要なら保存し直してください。');
+  }
   pollForm.dataset.saving = 'true';
   pollForm.inert = true;
   saveButton.disabled = true;
@@ -2115,34 +2125,34 @@ async function submitPoll(ev) {
     const url = POLL_ID
       ? '/api/v1/tenants/' + TENANT + '/polls/' + POLL_ID
       : '/api/v1/tenants/' + TENANT + '/polls';
+    saveDispatched = true;
     const res = await fetch(url, {
       method: POLL_ID ? 'PATCH' : 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
       credentials: 'same-origin',
     });
-    if (res.status >= 500) throw new Error('unconfirmed');
+    if (res.status === 408 || res.status >= 500) throw new Error('unconfirmed');
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       showServerError((data.error && data.error.message) || '保存に失敗しました', data.error && data.error.details);
       return;
     }
     if (!data.poll || !data.poll.id) {
-      showServerError('保存結果を確認できません。別タブで保存済みの内容を確認してから、必要なら保存し直してください。');
+      showUnconfirmedSave();
       return;
     }
     leaving = true;
     location.href = '/admin/workspaces/' + TENANT + '/polls/' + data.poll.id;
   } catch (e) {
-    errorEl.textContent = '処理結果を確認できません。入力は残っています。別タブで保存済みの内容を確認してから、必要ならやり直してください。';
-    errorEl.style.display = 'block';
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    if (saveDispatched) showUnconfirmedSave();
+    else showServerError(e instanceof Error ? e.message : '保存前の処理に失敗しました。入力は残っています。');
   } finally {
     if (!leaving) {
       savingPoll = false;
       delete pollForm.dataset.saving;
       pollForm.inert = false;
-      saveButton.disabled = false;
+      saveButton.disabled = verifyCreateBeforeRetry;
     }
   }
 }
