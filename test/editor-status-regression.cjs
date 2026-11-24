@@ -18,7 +18,67 @@ function setup(fetch) {
   vm.runInNewContext(guard, {Event, TENANT:'fixture', POLL:'fixture', document:{getElementById:id=>els[id],querySelectorAll:()=>[action]}, fetch:(...a)=>{changes.calls++;return fetch(...a)},location:{reload(){changes.reload++}}});
   return {action,dialog,flash,confirm,cancel,changes,form};
 }
+function setupSave({pollId = '', fetch, upload = async () => {}}) {
+  const button = {disabled:false};
+  const form = {dataset:{}, inert:false, querySelector:()=>button};
+  const state = {calls:0, errors:[], records:[], messages:[], methods:[]};
+  const elements = {'poll-form':form, question:{value:'Synthetic draft'}, description:{value:'Keep me'}};
+  const nodes = {getElementById:(id)=>elements[id] || {value:'', checked:false}, querySelector:()=>({value:'token'})};
+  const scope = {document:nodes, TENANT:'fixture', POLL_ID:pollId, validateForm:()=>[], uploadFrom:upload,
+    showServerError:message=>state.messages.push(message), errorEl:{style:{}}, window:{scrollTo(){}}, location:{href:''},
+    fetch:async (url, request)=>{state.calls++;state.methods.push(request.method);return fetch(state);}};
+  const start=src.indexOf("const pollForm = document.getElementById('poll-form');");
+  const end=src.indexOf("pollForm.addEventListener('submit', submitPoll);",start);
+  assert.ok(start>=0 && end>start);
+  const submit=vm.runInNewContext(src.slice(start,end)+'submitPoll',scope);
+  return {state, form, button, location:scope.location, question:elements.question,
+    submit:()=>submit({preventDefault(){}})};
+}
+async function checkSaveSubmissions() {
+  // The synthetic server records the draft before the connection drops.
+  for (const outcome of ['disconnect','timeout','server error','missing ID']) {
+    const t=setupSave({fetch:async s=>{
+      s.records.push('created');
+      if(outcome==='disconnect') throw Error('response lost');
+      if(outcome==='timeout') return {ok:false,status:408};
+      if(outcome==='server error') return {ok:false,status:503};
+      return {ok:true,status:201,json:async()=>({})};
+    }});
+    await t.submit();
+    assert.equal(t.form.inert,false);
+    assert.equal(t.question.value,'Synthetic draft');
+    assert.equal(t.button.disabled,true);
+    assert.match(t.state.messages[0],/再送は止めました/);
+    await t.submit();
+    assert.equal(t.state.calls,1);
+    assert.equal(t.state.records.length,1);
+  }
+  let uploads=0;
+  const beforeSend=setupSave({upload:async()=>{if(++uploads===1)throw Error('upload failed');},
+    fetch:async()=>({ok:true,status:201,json:async()=>({poll:{id:'new'}})})});
+  await beforeSend.submit();
+  assert.equal(beforeSend.state.calls,0);
+  assert.equal(beforeSend.button.disabled,false);
+  await beforeSend.submit();
+  assert.deepEqual(beforeSend.state.methods,['POST']);
+  assert.match(beforeSend.location.href,/polls\/new$/);
+
+  const rejected=setupSave({fetch:async s=>s.calls===1?{ok:false,status:400,json:async()=>({error:{message:'invalid'}})}
+    :{ok:true,status:201,json:async()=>({poll:{id:'new'}})}});
+  await rejected.submit();
+  assert.equal(rejected.button.disabled,false);
+  assert.equal(rejected.state.messages[0],'invalid');
+  await rejected.submit();
+  assert.equal(rejected.state.calls,2);
+
+  const existing=setupSave({pollId:'existing',fetch:async()=>{throw Error('response lost');}});
+  await existing.submit();
+  assert.deepEqual(existing.state.methods,['PATCH']);
+  assert.equal(existing.button.disabled,false);
+  assert.match(existing.state.messages[0],/確認できません/);
+}
 (async()=>{
+  await checkSaveSubmissions();
   assert.ok(guard.length>1500 && snap.length>100);
   const fields=[{type:'text',value:'old'}, {type:'password',value:''}, {type:'file',files:[]}];
   const snapshot=()=>vm.runInNewContext(snap+'editorSnapshot()', {pollForm:{querySelectorAll:()=>fields}});
@@ -44,5 +104,5 @@ function setup(fetch) {
     t=setup(fn); t.action.fire('click'); await t.confirm.fire('click'); t.action.fire('click'); await t.confirm.fire('click');
     assert.equal(t.changes.calls,1); assert.equal(t.changes.reload,0); assert.equal(t.action.disabled,true); assert.match(t.flash.textContent,/読み直し/);
   }
-  console.log('Passed editor snapshot, unsaved gating, pending save, readiness, duplicate transition, rejection, and uncertain transition checks.');
+  console.log('Passed editor snapshot, unsaved gating, pending save, readiness, duplicate transition, rejection, uncertain transition, and save-retry checks.');
 })().catch(e=>{console.error(e);process.exitCode=1});
