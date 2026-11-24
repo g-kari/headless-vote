@@ -2062,10 +2062,27 @@ function showServerError(message, details) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
+const pollForm = document.getElementById('poll-form');
+const saveButton = pollForm.querySelector('button[type="submit"]');
+let savingPoll = false;
+function editorSnapshot() {
+  return JSON.stringify(Array.from(pollForm.querySelectorAll('input, select, textarea'), (el) => {
+    if (el.type === 'file') return el.files ? el.files.length : 0;
+    if (el.type === 'password') return el.value.length > 0;
+    if (el.type === 'checkbox' || el.type === 'radio') return el.checked;
+    return el.value;
+  }));
+}
 async function submitPoll(ev) {
   ev.preventDefault();
+  if (savingPoll) return;
   const questions = validateForm();
   if (!questions) return;
+  savingPoll = true;
+  let leaving = false;
+  pollForm.dataset.saving = 'true';
+  pollForm.inert = true;
+  saveButton.disabled = true;
   try {
     await uploadFrom(document.getElementById('poll-image-row'), '#poll-image-file', '#poll-image-key');
     for (const q of questions) {
@@ -2104,19 +2121,32 @@ async function submitPoll(ev) {
       body: JSON.stringify(payload),
       credentials: 'same-origin',
     });
+    if (res.status >= 500) throw new Error('unconfirmed');
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       showServerError((data.error && data.error.message) || '保存に失敗しました', data.error && data.error.details);
       return;
     }
+    if (!data.poll || !data.poll.id) {
+      showServerError('保存結果を確認できません。別タブで保存済みの内容を確認してから、必要なら保存し直してください。');
+      return;
+    }
+    leaving = true;
     location.href = '/admin/workspaces/' + TENANT + '/polls/' + data.poll.id;
   } catch (e) {
-    errorEl.textContent = e.message || String(e);
+    errorEl.textContent = '処理結果を確認できません。入力は残っています。別タブで保存済みの内容を確認してから、必要ならやり直してください。';
     errorEl.style.display = 'block';
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  } finally {
+    if (!leaving) {
+      savingPoll = false;
+      delete pollForm.dataset.saving;
+      pollForm.inert = false;
+      saveButton.disabled = false;
+    }
   }
 }
-document.getElementById('poll-form').addEventListener('submit', submitPoll);
+pollForm.addEventListener('submit', submitPoll);
 // Clear a field's error as soon as the user starts fixing it.
 document.getElementById('poll-form').addEventListener('input', (ev) => {
   const t = ev.target;
@@ -2139,6 +2169,12 @@ for (const id of ['opens-at', 'closes-at']) {
     }
   }
 }
+// Only compare live form values. Never store the editor contents or credentials persistently.
+const savedEditorSnapshot = editorSnapshot();
+pollForm.dataset.editorReady = 'true';
+pollForm.addEventListener('hyo:check-unsaved', (ev) => {
+  if (editorSnapshot() !== savedEditorSnapshot || pollForm.dataset.saving === 'true') ev.preventDefault();
+});
 })();
 `;
   return scriptTag(nonce, code);
@@ -2410,7 +2446,7 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
         })();
       `)}`}
     </section>
-    <div id="flash" class="notice bad" role="alert" hidden></div>
+    <div id="flash" class="notice bad" role="alert" tabindex="-1" hidden></div>
     <dialog id="status-dialog" aria-labelledby="status-dialog-title">
       <h2 id="status-dialog-title">状態を変更しますか？</h2>
       <p id="status-dialog-text" class="muted"></p>
@@ -2423,35 +2459,74 @@ await fetch(base + "/api/v1/polls/" + pollId + "/vote", {
       (() => {
       const TENANT = ${safeJsonForScript(tenantId)};
       const POLL = ${safeJsonForScript(poll.id)};
+      const dialog = document.getElementById("status-dialog");
+      const confirm = document.getElementById("status-confirm");
+      const cancel = document.getElementById("status-cancel");
+      const flash = document.getElementById("flash");
+      const buttons = document.querySelectorAll("[data-ask-status]");
       let pendingStatus = null;
-      for (const button of document.querySelectorAll("[data-ask-status]")) {
+      let changing = false;
+      let verifyBeforeRetry = false;
+      function showStatusError(message) {
+        flash.textContent = message;
+        flash.hidden = false;
+        flash.focus();
+      }
+      function canChangeStatus() {
+        const form = document.getElementById("poll-form");
+        if (!form || form.dataset.editorReady !== "true" || !form.dispatchEvent(new Event("hyo:check-unsaved", { cancelable: true }))) {
+          showStatusError("保存していない変更があります。先に保存し、保存済みの内容を確認してください。");
+          return false;
+        }
+        return true;
+      }
+      for (const button of buttons) {
         button.addEventListener("click", () => {
+          if (changing || verifyBeforeRetry || !canChangeStatus()) return;
+          flash.hidden = true;
           pendingStatus = button.getAttribute("data-ask-status");
           const text = document.getElementById("status-dialog-text");
           const title = document.getElementById("status-dialog-title");
           text.textContent = pendingStatus === "published"
-            ? "この投票を公開します。公開後は API から投票できるようになります。"
-            : "この投票を締め切ります。締切後は投票できなくなります。";
+            ? "保存済みの内容を公開します。開始日時を設定している場合、投票受付はその日時からです。"
+            : "この投票を締め切ります。この操作は取り消せず、投票を再開できません。";
           title.textContent = (pendingStatus === "published" ? "公開" : "締め切る") + "しますか？";
-          document.getElementById("status-dialog").showModal();
+          dialog.showModal();
         });
       }
-      document.getElementById("status-cancel").addEventListener("click", () => {
-        document.getElementById("status-dialog").close();
-      });
-      document.getElementById("status-confirm").addEventListener("click", async () => {
-        document.getElementById("status-dialog").close();
-        const res = await fetch("/api/v1/tenants/" + TENANT + "/polls/" + POLL + "/status", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ status: pendingStatus }),
-          credentials: "same-origin",
-        });
-        if (res.ok) { location.reload(); return; }
-        const d = await res.json().catch(() => ({}));
-        const flash = document.getElementById("flash");
-        flash.textContent = (d.error && d.error.message) || "状態の変更に失敗しました";
-        flash.hidden = false;
+      cancel.addEventListener("click", () => dialog.close());
+      dialog.addEventListener("cancel", (ev) => { if (changing) ev.preventDefault(); });
+      confirm.addEventListener("click", async () => {
+        if (changing || verifyBeforeRetry || (pendingStatus !== "published" && pendingStatus !== "closed")) return;
+        if (!canChangeStatus()) { dialog.close(); flash.focus(); return; }
+        changing = true;
+        confirm.disabled = true;
+        cancel.disabled = true;
+        let leaving = false;
+        try {
+          const res = await fetch("/api/v1/tenants/" + TENANT + "/polls/" + POLL + "/status", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ status: pendingStatus }),
+            credentials: "same-origin",
+          });
+          if (res.ok) { leaving = true; location.reload(); return; }
+          if (res.status >= 500) throw new Error("unconfirmed");
+          const d = await res.json().catch(() => ({}));
+          dialog.close();
+          showStatusError((d.error && d.error.message) || "状態の変更に失敗しました");
+        } catch {
+          verifyBeforeRetry = true;
+          for (const button of buttons) button.disabled = true;
+          dialog.close();
+          showStatusError("変更結果を確認できません。ページを読み直し、現在の公開・締切状態を確認してからやり直してください。");
+        } finally {
+          if (!leaving) {
+            changing = false;
+            confirm.disabled = false;
+            cancel.disabled = false;
+          }
+        }
       });
       })();
     `)}
