@@ -53,6 +53,8 @@ Only when depth carries data: embeddings, physical or spatial layouts, stacks wh
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.186/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.186/examples/jsm/"}}</script>
 ```
 
+The pinned build and the addons the kit's pages use are vendored ahead of time (`kit/vendor/`, sha256 in `kit/vendor/manifest.json`); when a page is checked, `kit/net-policy.mjs` serves those URLs from the vendored copies and blocks every other network request, so a checked page never talks to the CDN. An addon that is not pinned yet fails the check — extend the seeds in `kit/vendor/fetch-vendor.mjs` and re-run it by hand to pin it.
+
 - Canvas in a `.frame` with a fixed aspect ratio, `role="img"`, an `aria-label`, a `Fig. N` caption, and a one-line text fallback with the key numbers.
 - Colors from the page tokens via `getComputedStyle`; labels with `CSS2DRenderer`. One directional light plus ambient; no bloom, fog, or particles.
 - `OrbitControls` with damping and zoom limits, plus "Reset view". Open on an angle that shows the answer; auto-rotate only until the first interaction, never under reduced motion.
